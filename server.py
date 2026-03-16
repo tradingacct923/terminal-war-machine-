@@ -592,43 +592,91 @@ def api_candles():
 
 @app.route("/api/chain")
 def api_chain():
-    """Return real options chain from Tradier for use by the terminal options panel."""
-    try:
-        from data_provider import _fetch_expirations, _fetch_chain, _fetch_quote, _cached, _safe
-        ticker = request.args.get("ticker", get_ticker())
-        spot = _cached(f"quote:{ticker}", lambda: _fetch_quote(ticker))
-        exps = _cached(f"exps:{ticker}", lambda: _fetch_expirations(ticker))
-        if not exps:
-            return jsonify({"error": "No expirations found", "ticker": ticker}), 404
+    """Return real options chain from Tradier for the terminal options panel.
+    Self-contained — calls Tradier API directly, no data_provider dependency."""
+    import requests as _req
+    from datetime import datetime, date
 
-        # Use the requested expiry or default to nearest
-        req_exp = request.args.get("exp", None)
-        if req_exp:
+    TRADIER_TOKEN = os.getenv("TRADIER_TOKEN", "BkkUX4cdeBXLkAejHAm8mKeOGTzt")
+    TRADIER_BASE  = "https://api.tradier.com/v1"
+    HEADERS = {
+        "Authorization": f"Bearer {TRADIER_TOKEN}",
+        "Accept": "application/json",
+    }
+
+    ticker = request.args.get("ticker", "QQQ").upper()
+
+    try:
+        # Step 1: Get expirations
+        exp_resp = _req.get(
+            f"{TRADIER_BASE}/markets/options/expirations",
+            params={"symbol": ticker, "includeAllRoots": "true", "strikes": "false"},
+            headers=HEADERS, timeout=10
+        ).json()
+        raw_dates = exp_resp.get("expirations", {}).get("date", [])
+        if isinstance(raw_dates, str):
+            raw_dates = [raw_dates]
+        if not raw_dates:
+            return jsonify({"error": f"No expirations found for {ticker}"}), 404
+
+        today = date.today()
+        expirations = []
+        for d in raw_dates:
+            try:
+                exp_dt = datetime.strptime(d, "%Y-%m-%d").date()
+                dte = (exp_dt - today).days
+                label = exp_dt.strftime("%b %d")
+                expirations.append({"date": d, "label": label, "dte": dte})
+            except Exception:
+                continue
+
+        # Pick requested expiry or nearest
+        req_exp = request.args.get("exp", "")
+        if req_exp and any(e["date"] == req_exp for e in expirations):
             exp_date = req_exp
         else:
-            exp_date = exps[0]["date"]  # nearest expiry
-        exp_label = next((e["label"] for e in exps if e["date"] == exp_date), exp_date)
-        exp_dte = next((e["dte"] for e in exps if e["date"] == exp_date), 0)
+            exp_date = expirations[0]["date"]  # nearest
+        exp_label = next((e["label"] for e in expirations if e["date"] == exp_date), exp_date)
+        exp_dte = next((e["dte"] for e in expirations if e["date"] == exp_date), 0)
 
-        chain = _cached(f"chain:{ticker}:{exp_date}", lambda: _fetch_chain(ticker, exp_date))
+        # Step 2: Get chain with greeks
+        chain_resp = _req.get(
+            f"{TRADIER_BASE}/markets/options/chains",
+            params={"symbol": ticker, "expiration": exp_date, "greeks": "true"},
+            headers=HEADERS, timeout=10
+        ).json()
+        raw_chain = chain_resp.get("options", {}).get("option", [])
+        if isinstance(raw_chain, dict):
+            raw_chain = [raw_chain]
 
-        # Build clean response
+        # Step 3: Get spot price
+        quote_resp = _req.get(
+            f"{TRADIER_BASE}/markets/quotes",
+            params={"symbols": ticker, "greeks": "false"},
+            headers=HEADERS, timeout=10
+        ).json()
+        quote = quote_resp.get("quotes", {}).get("quote", {})
+        spot = float(quote.get("last") or quote.get("close") or 0)
+
+        # Step 4: Build response
         rows = []
-        for opt in chain:
+        for opt in raw_chain:
             greeks = opt.get("greeks") or {}
+            mid_iv = greeks.get("mid_iv")
+            iv_str = str(round(float(mid_iv) * 100, 1)) if mid_iv else None
             rows.append({
-                "strike":  _safe(opt.get("strike")),
+                "strike":  float(opt.get("strike", 0)),
                 "type":    opt.get("option_type", ""),
-                "bid":     _safe(opt.get("bid")),
-                "ask":     _safe(opt.get("ask")),
-                "last":    _safe(opt.get("last")),
-                "volume":  int(_safe(opt.get("volume"))),
-                "oi":      int(_safe(opt.get("open_interest"))),
-                "iv":      round(_safe(greeks.get("mid_iv")) * 100, 1) if greeks.get("mid_iv") else None,
-                "delta":   round(_safe(greeks.get("delta")), 4) if greeks.get("delta") is not None else None,
-                "gamma":   round(_safe(greeks.get("gamma")), 6) if greeks.get("gamma") is not None else None,
-                "theta":   round(_safe(greeks.get("theta")), 4) if greeks.get("theta") is not None else None,
-                "vega":    round(_safe(greeks.get("vega")), 4) if greeks.get("vega") is not None else None,
+                "bid":     float(opt.get("bid") or 0),
+                "ask":     float(opt.get("ask") or 0),
+                "last":    float(opt.get("last") or 0),
+                "volume":  int(opt.get("volume") or 0),
+                "oi":      int(opt.get("open_interest") or 0),
+                "iv":      iv_str,
+                "delta":   round(float(greeks.get("delta", 0)), 4) if greeks.get("delta") is not None else None,
+                "gamma":   round(float(greeks.get("gamma", 0)), 6) if greeks.get("gamma") is not None else None,
+                "theta":   round(float(greeks.get("theta", 0)), 4) if greeks.get("theta") is not None else None,
+                "vega":    round(float(greeks.get("vega", 0)), 4) if greeks.get("vega") is not None else None,
             })
 
         return jsonify({
@@ -637,11 +685,12 @@ def api_chain():
             "expiry": exp_date,
             "expiry_label": exp_label,
             "dte": exp_dte,
-            "expirations": [{"date": e["date"], "label": e["label"], "dte": e["dte"]} for e in exps[:8]],
+            "expirations": expirations[:12],
             "chain": rows,
         })
     except Exception as e:
-        print(f"[api/chain] Error: {e}")
+        import traceback
+        print(f"[api/chain] Error: {e}\n{traceback.format_exc()}")
         return jsonify({"error": str(e)}), 500
 
 
