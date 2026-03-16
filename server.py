@@ -1,5 +1,5 @@
-"""
-Greek Bot â€” Flask Web Server
+"""""
+Altaris Terminal - Flask Web Server
 """
 import sys, os, json, secrets, hashlib, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
