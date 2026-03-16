@@ -4637,8 +4637,11 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     // ── Auto-start L2 chart (skip tab routing) ──
-    _l2InitCandleChart();
-    _startL2Poll();
+    // Use rAF to ensure CSS grid layout is fully computed before chart reads container dimensions
+    requestAnimationFrame(() => {
+        _l2InitCandleChart();
+        _startL2Poll();
+    });
 
     // ── Populate Options Chain with mock data ──
     _ocPopulateChain();

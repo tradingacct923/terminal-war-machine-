@@ -4223,6 +4223,8 @@ h3 {
   overflow: hidden;
   background: var(--bg, #06080f);
   position: relative;
+  min-height: 0;
+  height: 100%;
 }
 
 /* ── Options Chain Panel ── */
