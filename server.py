@@ -590,6 +590,61 @@ def api_candles():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/chain")
+def api_chain():
+    """Return real options chain from Tradier for use by the terminal options panel."""
+    try:
+        from data_provider import _fetch_expirations, _fetch_chain, _fetch_quote, _cached, _safe
+        ticker = get_ticker()
+        spot = _cached(f"quote:{ticker}", lambda: _fetch_quote(ticker))
+        exps = _cached(f"exps:{ticker}", lambda: _fetch_expirations(ticker))
+        if not exps:
+            return jsonify({"error": "No expirations found", "ticker": ticker}), 404
+
+        # Use the requested expiry or default to nearest
+        req_exp = request.args.get("exp", None)
+        if req_exp:
+            exp_date = req_exp
+        else:
+            exp_date = exps[0]["date"]  # nearest expiry
+        exp_label = next((e["label"] for e in exps if e["date"] == exp_date), exp_date)
+        exp_dte = next((e["dte"] for e in exps if e["date"] == exp_date), 0)
+
+        chain = _cached(f"chain:{ticker}:{exp_date}", lambda: _fetch_chain(ticker, exp_date))
+
+        # Build clean response
+        rows = []
+        for opt in chain:
+            greeks = opt.get("greeks") or {}
+            rows.append({
+                "strike":  _safe(opt.get("strike")),
+                "type":    opt.get("option_type", ""),
+                "bid":     _safe(opt.get("bid")),
+                "ask":     _safe(opt.get("ask")),
+                "last":    _safe(opt.get("last")),
+                "volume":  int(_safe(opt.get("volume"))),
+                "oi":      int(_safe(opt.get("open_interest"))),
+                "iv":      round(_safe(greeks.get("mid_iv")) * 100, 1) if greeks.get("mid_iv") else None,
+                "delta":   round(_safe(greeks.get("delta")), 4) if greeks.get("delta") is not None else None,
+                "gamma":   round(_safe(greeks.get("gamma")), 6) if greeks.get("gamma") is not None else None,
+                "theta":   round(_safe(greeks.get("theta")), 4) if greeks.get("theta") is not None else None,
+                "vega":    round(_safe(greeks.get("vega")), 4) if greeks.get("vega") is not None else None,
+            })
+
+        return jsonify({
+            "ticker": ticker,
+            "spot": spot,
+            "expiry": exp_date,
+            "expiry_label": exp_label,
+            "dte": exp_dte,
+            "expirations": [{"date": e["date"], "label": e["label"], "dte": e["dte"]} for e in exps[:8]],
+            "chain": rows,
+        })
+    except Exception as e:
+        print(f"[api/chain] Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/spot")
 def api_spot():
     """Lightweight quote-only endpoint — single Tradier call, no options processing."""

@@ -4016,7 +4016,44 @@ let _l2CandlePollTimer = null;
 let _l2SeamTime = 0;  // timestamp of the first candle with live bubble data
 let _l2TapeAll = [];   // accumulated trades, newest first
 
+// ── Wall / Max Pain overlay state ──
+let _l2WallLines = [];   // stored price line refs for cleanup
+let _l2WallTimer = null; // refresh interval
+let _ocRefreshTimer = null; // options chain auto-refresh
+
 const L2_SYMBOLS = ['NQ', 'ES', 'YM', 'RTY'];
+
+// ── Timezone helper: UTC epoch → Eastern Time epoch ──
+// LWC treats the time field as UTC, so we offset it to ET
+// to make the x-axis show ET hours. Handles EST/EDT automatically.
+function _utcToET(utcEpoch) {
+    // Create a Date from the UTC epoch
+    const d = new Date(utcEpoch * 1000);
+    // Format in ET to get the offset
+    const etStr = d.toLocaleString('en-US', { timeZone: 'America/New_York' });
+    const etDate = new Date(etStr);
+    // The difference between UTC and the ET interpretation gives us the offset
+    const offsetMs = etDate.getTime() - d.getTime();
+    // But we need the ACTUAL offset (ET is behind UTC)
+    // toLocaleString round-trips lose ms, so compute directly:
+    // Get the ET timezone offset in minutes
+    const utcParts = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'America/New_York',
+        hour: 'numeric', minute: 'numeric',
+        hour12: false, timeZoneName: 'shortOffset',
+    }).formatToParts(d);
+    // Extract offset from parts (e.g., "GMT-4" or "GMT-5")
+    const tzPart = utcParts.find(p => p.type === 'timeZoneName');
+    if (tzPart) {
+        const match = tzPart.value.match(/GMT([+-]?\d+)/);
+        if (match) {
+            const offsetHours = parseInt(match[1]);
+            return utcEpoch + (offsetHours * 3600);
+        }
+    }
+    // Fallback: assume EDT (-4)
+    return utcEpoch - (4 * 3600);
+}
 
 const SIG_META = {
     shannon_entropy:     { label: 'Shannon Entropy',     unit: 'bits', hi: 8,    good: 'chaos', color: '#7c5af7' },
@@ -4349,16 +4386,16 @@ function _l2FetchCandles(fullRedraw) {
 
             if (fullRedraw) {
                 // ── FULL HISTORY: setData() once ──
-                // Used on initial load and symbol/timeframe switches only.
+                // All timestamps offset to ET for x-axis display
                 const ohlc = candles.map(c => ({
-                    time: c.time,
+                    time: _utcToET(c.time),
                     open: c.open,
                     high: c.high,
                     low: c.low,
                     close: c.close,
                 }));
                 const vol = candles.map(c => ({
-                    time: c.time,
+                    time: _utcToET(c.time),
                     value: c.volume || 0,
                     color: c.close >= c.open ? 'rgba(31,209,122,.25)' : 'rgba(224,48,96,.25)',
                 }));
@@ -4367,25 +4404,20 @@ function _l2FetchCandles(fullRedraw) {
                 _l2CandleChart.timeScale().fitContent();
 
                 // ── VOLUME BUBBLE DATA ──
-                // Feed the custom bubble series with candle data + bp profiles.
-                // Only candles with bp will render bubbles; historical candles
-                // produce empty renders (no bp key).
                 if (_l2BubbleSeries) {
                     const bubbleData = candles.map(c => ({
-                        time: c.time,
-                        close: c.close,  // needed for priceValueBuilder
+                        time: _utcToET(c.time),
+                        close: c.close,
                         bp: c.bp || null,
                     }));
                     _l2BubbleSeries.setData(bubbleData);
                 }
 
                 // ── LIVE DATA SEAM MARKER ──
-                // Find the first candle with bubble profile data (bp).
-                // This marks where live WebSocket data starts.
                 _l2SeamTime = 0;
                 for (const c of candles) {
                     if (c.bp && Object.keys(c.bp).length > 0) {
-                        _l2SeamTime = c.time;
+                        _l2SeamTime = _utcToET(c.time);
                         break;
                     }
                 }
@@ -4400,29 +4432,28 @@ function _l2FetchCandles(fullRedraw) {
                 } else {
                     _l2CandleSeries.setMarkers([]);
                 }
+
+                // ── Fetch wall/max-pain overlays on full redraw ──
+                _l2UpdateWallLines();
             } else {
                 // ── DELTA UPDATE: update() only ──
-                // Server returns only candles with time >= _l2LastCandleTime
-                // (typically 1-2 candles). update() handles both:
-                //   - Modifying the current bar (same timestamp)
-                //   - Appending a new bar (new timestamp)
                 for (const c of candles) {
+                    const et = _utcToET(c.time);
                     _l2CandleSeries.update({
-                        time: c.time,
+                        time: et,
                         open: c.open,
                         high: c.high,
                         low: c.low,
                         close: c.close,
                     });
                     _l2VolumeSeries.update({
-                        time: c.time,
+                        time: et,
                         value: c.volume || 0,
                         color: c.close >= c.open ? 'rgba(31,209,122,.25)' : 'rgba(224,48,96,.25)',
                     });
-                    // Update bubble series with latest bp data
                     if (_l2BubbleSeries) {
                         _l2BubbleSeries.update({
-                            time: c.time,
+                            time: et,
                             close: c.close,
                             bp: c.bp || null,
                         });
@@ -4430,7 +4461,7 @@ function _l2FetchCandles(fullRedraw) {
                 }
             }
 
-            // Track the newest candle timestamp for next delta poll
+            // Track the newest candle timestamp (raw UTC for ?since= param)
             _l2LastCandleTime = candles[candles.length - 1].time;
         })
         .catch(() => {});
@@ -4511,84 +4542,137 @@ const TerminalBus = {
 };
 window.TerminalBus = TerminalBus;
 
-// ── Options Chain: mock data + population ──
+// ── Options Chain: real Tradier data ──
 let _ocSelectedStrike = null;
 
 function _ocPopulateChain() {
     const tbody = document.getElementById('oc-tbody');
     if (!tbody) return;
 
-    // Mock ATM based on current spot (or default to $594 for QQQ)
-    const spotEl = document.getElementById('t-spot') || document.getElementById('ds-spot');
-    const spot = parseFloat(spotEl?.textContent) || 594;
-    const atm = Math.round(spot);  // nearest integer strike
+    const ticker = document.getElementById('oc-symbol')?.value || 'QQQ';
 
-    // Generate 10 strikes above and below ATM
-    const strikes = [];
-    for (let i = 10; i >= -10; i--) {
-        strikes.push(atm + i);
-    }
+    authFetch(`/api/chain?ticker=${ticker}`)
+        .then(r => r.json())
+        .then(data => {
+            if (data.error) {
+                console.warn('[OptionsChain] API error:', data.error);
+                return;
+            }
 
-    const rows = strikes.map(strike => {
-        const dist = Math.abs(strike - spot);
-        const isATM = strike === atm;
-        const isITMCall = strike < spot;
-        const isITMPut = strike > spot;
+            const spot = data.spot || 0;
+            const chain = data.chain || [];
 
-        // Mock realistic-ish options data
-        const baseIV = 22 + Math.random() * 8;
-        const cBid = Math.max(0, (spot - strike + 2) * (1 + Math.random() * 0.3)).toFixed(2);
-        const cAsk = (parseFloat(cBid) + 0.05 + Math.random() * 0.15).toFixed(2);
-        const cVol = Math.floor(Math.random() * 5000 + (dist < 3 ? 8000 : 500));
-        const cIV = (baseIV + dist * 0.3).toFixed(1);
-        const pBid = Math.max(0, (strike - spot + 2) * (1 + Math.random() * 0.3)).toFixed(2);
-        const pAsk = (parseFloat(pBid) + 0.05 + Math.random() * 0.15).toFixed(2);
-        const pVol = Math.floor(Math.random() * 4000 + (dist < 3 ? 6000 : 400));
-        const pIV = (baseIV + dist * 0.25).toFixed(1);
+            // Group by strike: {strike: {call: {...}, put: {...}}}
+            const byStrike = {};
+            for (const opt of chain) {
+                const s = opt.strike;
+                if (!byStrike[s]) byStrike[s] = {};
+                byStrike[s][opt.type] = opt;
+            }
 
-        const classes = [
-            isATM ? 'oc-atm' : '',
-            isITMCall ? 'oc-itm' : '',
-        ].filter(Boolean).join(' ');
+            const strikes = Object.keys(byStrike).map(Number).sort((a, b) => b - a);
+            const atm = strikes.reduce((best, s) =>
+                Math.abs(s - spot) < Math.abs(best - spot) ? s : best, strikes[0]);
 
-        return `<tr class="${classes}" data-strike="${strike}">
-            <td class="oc-call-cell">${cBid}</td>
-            <td class="oc-call-cell">${cAsk}</td>
-            <td class="oc-call-cell">${cVol.toLocaleString()}</td>
-            <td class="oc-call-cell">${cIV}%</td>
-            <td class="oc-strike-cell">${strike}</td>
-            <td class="oc-put-cell">${pBid}</td>
-            <td class="oc-put-cell">${pAsk}</td>
-            <td class="oc-put-cell">${pVol.toLocaleString()}</td>
-            <td class="oc-put-cell">${pIV}%</td>
-        </tr>`;
-    }).join('');
+            const rows = strikes.map(strike => {
+                const c = byStrike[strike]?.call || {};
+                const p = byStrike[strike]?.put || {};
+                const isATM = strike === atm;
+                const isITMCall = strike < spot;
 
-    tbody.innerHTML = rows;
+                const classes = [
+                    isATM ? 'oc-atm' : '',
+                    isITMCall ? 'oc-itm' : '',
+                ].filter(Boolean).join(' ');
 
-    // Click-to-select wiring
-    tbody.querySelectorAll('.oc-strike-cell').forEach(cell => {
-        cell.addEventListener('click', () => {
-            const strike = parseInt(cell.textContent);
-            // Remove previous selection
-            tbody.querySelectorAll('.oc-selected').forEach(r => r.classList.remove('oc-selected'));
-            // Highlight this row
-            cell.parentElement.classList.add('oc-selected');
-            _ocSelectedStrike = strike;
-            // Emit to bus — chart can listen for this
-            TerminalBus.emit('strike-select', {
-                strike,
-                symbol: document.getElementById('oc-symbol')?.value || 'QQQ',
+                return `<tr class="${classes}" data-strike="${strike}">
+                    <td class="oc-call-cell">${(c.bid || 0).toFixed(2)}</td>
+                    <td class="oc-call-cell">${(c.ask || 0).toFixed(2)}</td>
+                    <td class="oc-call-cell">${(c.volume || 0).toLocaleString()}</td>
+                    <td class="oc-call-cell">${c.iv != null ? c.iv + '%' : '—'}</td>
+                    <td class="oc-strike-cell">${strike}</td>
+                    <td class="oc-put-cell">${(p.bid || 0).toFixed(2)}</td>
+                    <td class="oc-put-cell">${(p.ask || 0).toFixed(2)}</td>
+                    <td class="oc-put-cell">${(p.volume || 0).toLocaleString()}</td>
+                    <td class="oc-put-cell">${p.iv != null ? p.iv + '%' : '—'}</td>
+                </tr>`;
+            }).join('');
+
+            tbody.innerHTML = rows;
+
+            // Update expiry label if present
+            const expLabel = document.getElementById('oc-exp-label');
+            if (expLabel) expLabel.textContent = `${data.expiry_label} (${data.dte}d)`;
+
+            // Click-to-select wiring
+            tbody.querySelectorAll('.oc-strike-cell').forEach(cell => {
+                cell.addEventListener('click', () => {
+                    const strike = parseFloat(cell.textContent);
+                    tbody.querySelectorAll('.oc-selected').forEach(r => r.classList.remove('oc-selected'));
+                    cell.parentElement.classList.add('oc-selected');
+                    _ocSelectedStrike = strike;
+                    TerminalBus.emit('strike-select', { strike, symbol: ticker });
+                });
             });
-            console.log(`[TerminalBus] strike-select: ${strike}`);
-        });
-    });
 
-    // Auto-scroll to ATM
-    const atmRow = tbody.querySelector('.oc-atm');
-    if (atmRow) {
-        setTimeout(() => atmRow.scrollIntoView({ block: 'center', behavior: 'smooth' }), 100);
+            // Auto-scroll to ATM
+            const atmRow = tbody.querySelector('.oc-atm');
+            if (atmRow) {
+                setTimeout(() => atmRow.scrollIntoView({ block: 'center', behavior: 'smooth' }), 100);
+            }
+        })
+        .catch(err => console.warn('[OptionsChain] fetch error:', err));
+}
+
+// ── Wall / Max Pain overlays on L2 chart ──
+function _l2UpdateWallLines() {
+    if (!_l2CandleSeries) return;
+
+    // Remove old lines
+    for (const line of _l2WallLines) {
+        try { _l2CandleSeries.removePriceLine(line); } catch(e) {}
     }
+    _l2WallLines = [];
+
+    authFetch('/api/data')
+        .then(r => r.json())
+        .then(data => {
+            if (data.error) return;
+
+            const lines = [
+                {
+                    price: data.put_wall,
+                    title: `PUT WALL @ ${data.put_wall}`,
+                    color: 'rgba(224, 48, 96, 0.8)',
+                },
+                {
+                    price: data.call_wall,
+                    title: `CALL WALL @ ${data.call_wall}`,
+                    color: 'rgba(31, 209, 122, 0.8)',
+                },
+                {
+                    price: data.max_pain,
+                    title: `MAX PAIN @ ${data.max_pain}`,
+                    color: 'rgba(255, 200, 50, 0.85)',
+                },
+            ];
+
+            for (const cfg of lines) {
+                if (!cfg.price || cfg.price <= 0) continue;
+                const pl = _l2CandleSeries.createPriceLine({
+                    price: cfg.price,
+                    color: cfg.color,
+                    lineWidth: 1,
+                    lineStyle: LightweightCharts.LineStyle.Dashed,
+                    axisLabelVisible: true,
+                    title: cfg.title,
+                });
+                _l2WallLines.push(pl);
+            }
+
+            console.log(`[Walls] Put:${data.put_wall} Call:${data.call_wall} MaxPain:${data.max_pain}`);
+        })
+        .catch(() => {});
 }
 
 // ── Bridge: push existing dashboard metrics into toolbar ──
@@ -4644,8 +4728,12 @@ document.addEventListener('DOMContentLoaded', () => {
         _startL2Poll();
     });
 
-    // ── Populate Options Chain with mock data ──
+    // ── Populate Options Chain with real Tradier data + auto-refresh ──
     _ocPopulateChain();
+    _ocRefreshTimer = setInterval(_ocPopulateChain, 60000); // refresh every 60s
+
+    // ── Wall / Max Pain overlay refresh ──
+    _l2WallTimer = setInterval(_l2UpdateWallLines, 90000); // refresh every 90s
 
     // ── Metric bridge: update toolbar from old dash metrics ──
     setInterval(_termUpdateMetrics, 2000);
