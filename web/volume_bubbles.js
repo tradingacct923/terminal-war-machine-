@@ -21,7 +21,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 const BUBBLE_CONFIG = {
     // ── Thresholds ──
-    MIN_BUBBLE_VOL: 10,           // min total vol to draw (filters noise during NY open)
+    MIN_BUBBLE_VOL: 1,            // min total vol to draw (set to 10+ for NY open noise filter)
     INSTITUTIONAL_THRESHOLD: 100, // 100+ contracts = institutional print
     ABSORPTION_MIN: 50,           // both buy AND sell must exceed this for absorption
     ABSORPTION_RATIO: 0.35,       // minor side must be at least 35% of total (no 95/5 splits)
