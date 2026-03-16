@@ -70,7 +70,7 @@ class TopStepXConnector:
             on_dom_update=my_dom_cb,
             on_trade=my_trade_cb,
         )
-        conn.start(symbols=["NQ", "ES", "YM", "RTY"])
+        conn.start(symbols=["NQ", "GC"])
         ...
         conn.stop()
 

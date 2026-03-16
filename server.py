@@ -595,7 +595,7 @@ def api_chain():
     """Return real options chain from Tradier for use by the terminal options panel."""
     try:
         from data_provider import _fetch_expirations, _fetch_chain, _fetch_quote, _cached, _safe
-        ticker = get_ticker()
+        ticker = request.args.get("ticker", get_ticker())
         spot = _cached(f"quote:{ticker}", lambda: _fetch_quote(ticker))
         exps = _cached(f"exps:{ticker}", lambda: _fetch_expirations(ticker))
         if not exps:
@@ -695,6 +695,33 @@ def api_data():
         "vannex_hm": _build_heatmap(data["vannex"]),
         "cex_hm":    _build_tex_heatmap(data["cex"]),
     }
+
+    # ── Convert QQQ wall prices → NQ-equivalent for chart overlay ──
+    # The chart shows NQ futures (~24500) but walls are QQQ (~495).
+    # Use live NQ mid price from L2 state for accurate conversion.
+    try:
+        from background_engine.l2_worker import get_l2_state
+        l2 = get_l2_state()
+        nq_mid = l2.get("mid_prices", {}).get("NQ", 0)
+        qqq_spot = data["spot"]
+        if nq_mid > 0 and qqq_spot > 0:
+            ratio = nq_mid / qqq_spot
+        else:
+            ratio = 40.0  # fallback approximation
+        # Preserve QQQ values for toolbar display
+        result["qqq_spot"] = qqq_spot
+        result["qqq_put_wall"] = result["put_wall"]
+        result["qqq_call_wall"] = result["call_wall"]
+        result["qqq_max_pain"] = result["max_pain"]
+        result["nq_mid"] = nq_mid
+        result["ratio"] = round(ratio, 4)
+        # Overwrite wall prices with NQ-equivalent for chart lines
+        result["put_wall"] = round(result["qqq_put_wall"] * ratio, 2)
+        result["call_wall"] = round(result["qqq_call_wall"] * ratio, 2)
+        result["max_pain"] = round(result["qqq_max_pain"] * ratio, 2)
+    except Exception as e:
+        print(f"[api/data] NQ conversion warning: {e}")
+
     return jsonify(result)
 
 @app.route("/api/vol_skew_multi")

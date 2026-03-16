@@ -4115,11 +4115,11 @@ function _l2RenderDOM(dom) {
     const body = document.getElementById('l2-dom-body');
     const stats = document.getElementById('l2-dom-stats');
     if (!body) return;
-    const nq = dom ? (dom[_l2ChartSymbol] || {}) : {};
-    const bids = nq.bids || {};
-    const asks = nq.asks || {};
-    const bestBid = nq.best_bid || 0;
-    const bestAsk = nq.best_ask || 0;
+    const symData = dom ? (dom[_l2ChartSymbol] || {}) : {};
+    const bids = symData.bids || {};
+    const asks = symData.asks || {};
+    const bestBid = symData.best_bid || 0;
+    const bestAsk = symData.best_ask || 0;
     if (stats) stats.textContent = `bids: ${Object.keys(bids).length}  asks: ${Object.keys(asks).length}  spread: ${bestAsk && bestBid ? (bestAsk - bestBid).toFixed(2) : '—'}`;
 
     // Sort: bids desc (highest first), asks asc (lowest = nearest first)
@@ -4167,6 +4167,8 @@ function _l2RenderDOM(dom) {
     body.innerHTML = rows;
 }
 
+let _l2TapePrevLen = 0;  // tape dedup tracker
+
 function _l2RenderTape(trades) {
     const body = document.getElementById('l2-tape-body');
     const cnt  = document.getElementById('l2-tape-count');
@@ -4181,6 +4183,9 @@ function _l2RenderTape(trades) {
     // Deduplicate and cap
     _l2TapeAll = _l2TapeAll.slice(0, 300);
     if (cnt) cnt.textContent = `${_l2TapeAll.length} prints`;
+    // Skip expensive innerHTML rebuild if no new trades arrived
+    if (_l2TapeAll.length === _l2TapePrevLen) return;
+    _l2TapePrevLen = _l2TapeAll.length;
     const top50 = _l2TapeAll.slice(0, 80);
     body.innerHTML = top50.map(t => {
         const side = t.side || (t.spin > 0 ? 'buy' : 'sell');
@@ -4286,7 +4291,7 @@ function _l2InitCandleChart() {
         borderDownColor: '#e03060',
         wickUpColor: 'rgba(31,209,122,.7)',
         wickDownColor: 'rgba(224,48,96,.7)',
-        priceFormat: { type: 'price', precision: 2, minMove: 0.25 },
+        priceFormat: { type: 'price', precision: 2, minMove: L2_TICK_SIZES[_l2ChartSymbol] || 0.25 },
     });
 
     _l2VolumeSeries = _l2CandleChart.addHistogramSeries({
@@ -4506,7 +4511,7 @@ function _l2ScheduleDomPoll() {
         loadL2().finally(() => {
             _l2ScheduleDomPoll();
         });
-    }, 500);
+    }, 1000);  // 1s between DOM/tape polls (was 500ms — reduced DOM thrash)
 }
 
 function _startL2Poll() {
@@ -4546,13 +4551,17 @@ window.TerminalBus = TerminalBus;
 // ── Options Chain: real Tradier data ──
 let _ocSelectedStrike = null;
 
-function _ocPopulateChain() {
+function _ocPopulateChain(selectedExp) {
     const tbody = document.getElementById('oc-tbody');
     if (!tbody) return;
 
     const ticker = document.getElementById('oc-symbol')?.value || 'QQQ';
+    const expParam = selectedExp || document.getElementById('oc-expiry')?.value || '';
+    const url = expParam
+        ? `/api/chain?ticker=${ticker}&exp=${expParam}`
+        : `/api/chain?ticker=${ticker}`;
 
-    authFetch(`/api/chain?ticker=${ticker}`)
+    authFetch(url)
         .then(r => r.json())
         .then(data => {
             if (data.error) {
@@ -4605,6 +4614,19 @@ function _ocPopulateChain() {
             const expLabel = document.getElementById('oc-exp-label');
             if (expLabel) expLabel.textContent = `${data.expiry_label} (${data.dte}d)`;
 
+            // Dynamically populate expiry dropdown from API
+            const expSelect = document.getElementById('oc-expiry');
+            if (expSelect && data.expirations && data.expirations.length > 0) {
+                const currentVal = expSelect.value;
+                expSelect.innerHTML = data.expirations.map(e =>
+                    `<option value="${e.date}" ${e.date === data.expiry ? 'selected' : ''}>${e.label} (${e.dte}d)</option>`
+                ).join('');
+                // Restore previous selection if still valid
+                if (currentVal && [...expSelect.options].some(o => o.value === currentVal)) {
+                    expSelect.value = currentVal;
+                }
+            }
+
             // Click-to-select wiring
             tbody.querySelectorAll('.oc-strike-cell').forEach(cell => {
                 cell.addEventListener('click', () => {
@@ -4640,20 +4662,21 @@ function _l2UpdateWallLines() {
         .then(data => {
             if (data.error) return;
 
+            // Wall prices are now in NQ-equivalent (converted by backend)
             const lines = [
                 {
                     price: data.put_wall,
-                    title: `PUT WALL @ ${data.put_wall}`,
+                    title: `PUT WALL (QQQ ${data.qqq_put_wall || '?'})`,
                     color: 'rgba(224, 48, 96, 0.8)',
                 },
                 {
                     price: data.call_wall,
-                    title: `CALL WALL @ ${data.call_wall}`,
+                    title: `CALL WALL (QQQ ${data.qqq_call_wall || '?'})`,
                     color: 'rgba(31, 209, 122, 0.8)',
                 },
                 {
                     price: data.max_pain,
-                    title: `MAX PAIN @ ${data.max_pain}`,
+                    title: `MAX PAIN (QQQ ${data.qqq_max_pain || '?'})`,
                     color: 'rgba(255, 200, 50, 0.85)',
                 },
             ];
@@ -4671,7 +4694,15 @@ function _l2UpdateWallLines() {
                 _l2WallLines.push(pl);
             }
 
-            console.log(`[Walls] Put:${data.put_wall} Call:${data.call_wall} MaxPain:${data.max_pain}`);
+            // Update toolbar metrics with QQQ values
+            const setCW = document.getElementById('t-cw');
+            const setPW = document.getElementById('t-pw');
+            const setMP = document.getElementById('t-mp');
+            if (setCW) setCW.textContent = data.qqq_call_wall || '—';
+            if (setPW) setPW.textContent = data.qqq_put_wall || '—';
+            if (setMP) setMP.textContent = data.qqq_max_pain || '—';
+
+            console.log(`[Walls] NQ: PW=${data.put_wall} CW=${data.call_wall} MP=${data.max_pain} | QQQ: PW=${data.qqq_put_wall} CW=${data.qqq_call_wall} MP=${data.qqq_max_pain}`);
         })
         .catch(() => {});
 }
@@ -4738,7 +4769,19 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // ── Populate Options Chain with real Tradier data + auto-refresh ──
     _ocPopulateChain();
-    _ocRefreshTimer = setInterval(_ocPopulateChain, 60000); // refresh every 60s
+    _ocRefreshTimer = setInterval(() => _ocPopulateChain(), 60000); // refresh every 60s
+
+    // ── Wire symbol & expiry dropdown changes ──
+    const ocSymSelect = document.getElementById('oc-symbol');
+    const ocExpSelect = document.getElementById('oc-expiry');
+    if (ocSymSelect) {
+        ocSymSelect.addEventListener('change', () => _ocPopulateChain());
+    }
+    if (ocExpSelect) {
+        ocExpSelect.addEventListener('change', () => {
+            _ocPopulateChain(ocExpSelect.value);
+        });
+    }
 
     // ── Wall / Max Pain overlay refresh ──
     _l2WallTimer = setInterval(_l2UpdateWallLines, 90000); // refresh every 90s
