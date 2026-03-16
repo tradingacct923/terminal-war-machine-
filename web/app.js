@@ -4263,9 +4263,10 @@ function _l2InitCandleChart() {
     // Volume Bubble custom series (renders bp data as circles on the chart)
     if (typeof VolumeBubbleSeries !== 'undefined') {
         _l2BubbleSeries = _l2CandleChart.addCustomSeries(new VolumeBubbleSeries(), {
-            priceScaleId: '',    // overlay on main price scale
+            priceScaleId: 'right',   // MUST match candlestick series scale for Y-alignment
             lastValueVisible: false,
             priceLineVisible: false,
+            autoscaleInfoProvider: () => null,  // don't let bubbles affect price scale range
         });
     }
 

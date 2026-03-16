@@ -200,14 +200,12 @@ class VolumeBubbleSeries {
      * includes bubble positions in the visible price range.
      */
     priceValueBuilder(plotRow) {
-        const bp = plotRow.bp;
-        if (!bp || typeof bp !== 'object') {
-            // No bubble data — use the close price for scaling
-            return [plotRow.close || 0];
-        }
-        const prices = Object.keys(bp).map(Number).filter(p => !isNaN(p));
-        if (prices.length === 0) return [plotRow.close || 0];
-        return [Math.max(...prices), Math.min(...prices), plotRow.close || 0];
+        // Return only close price — do NOT expand scale with bp price keys.
+        // The bubbles share the candlestick 'right' price scale, so their
+        // Y-positions come from priceToCoordinate() in the renderer.
+        // Returning bp keys here would force LWC to auto-expand the scale
+        // range and detach bubbles from the candles.
+        return [plotRow.close || 0];
     }
 
     /**
