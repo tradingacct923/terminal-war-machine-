@@ -96,8 +96,9 @@ class VolumeBubbleRenderer {
 
                     // Convert price to Y coordinate
                     const price = parseFloat(priceStr);
+                    if (isNaN(price)) continue;
                     const y = priceConverter(price);
-                    if (y === null || y === undefined) continue;
+                    if (y === null || y === undefined || isNaN(y)) continue;
 
                     // Determine dominant side
                     const isBuy = buyVol >= sellVol;
