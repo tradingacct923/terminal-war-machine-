@@ -33,7 +33,7 @@ USERNAME = os.getenv("TOPSTEPX_USERNAME", "")
 API_KEY  = os.getenv("TOPSTEPX_API_KEY",  "")
 
 # ── Symbols to stream ────────────────────────────────────────────────────────
-SYMBOLS = ["NQ", "ES", "YM", "RTY"]
+SYMBOLS = ["NQ", "GC"]
 
 # ── OHLC Candle Engine ────────────────────────────────────────────────────────
 # Aggregates tick-by-tick trades into OHLC candles for multiple timeframes.
@@ -43,7 +43,13 @@ CANDLE_TIMEFRAMES = {
     "1h": 3600, "4h": 14400,
 }
 CANDLE_MAX = 2000  # max candles stored per timeframe per symbol (holds full 24h session)
-BUBBLE_TICK_SIZE = 0.25  # price quantization for bubble profile (NQ/ES tick size)
+
+# Per-symbol tick sizes for bubble profile price quantization
+TICK_SIZES = {
+    "NQ": 0.25,   # NQ tick = $0.25
+    "GC": 0.10,   # Gold tick = $0.10
+}
+DEFAULT_TICK_SIZE = 0.25
 
 # {symbol: {tf: deque([{t,o,h,l,c,v}, ...])}}
 _CANDLES: dict[str, dict[str, deque]] = defaultdict(
@@ -81,8 +87,9 @@ def _feed_candle(symbol: str, price: float, volume: int, timestamp: float,
 
     Thread-safe: acquires _CANDLE_LOCK.
     """
-    # Quantize price to tick size for bubble aggregation
-    qp = str(round(round(price / BUBBLE_TICK_SIZE) * BUBBLE_TICK_SIZE, 2))
+    # Quantize price to symbol-specific tick size for bubble aggregation
+    tick_size = TICK_SIZES.get(symbol, DEFAULT_TICK_SIZE)
+    qp = str(round(round(price / tick_size) * tick_size, 2))
 
     with _CANDLE_LOCK:
         for tf, seconds in CANDLE_TIMEFRAMES.items():

@@ -40,10 +40,8 @@ MARKET_HUB  = os.getenv("TOPSTEPX_MARKET_HUB", "https://rtc.topstepx.com/hubs/ma
 # These are searched dynamically at startup via /api/Contract/search
 # so we don't hard-code expiry codes.
 SYMBOL_SEARCH = {
-    "NQ":  "NQ",   # E-mini Nasdaq
-    "ES":  "EP",   # E-mini S&P  (ProjectX uses "EP" for ES)
-    "YM":  "YM",   # E-mini Dow
-    "RTY": "RTY",  # E-mini Russell
+    "NQ":  "NQ",   # E-mini Nasdaq (CME)
+    "GC":  "GC",   # Gold futures (COMEX)
 }
 
 
@@ -258,7 +256,7 @@ class TopStepXConnector:
     def start(self, symbols: list[str] = None):
         """Connect and start streaming. Runs in a background thread."""
         if symbols is None:
-            symbols = ["NQ", "ES", "YM", "RTY"]
+            symbols = ["NQ", "GC"]
 
         self.authenticate()
         contract_ids = self._resolve_contracts(symbols)

@@ -4021,7 +4021,8 @@ let _l2WallLines = [];   // stored price line refs for cleanup
 let _l2WallTimer = null; // refresh interval
 let _ocRefreshTimer = null; // options chain auto-refresh
 
-const L2_SYMBOLS = ['NQ', 'ES', 'YM', 'RTY'];
+const L2_SYMBOLS = ['NQ', 'GC'];
+const L2_TICK_SIZES = { NQ: 0.25, GC: 0.10 };
 
 // ── Timezone helper: UTC epoch → Eastern Time epoch ──
 // LWC treats the time field as UTC, so we offset it to ET
@@ -4114,7 +4115,7 @@ function _l2RenderDOM(dom) {
     const body = document.getElementById('l2-dom-body');
     const stats = document.getElementById('l2-dom-stats');
     if (!body) return;
-    const nq = dom ? (dom['NQ'] || {}) : {};
+    const nq = dom ? (dom[_l2ChartSymbol] || {}) : {};
     const bids = nq.bids || {};
     const asks = nq.asks || {};
     const bestBid = nq.best_bid || 0;
@@ -4706,6 +4707,13 @@ document.addEventListener('DOMContentLoaded', () => {
             btn.classList.add('active');
             _l2ChartSymbol = btn.dataset.sym;
             _l2LastCandleTime = 0;
+            // Update price format for symbol-specific tick size
+            const tickSize = L2_TICK_SIZES[_l2ChartSymbol] || 0.25;
+            if (_l2CandleSeries) {
+                _l2CandleSeries.applyOptions({
+                    priceFormat: { type: 'price', precision: 2, minMove: tickSize },
+                });
+            }
             _l2FetchCandles(true);
         });
     });
