@@ -694,6 +694,95 @@ def api_chain():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/walls")
+def api_walls():
+    """Lightweight put/call wall + max pain — direct Tradier calls, no fetch_all."""
+    import requests as _req
+    from datetime import datetime, date
+
+    TRADIER_TOKEN = os.getenv("TRADIER_TOKEN", "BkkUX4cdeBXLkAejHAm8mKeOGTzt")
+    TRADIER_BASE  = "https://api.tradier.com/v1"
+    HEADERS = {"Authorization": f"Bearer {TRADIER_TOKEN}", "Accept": "application/json"}
+    ticker = request.args.get("ticker", "QQQ").upper()
+
+    try:
+        # Get nearest expiry
+        exp_resp = _req.get(f"{TRADIER_BASE}/markets/options/expirations",
+            params={"symbol": ticker}, headers=HEADERS, timeout=10).json()
+        raw_dates = exp_resp.get("expirations", {}).get("date", [])
+        if isinstance(raw_dates, str): raw_dates = [raw_dates]
+        if not raw_dates:
+            return jsonify({"error": f"No expirations for {ticker}"}), 404
+        exp_date = raw_dates[0]
+
+        # Get chain
+        chain_resp = _req.get(f"{TRADIER_BASE}/markets/options/chains",
+            params={"symbol": ticker, "expiration": exp_date, "greeks": "false"},
+            headers=HEADERS, timeout=10).json()
+        raw_chain = chain_resp.get("options", {}).get("option", [])
+        if isinstance(raw_chain, dict): raw_chain = [raw_chain]
+
+        # Get spot
+        quote_resp = _req.get(f"{TRADIER_BASE}/markets/quotes",
+            params={"symbols": ticker}, headers=HEADERS, timeout=10).json()
+        quote = quote_resp.get("quotes", {}).get("quote", {})
+        spot = float(quote.get("last") or quote.get("close") or 0)
+
+        # Build OI maps
+        call_oi, put_oi, strikes = {}, {}, set()
+        for opt in raw_chain:
+            strike = float(opt.get("strike", 0))
+            oi = int(opt.get("open_interest") or 0)
+            otype = opt.get("option_type", "")
+            strikes.add(strike)
+            if otype == "call":   call_oi[strike] = call_oi.get(strike, 0) + oi
+            elif otype == "put":  put_oi[strike] = put_oi.get(strike, 0) + oi
+
+        qqq_put_wall  = max(put_oi, key=put_oi.get) if put_oi else 0
+        qqq_call_wall = max(call_oi, key=call_oi.get) if call_oi else 0
+
+        # Max pain
+        sorted_strikes = sorted(strikes)
+        min_pain = float("inf")
+        qqq_max_pain = spot
+        for K in sorted_strikes:
+            pain = 0
+            for S in sorted_strikes:
+                if S < K:  pain += put_oi.get(S, 0) * (K - S) * 100
+                if S > K:  pain += call_oi.get(S, 0) * (S - K) * 100
+            if pain < min_pain:
+                min_pain = pain
+                qqq_max_pain = K
+
+        # Convert QQQ → NQ
+        try:
+            from background_engine.l2_worker import get_l2_state
+            nq_mid = get_l2_state().get("mid_prices", {}).get("NQ", 0)
+        except Exception:
+            nq_mid = 0
+        ratio = nq_mid / spot if (nq_mid > 0 and spot > 0) else 40.0
+
+        result = {
+            "put_wall":      round(qqq_put_wall * ratio, 2),
+            "call_wall":     round(qqq_call_wall * ratio, 2),
+            "max_pain":      round(qqq_max_pain * ratio, 2),
+            "qqq_spot":      spot,
+            "qqq_put_wall":  qqq_put_wall,
+            "qqq_call_wall": qqq_call_wall,
+            "qqq_max_pain":  qqq_max_pain,
+            "nq_mid":        nq_mid,
+            "ratio":         round(ratio, 4),
+            "expiry":        exp_date,
+        }
+        print(f"[api/walls] QQQ PW={qqq_put_wall} CW={qqq_call_wall} MP={qqq_max_pain} | "
+              f"NQ r={ratio:.2f} PW={result['put_wall']} CW={result['call_wall']} MP={result['max_pain']}")
+        return jsonify(result)
+    except Exception as e:
+        import traceback
+        print(f"[api/walls] Error: {e}\n{traceback.format_exc()}")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/spot")
 def api_spot():
     """Lightweight quote-only endpoint — single Tradier call, no options processing."""

@@ -4657,7 +4657,7 @@ function _l2UpdateWallLines() {
     }
     _l2WallLines = [];
 
-    authFetch('/api/data')
+    authFetch('/api/walls')
         .then(r => r.json())
         .then(data => {
             if (data.error) return;
