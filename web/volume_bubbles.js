@@ -58,6 +58,22 @@ const BUBBLE_CONFIG = {
     SWEEP_GLOW_BLUR:  8,                 // shadowBlur for sweep glow
     SWEEP_BURST_SIZE: 6,                 // burst effect radius at endpoints
 
+    // ── Delta Divergence ──
+    DIV_BEAR_COLOR:   [224, 48, 96],     // red for bearish divergence
+    DIV_BULL_COLOR:   [31, 209, 122],    // green for bullish divergence
+    DIV_LINE_WIDTH:   2,                 // dashed line width
+    DIV_DASH:         [6, 4],            // dash pattern
+
+    // ── Momentum Ignition ──
+    IGN_COLOR:        [255, 165, 0],     // orange for ignition zone
+    IGN_TRAP_COLOR:   [255, 50, 50],     // red for confirmed trap
+    IGN_ZONE_ALPHA:   0.15,              // zone fill opacity
+
+    // ── Spoof Detection ──
+    SPOOF_COLOR:      [180, 180, 200],   // grey-white for phantom orders
+    SPOOF_DASH:       [4, 3],            // dashed border pattern
+    SPOOF_RADIUS:     10,                // ghost circle radius
+
     // ── Typography ──
     FONT: '10px "JetBrains Mono", "SF Mono", monospace',
     FONT_SMALL: '8px "JetBrains Mono", "SF Mono", monospace',
@@ -513,6 +529,238 @@ class VolumeBubbleRenderer {
                         ctx.font = BUBBLE_CONFIG.FONT_BADGE;
                         ctx.fillStyle = _rgba(color, 0.85);
                         ctx.fillText('SWP', x, endY + bs + 10);
+                    }
+                }
+            }
+
+            // ════════════════════════════════════════════════════════════════
+            // LAYER 9: DELTA DIVERGENCE (╱╱ dashed divergence lines)
+            // ════════════════════════════════════════════════════════════════
+            if (!useDots) {
+                for (let i = from; i < to; i++) {
+                    const bar = d.bars[i];
+                    if (!bar || !bar.originalData || !bar.originalData.delta_div) continue;
+
+                    const div = bar.originalData.delta_div;
+                    const x = bar.x;
+                    const isBear = div.type === 'bearish';
+                    const color = isBear ? BUBBLE_CONFIG.DIV_BEAR_COLOR : BUBBLE_CONFIG.DIV_BULL_COLOR;
+
+                    // Current price point
+                    const priceKey = isBear ? 'price_high' : 'price_low';
+                    const prevKey = isBear ? 'price_prev' : 'price_prev';
+                    const yNow = priceConverter(div[priceKey]);
+                    const yPrev = priceConverter(div[prevKey]);
+                    if (!yNow || !yPrev || isNaN(yNow) || isNaN(yPrev)) continue;
+
+                    // Find previous bar X (approximate from t_prev)
+                    let xPrev = x - 80; // fallback
+                    for (let j = from; j < i; j++) {
+                        const pb = d.bars[j];
+                        if (pb && pb.originalData && pb.originalData.time === div.t_prev) {
+                            xPrev = pb.x;
+                            break;
+                        }
+                    }
+
+                    // Dashed divergence line
+                    ctx.save();
+                    ctx.strokeStyle = _rgba(color, 0.8);
+                    ctx.lineWidth = BUBBLE_CONFIG.DIV_LINE_WIDTH;
+                    ctx.setLineDash(BUBBLE_CONFIG.DIV_DASH);
+                    ctx.beginPath();
+                    ctx.moveTo(xPrev, yPrev);
+                    ctx.lineTo(x, yNow);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+                    ctx.restore();
+
+                    // Divergence label
+                    const divLabel = isBear ? 'DIV ▼' : 'DIV ▲';
+                    const labelX = (xPrev + x) / 2;
+                    const labelY = (yPrev + yNow) / 2 - 12;
+                    ctx.font = BUBBLE_CONFIG.FONT_SMALL;
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+
+                    // Background pill
+                    const dtm = ctx.measureText(divLabel);
+                    ctx.fillStyle = 'rgba(0,0,0,0.75)';
+                    ctx.beginPath();
+                    ctx.roundRect(labelX - dtm.width / 2 - 5, labelY - 7, dtm.width + 10, 14, 4);
+                    ctx.fill();
+
+                    ctx.fillStyle = _rgba(color, 0.95);
+                    ctx.fillText(divLabel, labelX, labelY);
+
+                    // Circle markers at both endpoints
+                    ctx.fillStyle = _rgba(color, 0.7);
+                    ctx.beginPath();
+                    ctx.arc(xPrev, yPrev, 4, 0, Math.PI * 2);
+                    ctx.fill();
+                    ctx.beginPath();
+                    ctx.arc(x, yNow, 4, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+            }
+
+            // ════════════════════════════════════════════════════════════════
+            // LAYER 10: MOMENTUM IGNITION (⚠️ warning zones)
+            // ════════════════════════════════════════════════════════════════
+            for (let i = from; i < to; i++) {
+                const bar = d.bars[i];
+                if (!bar || !bar.originalData || !bar.originalData.ignition) continue;
+
+                const ignitions = bar.originalData.ignition;
+                const x = bar.x;
+
+                for (const ign of ignitions) {
+                    const yMin = priceConverter(ign.price_min);
+                    const yMax = priceConverter(ign.price_max);
+                    if (!yMin || !yMax || isNaN(yMin) || isNaN(yMax)) continue;
+
+                    const isReversed = ign.reversed === true;
+                    const color = isReversed ? BUBBLE_CONFIG.IGN_TRAP_COLOR : BUBBLE_CONFIG.IGN_COLOR;
+                    const yTop = Math.min(yMin, yMax);
+                    const yBot = Math.max(yMin, yMax);
+                    const zoneH = Math.max(yBot - yTop, 4);
+
+                    if (useDots) {
+                        // Macro zoom: thin vertical line
+                        ctx.strokeStyle = _rgba(color, 0.5);
+                        ctx.lineWidth = 2;
+                        ctx.beginPath();
+                        ctx.moveTo(x, yTop);
+                        ctx.lineTo(x, yBot);
+                        ctx.stroke();
+                    } else {
+                        // Full zoom: warning zone rectangle
+                        const zoneW = 24;
+
+                        // Semi-transparent fill
+                        ctx.fillStyle = _rgba(color, BUBBLE_CONFIG.IGN_ZONE_ALPHA);
+                        ctx.fillRect(x - zoneW / 2, yTop, zoneW, zoneH);
+
+                        // Border (pulsing if not reversed)
+                        if (!isReversed) {
+                            const t = (performance.now() % 1500) / 1500;
+                            const borderAlpha = 0.4 + 0.4 * Math.sin(t * Math.PI * 2);
+                            ctx.strokeStyle = _rgba(color, borderAlpha);
+                            ctx.lineWidth = 1.5;
+                            ctx.setLineDash([4, 3]);
+                        } else {
+                            ctx.strokeStyle = _rgba(color, 0.9);
+                            ctx.lineWidth = 2;
+                            ctx.setLineDash([]);
+                        }
+                        ctx.strokeRect(x - zoneW / 2, yTop, zoneW, zoneH);
+                        ctx.setLineDash([]);
+
+                        // Direction arrow
+                        const arrowY = ign.direction === 'up' ? yTop - 10 : yBot + 10;
+                        const arrowChar = ign.direction === 'up' ? '↑' : '↓';
+                        ctx.font = BUBBLE_CONFIG.FONT;
+                        ctx.textAlign = 'center';
+                        ctx.textBaseline = 'middle';
+                        ctx.fillStyle = _rgba(color, 0.9);
+                        ctx.fillText(arrowChar, x, arrowY);
+
+                        // Label
+                        const ignLabel = isReversed ? '⚠ TRAP' : 'IGN';
+                        ctx.font = BUBBLE_CONFIG.FONT_BADGE;
+                        ctx.fillStyle = _rgba(color, 0.9);
+
+                        const itm = ctx.measureText(ignLabel);
+                        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+                        ctx.beginPath();
+                        ctx.roundRect(x - itm.width / 2 - 3, yBot + 14, itm.width + 6, 11, 3);
+                        ctx.fill();
+
+                        ctx.fillStyle = _rgba(color, 0.95);
+                        ctx.fillText(ignLabel, x, yBot + 19);
+                    }
+                }
+            }
+
+            // ════════════════════════════════════════════════════════════════
+            // LAYER 11: SPOOF DETECTION (👻 ghost markers)
+            // ════════════════════════════════════════════════════════════════
+            for (let i = from; i < to; i++) {
+                const bar = d.bars[i];
+                if (!bar || !bar.originalData || !bar.originalData.spoofs) continue;
+
+                const spoofs = bar.originalData.spoofs;
+                const x = bar.x;
+
+                for (const spoof of spoofs) {
+                    const price = parseFloat(spoof.price);
+                    if (isNaN(price)) continue;
+                    const y = priceConverter(price);
+                    if (y === null || y === undefined || isNaN(y)) continue;
+
+                    const color = BUBBLE_CONFIG.SPOOF_COLOR;
+                    const r = BUBBLE_CONFIG.SPOOF_RADIUS;
+
+                    if (useDots) {
+                        // Macro: small X mark
+                        ctx.strokeStyle = _rgba(color, 0.5);
+                        ctx.lineWidth = 1.5;
+                        ctx.beginPath();
+                        ctx.moveTo(x - 3, y - 3);
+                        ctx.lineTo(x + 3, y + 3);
+                        ctx.moveTo(x + 3, y - 3);
+                        ctx.lineTo(x - 3, y + 3);
+                        ctx.stroke();
+                    } else {
+                        // Full zoom: ghost circle with dashed border
+                        ctx.save();
+
+                        // Translucent fill
+                        ctx.fillStyle = _rgba(color, 0.1);
+                        ctx.beginPath();
+                        ctx.arc(x, y, r, 0, Math.PI * 2);
+                        ctx.fill();
+
+                        // Dashed border
+                        ctx.strokeStyle = _rgba(color, 0.5);
+                        ctx.lineWidth = 1.5;
+                        ctx.setLineDash(BUBBLE_CONFIG.SPOOF_DASH);
+                        ctx.stroke();
+                        ctx.setLineDash([]);
+
+                        // Red X through it
+                        ctx.strokeStyle = 'rgba(255, 60, 60, 0.7)';
+                        ctx.lineWidth = 2;
+                        ctx.beginPath();
+                        ctx.moveTo(x - r * 0.5, y - r * 0.5);
+                        ctx.lineTo(x + r * 0.5, y + r * 0.5);
+                        ctx.moveTo(x + r * 0.5, y - r * 0.5);
+                        ctx.lineTo(x - r * 0.5, y + r * 0.5);
+                        ctx.stroke();
+                        ctx.restore();
+
+                        // Fake size label
+                        const fakeLabel = spoof.fake_size >= 1000
+                            ? (spoof.fake_size / 1000).toFixed(1) + 'k'
+                            : String(spoof.fake_size);
+                        ctx.font = BUBBLE_CONFIG.FONT_SMALL;
+                        ctx.textAlign = 'center';
+                        ctx.textBaseline = 'middle';
+                        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+                        ctx.fillText(fakeLabel, x + 1, y + 1);
+                        ctx.fillStyle = _rgba(color, 0.9);
+                        ctx.fillText(fakeLabel, x, y);
+
+                        // "SPOOF" badge below
+                        ctx.font = BUBBLE_CONFIG.FONT_BADGE;
+                        ctx.fillStyle = 'rgba(255, 60, 60, 0.85)';
+                        ctx.fillText('SPOOF', x, y + r + 10);
+
+                        // Occurrence count badge
+                        if (spoof.count > 2) {
+                            ctx.fillStyle = _rgba(color, 0.7);
+                            ctx.fillText('x' + spoof.count, x, y + r + 20);
+                        }
                     }
                 }
             }

@@ -93,6 +93,41 @@ _SWEEP_TRACKER: dict = defaultdict(list)
 # Detected results attached to current candle: {symbol: {tf: {icebergs: {}, sweeps: []}}}
 _DETECT_RESULTS: dict = defaultdict(lambda: defaultdict(dict))
 
+# ── Cumulative Delta Divergence Constants ──
+_DIV_LOOKBACK_CANDLES = 20       # rolling window to find swing highs/lows
+_DIV_MIN_PRICE_MOVE   = 2.0      # minimum price difference for swing
+_DIV_MIN_DELTA_GAP    = 50       # minimum delta gap to trigger
+
+# ── Delta Divergence State ──
+# {symbol: {tf: [{"t": boundary, "high": h, "low": l, "delta": d}, ...]}}
+_DELTA_HISTORY: dict = defaultdict(lambda: defaultdict(list))
+# {symbol: {tf: cumulative_delta}}
+_CUM_DELTA: dict = defaultdict(lambda: defaultdict(float))
+
+# ── Momentum Ignition Constants ──
+_IGN_MIN_TRADES       = 8        # min trades in window
+_IGN_WINDOW_SEC       = 2.0      # 2-second window
+_IGN_MAX_CLIP_SIZE    = 5        # max individual trade size
+_IGN_MAX_TOTAL        = 30       # max total volume (not real conviction)
+_IGN_REVERSAL_SEC     = 30.0     # reversal confirmation window
+
+# ── Momentum Ignition State ──
+# {symbol: [(timestamp, price, volume, side), ...]}
+_IGN_TRACKER: dict = defaultdict(list)
+# {symbol: [{"direction": "up"|"down", "prices": [...], "ts": T, "start_price": P}, ...]}
+_IGN_ACTIVE: dict = defaultdict(list)
+
+# ── Spoof Detection Constants ──
+_SPOOF_MIN_SIZE       = 100      # min order size to track
+_SPOOF_MAX_LIFETIME   = 3.0      # max seconds before considered spoof
+_SPOOF_MIN_OCCUR      = 2        # min occurrences to trigger
+
+# ── Spoof Detection State ──
+# {symbol: {price_str: {"size": V, "first_seen": T, "side": "bid"|"ask"}}}
+_DOM_PREV: dict = defaultdict(dict)
+# {symbol: {price_str: [{"fake_size": V, "side": s, "ts": T}, ...]}}
+_SPOOF_TRACKER: dict = defaultdict(lambda: defaultdict(list))
+
 
 def _detect_iceberg(symbol: str, price_str: str, volume: int,
                     timestamp: float, side: str):
@@ -190,6 +225,191 @@ def _detect_sweep(symbol: str, price: float, volume: int,
     return sweep_result
 
 
+def _detect_delta_divergence(symbol: str, tf: str):
+    """Check for cumulative delta divergence on candle close.
+    Bearish: price makes new high but delta is lower than at previous high.
+    Bullish: price makes new low but delta is higher than at previous low.
+    Returns divergence dict if detected, else None.
+    """
+    history = _DELTA_HISTORY[symbol][tf]
+    if len(history) < _DIV_LOOKBACK_CANDLES:
+        return None
+
+    recent = history[-_DIV_LOOKBACK_CANDLES:]
+    current = recent[-1]
+
+    # Find previous swing high (highest price in lookback excluding last)
+    prev_highs = sorted(recent[:-1], key=lambda c: c["high"], reverse=True)
+    if prev_highs:
+        prev_high = prev_highs[0]
+        price_diff = current["high"] - prev_high["high"]
+        delta_diff = current["delta"] - prev_high["delta"]
+        if (price_diff >= _DIV_MIN_PRICE_MOVE and
+                delta_diff <= -_DIV_MIN_DELTA_GAP):
+            return {
+                "type": "bearish",
+                "price_high": current["high"],
+                "price_prev": prev_high["high"],
+                "delta_current": current["delta"],
+                "delta_prev": prev_high["delta"],
+                "t_prev": prev_high["t"],
+            }
+
+    # Find previous swing low (lowest price in lookback excluding last)
+    prev_lows = sorted(recent[:-1], key=lambda c: c["low"])
+    if prev_lows:
+        prev_low = prev_lows[0]
+        price_diff = prev_low["low"] - current["low"]
+        delta_diff = current["delta"] - prev_low["delta"]
+        if (price_diff >= _DIV_MIN_PRICE_MOVE and
+                delta_diff >= _DIV_MIN_DELTA_GAP):
+            return {
+                "type": "bullish",
+                "price_low": current["low"],
+                "price_prev": prev_low["low"],
+                "delta_current": current["delta"],
+                "delta_prev": prev_low["delta"],
+                "t_prev": prev_low["t"],
+            }
+
+    return None
+
+
+def _detect_ignition(symbol: str, price: float, volume: int,
+                     timestamp: float, side: str):
+    """Detect momentum ignition: rapid small orders stepping through levels.
+    Signal: 8+ trades within 2s, progressively higher/lower prices,
+    small clips (1-5), total < 30. Returns ignition dict if detected.
+    """
+    if side == "n" or volume > _IGN_MAX_CLIP_SIZE:
+        return None
+
+    tracker = _IGN_TRACKER[symbol]
+    tracker.append((timestamp, price, volume, side))
+
+    # Prune old entries
+    cutoff = timestamp - _IGN_WINDOW_SEC
+    while tracker and tracker[0][0] < cutoff:
+        tracker.pop(0)
+
+    if len(tracker) < _IGN_MIN_TRADES:
+        return None
+
+    # Check: all same side
+    sides = [t[3] for t in tracker]
+    if len(set(sides)) != 1:
+        return None
+
+    # Check: total volume is small (probing, not real conviction)
+    total_vol = sum(t[2] for t in tracker)
+    if total_vol >= _IGN_MAX_TOTAL:
+        return None
+
+    # Check: monotonically increasing or decreasing prices
+    prices = [t[1] for t in tracker]
+    is_up = all(prices[i] >= prices[i - 1] for i in range(1, len(prices)))
+    is_down = all(prices[i] <= prices[i - 1] for i in range(1, len(prices)))
+    if not is_up and not is_down:
+        return None
+
+    direction = "up" if is_up else "down"
+    start_price = prices[0]
+
+    # Store as active ignition for reversal tracking
+    ign_result = {
+        "direction": direction,
+        "levels_swept": len(set(prices)),
+        "reversed": False,
+        "ts": timestamp,
+        "price_min": min(prices),
+        "price_max": max(prices),
+    }
+    _IGN_ACTIVE[symbol].append({
+        "direction": direction,
+        "ts": timestamp,
+        "start_price": start_price,
+    })
+    tracker.clear()
+    return ign_result
+
+
+def _check_ignition_reversals(symbol: str, current_price: float,
+                              timestamp: float):
+    """Check if any active ignitions have reversed.
+    Returns list of confirmed reversals to attach to candle.
+    """
+    confirmed = []
+    remaining = []
+    for ign in _IGN_ACTIVE[symbol]:
+        age = timestamp - ign["ts"]
+        if age > _IGN_REVERSAL_SEC:
+            continue  # expired
+        # Check reversal: price moved back past start
+        if ign["direction"] == "up" and current_price < ign["start_price"]:
+            confirmed.append({"direction": "up", "reversed": True, "ts": ign["ts"]})
+        elif ign["direction"] == "down" and current_price > ign["start_price"]:
+            confirmed.append({"direction": "down", "reversed": True, "ts": ign["ts"]})
+        else:
+            remaining.append(ign)
+    _IGN_ACTIVE[symbol] = remaining
+    return confirmed
+
+
+def _detect_spoof(symbol: str, dom: dict, timestamp: float):
+    """Compare current DOM snapshot with previous to detect spoofing.
+    Large orders that appear and disappear quickly without being filled.
+    Returns list of spoof detections.
+    """
+    spoofs_found = []
+    prev = _DOM_PREV.get(symbol, {})
+    current_levels = {}
+
+    # Build current DOM level map from bids and asks
+    for side_key, side_label in [("bids", "bid"), ("asks", "ask")]:
+        levels = dom.get(side_key, [])
+        if isinstance(levels, list):
+            for lvl in levels:
+                if isinstance(lvl, dict):
+                    p = str(lvl.get("price", ""))
+                    s = lvl.get("size", 0)
+                    if p and s >= _SPOOF_MIN_SIZE:
+                        current_levels[p] = {"size": s, "side": side_label}
+
+    # Check for large orders that were in prev but disappeared
+    for price_str, info in prev.items():
+        if price_str not in current_levels:
+            # Large order vanished — possible spoof
+            age = timestamp - info.get("first_seen", timestamp)
+            if age <= _SPOOF_MAX_LIFETIME and age > 0:
+                spoof_tracker = _SPOOF_TRACKER[symbol][price_str]
+                spoof_tracker.append({
+                    "fake_size": info["size"],
+                    "side": info["side"],
+                    "ts": timestamp,
+                })
+                # Prune old spoof events (keep last 30s)
+                spoof_tracker[:] = [s for s in spoof_tracker
+                                    if timestamp - s["ts"] < 30]
+                if len(spoof_tracker) >= _SPOOF_MIN_OCCUR:
+                    spoofs_found.append({
+                        "price": price_str,
+                        "fake_size": info["size"],
+                        "side": info["side"],
+                        "count": len(spoof_tracker),
+                    })
+
+    # Update previous DOM snapshot with timestamps
+    new_prev = {}
+    for p, info in current_levels.items():
+        if p in prev:
+            new_prev[p] = prev[p]  # keep original first_seen
+        else:
+            new_prev[p] = {**info, "first_seen": timestamp}
+    _DOM_PREV[symbol] = new_prev
+
+    return spoofs_found if spoofs_found else None
+
+
 # Dedicated lock for candle data — separate from _L2_LOCK to avoid
 # contention with DOM/trade state reads during high-volume periods.
 _CANDLE_LOCK = threading.Lock()
@@ -231,6 +451,26 @@ def _feed_candle(symbol: str, price: float, volume: int, timestamp: float,
             if cur is None or cur["t"] != boundary:
                 # Close previous candle if it exists
                 if cur is not None:
+                    # ── Cumulative Delta tracking on candle close ──
+                    candle_bp = cur.get("bp", {})
+                    candle_buy = sum(v[0] for v in candle_bp.values() if isinstance(v, list) and len(v) >= 2)
+                    candle_sell = sum(v[1] for v in candle_bp.values() if isinstance(v, list) and len(v) >= 2)
+                    candle_delta = candle_buy - candle_sell
+                    _CUM_DELTA[symbol][tf] += candle_delta
+                    # Record delta history for divergence detection
+                    _DELTA_HISTORY[symbol][tf].append({
+                        "t": cur["t"],
+                        "high": cur["h"],
+                        "low": cur["l"],
+                        "delta": _CUM_DELTA[symbol][tf],
+                    })
+                    # Keep only last 50 entries
+                    if len(_DELTA_HISTORY[symbol][tf]) > 50:
+                        _DELTA_HISTORY[symbol][tf] = _DELTA_HISTORY[symbol][tf][-50:]
+                    # Check for divergence
+                    div_hit = _detect_delta_divergence(symbol, tf)
+                    if div_hit:
+                        cur["delta_div"] = div_hit
                     _CANDLES[symbol][tf].append(_freeze_candle(cur))
                 # Start new candle with bubble profile
                 bp = {}
@@ -285,6 +525,9 @@ def _feed_candle(symbol: str, price: float, volume: int, timestamp: float,
                             "bp": cur.get("bp"),
                             "icebergs": cur.get("icebergs"),
                             "sweeps": cur.get("sweeps"),
+                            "delta_div": cur.get("delta_div"),
+                            "ignition": cur.get("ignition"),
+                            "spoofs": cur.get("spoofs"),
                         }
                         try:
                             _socketio.emit("candle_update", candle_data, namespace="/")
@@ -316,6 +559,15 @@ def _freeze_candle(candle: dict) -> dict:
     sweeps = candle.get("sweeps")
     if sweeps:
         snap["sweeps"] = sweeps
+    delta_div = candle.get("delta_div")
+    if delta_div:
+        snap["delta_div"] = delta_div
+    ignition = candle.get("ignition")
+    if ignition:
+        snap["ignition"] = ignition
+    spoofs = candle.get("spoofs")
+    if spoofs:
+        snap["spoofs"] = spoofs
     return snap
 
 
@@ -443,6 +695,17 @@ def on_dom_update(symbol: str, dom: dict):
         if _reynolds and mid > 0:
             L2_STATE["signals"]["reynolds_number"] = _reynolds.get_signal()
 
+    # ── Spoof detection (DOM snapshot diff) ── runs outside lock
+    spoof_hits = _detect_spoof(symbol, dom, time.time())
+    if spoof_hits:
+        with _CANDLE_LOCK:
+            for tf in CANDLE_TIMEFRAMES:
+                cur = _CURRENT_CANDLE[symbol].get(tf)
+                if cur:
+                    if "spoofs" not in cur:
+                        cur["spoofs"] = []
+                    cur["spoofs"].extend(spoof_hits)
+
 
 def on_quote(symbol: str, quote: dict):
     """Called by connector when BBO snapshot arrives."""
@@ -515,6 +778,28 @@ def on_trade(symbol: str, trade: dict):
                         if "sweeps" not in cur:
                             cur["sweeps"] = []
                         cur["sweeps"].append(sweep_hit)
+
+        # Momentum Ignition detection
+        ign_hit = _detect_ignition(symbol, price, vol, ts, side)
+        if ign_hit:
+            with _CANDLE_LOCK:
+                for tf in CANDLE_TIMEFRAMES:
+                    cur = _CURRENT_CANDLE[symbol].get(tf)
+                    if cur:
+                        if "ignition" not in cur:
+                            cur["ignition"] = []
+                        cur["ignition"].append(ign_hit)
+
+        # Ignition reversal checks (runs on every tick)
+        reversals = _check_ignition_reversals(symbol, price, ts)
+        if reversals:
+            with _CANDLE_LOCK:
+                for tf in CANDLE_TIMEFRAMES:
+                    cur = _CURRENT_CANDLE[symbol].get(tf)
+                    if cur:
+                        if "ignition" not in cur:
+                            cur["ignition"] = []
+                        cur["ignition"].extend(reversals)
 
         _feed_candle(symbol, price, vol, ts, side=side)
 
