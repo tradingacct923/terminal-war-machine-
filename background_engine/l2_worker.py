@@ -410,6 +410,60 @@ def _detect_spoof(symbol: str, dom: dict, timestamp: float):
     return spoofs_found if spoofs_found else None
 
 
+# ── Periodic cleanup to prevent unbounded memory growth ──
+_CLEANUP_INTERVAL = 30.0  # run every 30 seconds
+_last_cleanup_time = 0.0
+
+def _cleanup_detection_state():
+    """Purge stale entries from all detection trackers.
+    Called periodically from the heavy-compute loop to prevent memory leaks.
+    """
+    global _last_cleanup_time
+    now = time.time()
+    if now - _last_cleanup_time < _CLEANUP_INTERVAL:
+        return
+    _last_cleanup_time = now
+
+    for sym in list(SYMBOLS):
+        # ── ICE_TRACKER: remove price keys with no recent fills ──
+        ice_sym = _ICE_TRACKER.get(sym, {})
+        stale_prices = [p for p, fills in ice_sym.items()
+                        if not fills or (now - fills[-1][0]) > _ICE_WINDOW_SEC * 3]
+        for p in stale_prices:
+            del ice_sym[p]
+
+        # ── SWEEP_TRACKER: hard cap at 100 entries ──
+        sweep = _SWEEP_TRACKER.get(sym, [])
+        if len(sweep) > 100:
+            _SWEEP_TRACKER[sym] = sweep[-50:]
+
+        # ── IGN_TRACKER: hard cap at 200 entries ──
+        ign = _IGN_TRACKER.get(sym, [])
+        if len(ign) > 200:
+            _IGN_TRACKER[sym] = ign[-100:]
+
+        # ── IGN_ACTIVE: expire entries past reversal window ──
+        active = _IGN_ACTIVE.get(sym, [])
+        _IGN_ACTIVE[sym] = [a for a in active
+                            if (now - a["ts"]) <= _IGN_REVERSAL_SEC]
+
+        # ── SPOOF_TRACKER: remove price keys older than 60s ──
+        spoof_sym = _SPOOF_TRACKER.get(sym, {})
+        stale_spoof = [p for p, entries in spoof_sym.items()
+                       if not entries or (now - entries[-1]["ts"]) > 60]
+        for p in stale_spoof:
+            del spoof_sym[p]
+
+        # ── DELTA_HISTORY: already capped at 50, but double-check ──
+        for tf in CANDLE_TIMEFRAMES:
+            dh = _DELTA_HISTORY.get(sym, {}).get(tf, [])
+            if len(dh) > 50:
+                _DELTA_HISTORY[sym][tf] = dh[-50:]
+
+    # ── DOM_PREV: naturally bounded (replaced each DOM update) ──
+    # No cleanup needed.
+
+
 # Dedicated lock for candle data — separate from _L2_LOCK to avoid
 # contention with DOM/trade state reads during high-volume periods.
 _CANDLE_LOCK = threading.Lock()
@@ -800,6 +854,9 @@ def on_trade(symbol: str, trade: dict):
                         if "ignition" not in cur:
                             cur["ignition"] = []
                         cur["ignition"].extend(reversals)
+
+        # ── Periodic cleanup of detection state (runs every 30s) ──
+        _cleanup_detection_state()
 
         _feed_candle(symbol, price, vol, ts, side=side)
 
