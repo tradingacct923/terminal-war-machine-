@@ -44,9 +44,24 @@ const BUBBLE_CONFIG = {
     GLOW_COLOR_ABSORB: 'rgba(168, 85, 247, 0.35)',
     GLOW_EXTRA_RADIUS: 6,  // px added to radius for the glow ring
 
+    // ── Iceberg Detection ──
+    ICE_BUY_COLOR:    [100, 180, 255],   // ice blue for buy icebergs
+    ICE_SELL_COLOR:   [255, 140, 180],   // ice pink for sell icebergs
+    ICE_DIAMOND_SIZE: 12,                // diamond half-size in px (zoomed in)
+    ICE_DOT_SIZE:     4,                 // dot size when zoomed out
+    ICE_PULSE_SPEED:  2000,              // pulse cycle duration in ms
+
+    // ── Sweep Detection ──
+    SWEEP_BUY_COLOR:  [31, 209, 122],    // green for buy sweeps
+    SWEEP_SELL_COLOR: [224, 48, 96],     // red for sell sweeps
+    SWEEP_LINE_WIDTH: 3,                 // lightning bolt line width
+    SWEEP_GLOW_BLUR:  8,                 // shadowBlur for sweep glow
+    SWEEP_BURST_SIZE: 6,                 // burst effect radius at endpoints
+
     // ── Typography ──
     FONT: '10px "JetBrains Mono", "SF Mono", monospace',
     FONT_SMALL: '8px "JetBrains Mono", "SF Mono", monospace',
+    FONT_BADGE: '7px "JetBrains Mono", "SF Mono", monospace',
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -320,6 +335,184 @@ class VolumeBubbleRenderer {
                         ctx.font = '7px "JetBrains Mono", monospace';
                         ctx.fillStyle = _rgba(BUBBLE_CONFIG.ABSORPTION_COLOR, 0.9);
                         ctx.fillText('ABS', b.x, b.y + b.radius + 8);
+                    }
+                }
+            }
+
+            // ════════════════════════════════════════════════════════════════
+            // LAYER 7: ICEBERG DETECTION (◆ diamond markers)
+            // ════════════════════════════════════════════════════════════════
+            for (let i = from; i < to; i++) {
+                const bar = d.bars[i];
+                if (!bar || !bar.originalData || !bar.originalData.icebergs) continue;
+
+                const icebergs = bar.originalData.icebergs;
+                const x = bar.x;
+
+                for (const priceStr in icebergs) {
+                    const ice = icebergs[priceStr];
+                    const price = parseFloat(priceStr);
+                    if (isNaN(price)) continue;
+                    const y = priceConverter(price);
+                    if (y === null || y === undefined || isNaN(y)) continue;
+
+                    const isBuy = ice.side === 'b';
+                    const color = isBuy ? BUBBLE_CONFIG.ICE_BUY_COLOR : BUBBLE_CONFIG.ICE_SELL_COLOR;
+
+                    if (useDots) {
+                        // Macro zoom: small diamond dot
+                        ctx.fillStyle = _rgba(color, 0.8);
+                        ctx.beginPath();
+                        const ds = BUBBLE_CONFIG.ICE_DOT_SIZE;
+                        ctx.moveTo(x, y - ds);
+                        ctx.lineTo(x + ds, y);
+                        ctx.lineTo(x, y + ds);
+                        ctx.lineTo(x - ds, y);
+                        ctx.closePath();
+                        ctx.fill();
+                    } else {
+                        // Full zoom: diamond with glow + pulse + label
+                        const ds = BUBBLE_CONFIG.ICE_DIAMOND_SIZE;
+
+                        // Pulse animation via timestamp
+                        const t = (performance.now() % BUBBLE_CONFIG.ICE_PULSE_SPEED) / BUBBLE_CONFIG.ICE_PULSE_SPEED;
+                        const pulseAlpha = 0.6 + 0.4 * Math.sin(t * Math.PI * 2);
+
+                        // Glow
+                        const glowGrad = ctx.createRadialGradient(x, y, ds * 0.5, x, y, ds * 2);
+                        glowGrad.addColorStop(0, _rgba(color, 0.3 * pulseAlpha));
+                        glowGrad.addColorStop(1, 'rgba(0,0,0,0)');
+                        ctx.fillStyle = glowGrad;
+                        ctx.beginPath();
+                        ctx.arc(x, y, ds * 2, 0, Math.PI * 2);
+                        ctx.fill();
+
+                        // Diamond shape
+                        ctx.fillStyle = _rgba(color, 0.85 * pulseAlpha);
+                        ctx.beginPath();
+                        ctx.moveTo(x, y - ds);
+                        ctx.lineTo(x + ds * 0.7, y);
+                        ctx.lineTo(x, y + ds);
+                        ctx.lineTo(x - ds * 0.7, y);
+                        ctx.closePath();
+                        ctx.fill();
+
+                        // Diamond border
+                        ctx.strokeStyle = _rgba(color, 0.9);
+                        ctx.lineWidth = 1.5;
+                        ctx.stroke();
+
+                        // Volume text inside diamond
+                        const volLabel = ice.est_total >= 1000
+                            ? '~' + (ice.est_total / 1000).toFixed(1) + 'k'
+                            : '~' + ice.est_total;
+                        ctx.font = BUBBLE_CONFIG.FONT_SMALL;
+                        ctx.textAlign = 'center';
+                        ctx.textBaseline = 'middle';
+                        ctx.fillStyle = 'rgba(0,0,0,0.5)';
+                        ctx.fillText(volLabel, x + 1, y + 1);
+                        ctx.fillStyle = BUBBLE_CONFIG.TEXT_COLOR;
+                        ctx.fillText(volLabel, x, y);
+
+                        // "ICE" badge below
+                        ctx.font = BUBBLE_CONFIG.FONT_BADGE;
+                        ctx.fillStyle = _rgba(color, 0.9);
+                        ctx.fillText('ICE', x, y + ds + 8);
+                    }
+                }
+            }
+
+            // ════════════════════════════════════════════════════════════════
+            // LAYER 8: SWEEP DETECTION (⚡ lightning bolt lines)
+            // ════════════════════════════════════════════════════════════════
+            for (let i = from; i < to; i++) {
+                const bar = d.bars[i];
+                if (!bar || !bar.originalData || !bar.originalData.sweeps) continue;
+
+                const sweeps = bar.originalData.sweeps;
+                const x = bar.x;
+
+                for (const sweep of sweeps) {
+                    if (!sweep.prices || sweep.prices.length < 2) continue;
+
+                    const isBuy = sweep.side === 'b';
+                    const color = isBuy ? BUBBLE_CONFIG.SWEEP_BUY_COLOR : BUBBLE_CONFIG.SWEEP_SELL_COLOR;
+
+                    // Convert prices to Y coordinates
+                    const yCoords = [];
+                    for (const p of sweep.prices) {
+                        const yp = priceConverter(p);
+                        if (yp !== null && yp !== undefined && !isNaN(yp)) {
+                            yCoords.push({ price: p, y: yp });
+                        }
+                    }
+                    if (yCoords.length < 2) continue;
+
+                    // Sort by Y coordinate (top to bottom)
+                    yCoords.sort((a, b) => a.y - b.y);
+
+                    if (useDots) {
+                        // Macro zoom: simple vertical line
+                        ctx.strokeStyle = _rgba(color, 0.6);
+                        ctx.lineWidth = 2;
+                        ctx.beginPath();
+                        ctx.moveTo(x, yCoords[0].y);
+                        ctx.lineTo(x, yCoords[yCoords.length - 1].y);
+                        ctx.stroke();
+                    } else {
+                        // Full zoom: lightning bolt with glow
+                        ctx.save();
+                        ctx.shadowColor = _rgba(color, 0.6);
+                        ctx.shadowBlur = BUBBLE_CONFIG.SWEEP_GLOW_BLUR;
+                        ctx.strokeStyle = _rgba(color, 0.9);
+                        ctx.lineWidth = BUBBLE_CONFIG.SWEEP_LINE_WIDTH;
+                        ctx.setLineDash([]);
+
+                        // Draw zigzag lightning bolt
+                        ctx.beginPath();
+                        ctx.moveTo(x, yCoords[0].y);
+                        for (let j = 1; j < yCoords.length; j++) {
+                            const zigX = x + (j % 2 === 0 ? -6 : 6);  // zigzag offset
+                            ctx.lineTo(zigX, yCoords[j].y);
+                        }
+                        ctx.stroke();
+                        ctx.restore();
+
+                        // Burst effect at the endpoint
+                        const endY = yCoords[yCoords.length - 1].y;
+                        const bs = BUBBLE_CONFIG.SWEEP_BURST_SIZE;
+                        ctx.strokeStyle = _rgba(color, 0.8);
+                        ctx.lineWidth = 2;
+                        for (let angle = 0; angle < Math.PI * 2; angle += Math.PI / 4) {
+                            ctx.beginPath();
+                            ctx.moveTo(x + Math.cos(angle) * 3, endY + Math.sin(angle) * 3);
+                            ctx.lineTo(x + Math.cos(angle) * bs, endY + Math.sin(angle) * bs);
+                            ctx.stroke();
+                        }
+
+                        // Volume label at midpoint
+                        const midY = (yCoords[0].y + endY) / 2;
+                        const swpLabel = sweep.vol >= 1000
+                            ? (sweep.vol / 1000).toFixed(1) + 'k'
+                            : String(sweep.vol);
+                        ctx.font = BUBBLE_CONFIG.FONT_SMALL;
+                        ctx.textAlign = 'center';
+                        ctx.textBaseline = 'middle';
+
+                        // Background pill for sweep label
+                        const tm = ctx.measureText(swpLabel);
+                        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+                        ctx.beginPath();
+                        ctx.roundRect(x - tm.width / 2 - 4, midY - 6, tm.width + 8, 12, 3);
+                        ctx.fill();
+
+                        ctx.fillStyle = _rgba(color, 0.95);
+                        ctx.fillText(swpLabel, x, midY);
+
+                        // "SWP" badge below burst
+                        ctx.font = BUBBLE_CONFIG.FONT_BADGE;
+                        ctx.fillStyle = _rgba(color, 0.85);
+                        ctx.fillText('SWP', x, endY + bs + 10);
                     }
                 }
             }

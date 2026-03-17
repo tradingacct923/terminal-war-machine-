@@ -69,6 +69,127 @@ def set_socketio(sio):
     _socketio = sio
     log.info("Socket.IO reference set for real-time candle push")
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ORDERFLOW DETECTION — Iceberg + Sweep engines
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Iceberg Detection Constants ──
+_ICE_REFILL_COUNT     = 3       # min refills at same price to trigger
+_ICE_WINDOW_SEC       = 5.0     # time window for refill detection
+_ICE_SIZE_TOLERANCE   = 0.30    # clip sizes must be within ±30% of each other
+_ICE_MIN_CLIP         = 3       # minimum individual clip size to consider
+
+# ── Sweep Detection Constants ──
+_SWEEP_MIN_LEVELS     = 3       # min consecutive price levels swept
+_SWEEP_WINDOW_SEC     = 0.200   # 200ms window for sweep
+_SWEEP_MIN_VOLUME     = 30      # total swept volume threshold
+
+# ── Detection State ──
+# _ICE_TRACKER: {symbol: {quantized_price_str: [(timestamp, volume), ...]}}
+_ICE_TRACKER: dict = defaultdict(lambda: defaultdict(list))
+# _SWEEP_TRACKER: {symbol: [(timestamp, price, volume, side), ...]}
+_SWEEP_TRACKER: dict = defaultdict(list)
+# Detected results attached to current candle: {symbol: {tf: {icebergs: {}, sweeps: []}}}
+_DETECT_RESULTS: dict = defaultdict(lambda: defaultdict(dict))
+
+
+def _detect_iceberg(symbol: str, price_str: str, volume: int,
+                    timestamp: float, side: str):
+    """Track fills at each price level. Detect iceberg when:
+    - 3+ fills at the same price within 5 seconds
+    - Each fill is similar size (within ±30% of each other)
+    - All fills are the same side (all buys or all sells)
+    Returns iceberg dict if detected, else None.
+    """
+    if volume < _ICE_MIN_CLIP or side == "n":
+        return None
+
+    tracker = _ICE_TRACKER[symbol][price_str]
+    tracker.append((timestamp, volume, side))
+
+    # Prune old fills outside the window
+    cutoff = timestamp - _ICE_WINDOW_SEC
+    while tracker and tracker[0][0] < cutoff:
+        tracker.pop(0)
+
+    # Need at least N fills
+    if len(tracker) < _ICE_REFILL_COUNT:
+        return None
+
+    # Check: all same side
+    sides = [f[2] for f in tracker]
+    if len(set(sides)) != 1:
+        return None
+
+    # Check: similar clip sizes (each within ±tolerance of the median)
+    vols = [f[1] for f in tracker]
+    median_vol = sorted(vols)[len(vols) // 2]
+    if median_vol == 0:
+        return None
+    for v in vols:
+        if abs(v - median_vol) / median_vol > _ICE_SIZE_TOLERANCE:
+            return None
+
+    # Iceberg detected!
+    est_total = sum(vols)
+    return {
+        "clips": len(tracker),
+        "est_total": est_total,
+        "side": sides[0],
+    }
+
+
+def _detect_sweep(symbol: str, price: float, volume: int,
+                  timestamp: float, side: str):
+    """Track consecutive same-side trades across price levels.
+    Detect sweep when:
+    - 3+ consecutive price levels hit within 200ms
+    - All same side (all buys or all sells)
+    - Total volume >= 30 contracts
+    Returns sweep dict if detected, else None.
+    """
+    if side == "n":
+        return None
+
+    tracker = _SWEEP_TRACKER[symbol]
+    tracker.append((timestamp, price, volume, side))
+
+    # Prune entries older than the sweep window
+    cutoff = timestamp - _SWEEP_WINDOW_SEC
+    while tracker and tracker[0][0] < cutoff:
+        tracker.pop(0)
+
+    # Need at least N entries
+    if len(tracker) < _SWEEP_MIN_LEVELS:
+        return None
+
+    # Check: all same side in the window
+    sides = [t[3] for t in tracker]
+    if len(set(sides)) != 1:
+        return None
+
+    # Check: distinct price levels (consecutive level sweep)
+    prices = sorted(set(t[1] for t in tracker))
+    if len(prices) < _SWEEP_MIN_LEVELS:
+        return None
+
+    # Check: total volume threshold
+    total_vol = sum(t[2] for t in tracker)
+    if total_vol < _SWEEP_MIN_VOLUME:
+        return None
+
+    # Sweep detected! Clear tracker to avoid re-firing
+    sweep_result = {
+        "prices": [float(p) for p in prices],
+        "vol": total_vol,
+        "side": sides[0],
+        "ts": timestamp,
+    }
+    tracker.clear()
+    return sweep_result
+
+
 # Dedicated lock for candle data — separate from _L2_LOCK to avoid
 # contention with DOM/trade state reads during high-volume periods.
 _CANDLE_LOCK = threading.Lock()
@@ -162,6 +283,8 @@ def _feed_candle(symbol: str, price: float, volume: int, timestamp: float,
                             "close": cur["c"],
                             "volume": cur["v"],
                             "bp": cur.get("bp"),
+                            "icebergs": cur.get("icebergs"),
+                            "sweeps": cur.get("sweeps"),
                         }
                         try:
                             _socketio.emit("candle_update", candle_data, namespace="/")
@@ -186,6 +309,13 @@ def _freeze_candle(candle: dict) -> dict:
         clean = {k: v for k, v in bp.items() if v[0] > 0 or v[1] > 0}
         if clean:
             snap["bp"] = clean
+    # ── Orderflow detection results ──
+    icebergs = candle.get("icebergs")
+    if icebergs:
+        snap["icebergs"] = icebergs
+    sweeps = candle.get("sweeps")
+    if sweeps:
+        snap["sweeps"] = sweeps
     return snap
 
 
@@ -359,6 +489,33 @@ def on_trade(symbol: str, trade: dict):
                 side = "b"  # aggressive buy (lifted the ask)
             elif best_bid > 0 and price <= best_bid:
                 side = "s"  # aggressive sell (hit the bid)
+
+        # ── Orderflow Detection (runs before candle update) ──
+        tick_size = TICK_SIZES.get(symbol, DEFAULT_TICK_SIZE)
+        qp = str(round(round(price / tick_size) * tick_size, 2))
+
+        # Iceberg detection
+        ice_hit = _detect_iceberg(symbol, qp, vol, ts, side)
+        if ice_hit:
+            with _CANDLE_LOCK:
+                for tf in CANDLE_TIMEFRAMES:
+                    cur = _CURRENT_CANDLE[symbol].get(tf)
+                    if cur:
+                        if "icebergs" not in cur:
+                            cur["icebergs"] = {}
+                        cur["icebergs"][qp] = ice_hit
+
+        # Sweep detection
+        sweep_hit = _detect_sweep(symbol, price, vol, ts, side)
+        if sweep_hit:
+            with _CANDLE_LOCK:
+                for tf in CANDLE_TIMEFRAMES:
+                    cur = _CURRENT_CANDLE[symbol].get(tf)
+                    if cur:
+                        if "sweeps" not in cur:
+                            cur["sweeps"] = []
+                        cur["sweeps"].append(sweep_hit)
+
         _feed_candle(symbol, price, vol, ts, side=side)
 
     # Store trade in L2_STATE
