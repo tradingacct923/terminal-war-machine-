@@ -4022,6 +4022,8 @@ let _l2ChartTF = '1m';
 let _l2ChartInitialized = false;
 let _l2CandlePollTimer = null;
 let _l2SeamTime = 0;  // timestamp of the first candle with live bubble data
+let _l2FetchController = null;   // AbortController for in-flight fetch cancellation
+let _l2FetchVersion = 0;         // bumped on each switch to discard stale responses
 let _l2TapeAll = [];   // accumulated trades, newest first
 
 // ── Wall / Max Pain overlay state ──
@@ -4409,40 +4411,21 @@ function _l2InitCandleChart() {
     });
     ro.observe(container);
 
-    // ── Symbol buttons ──
+    // ── Symbol buttons (old tab layout) — delegate to unified handler ──
     document.querySelectorAll('#l2-chart-symbols .l2-tf-btn').forEach(btn => {
         btn.addEventListener('click', () => {
             document.querySelectorAll('#l2-chart-symbols .l2-tf-btn').forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
-            _l2ChartSymbol = btn.dataset.sym;
-            // Full reload: reset delta tracking, fetch all history
-            _l2LastCandleTime = 0;
-            // Update price format for symbol-specific tick size
-            const tickSize = L2_TICK_SIZES[_l2ChartSymbol] || 0.25;
-            if (_l2CandleSeries) {
-                _l2CandleSeries.applyOptions({
-                    priceFormat: { type: 'price', precision: 2, minMove: tickSize },
-                });
-            }
-            if (_l2BubbleSeries) {
-                try { _l2BubbleSeries.applyOptions({ priceFormat: { type: 'price', precision: 2, minMove: tickSize } }); } catch(e) {}
-            }
-            _l2FetchCandles(true);
-            _l2UpdateWallLines();
-            _l2SocketSubscribe(); // tell server to push candles for new symbol
+            _l2SwitchSymbol(btn.dataset.sym);
         });
     });
 
-    // ── Timeframe buttons ──
+    // ── Timeframe buttons (old tab layout) — delegate to unified handler ──
     document.querySelectorAll('#l2-chart-tfs .l2-tf-btn').forEach(btn => {
         btn.addEventListener('click', () => {
             document.querySelectorAll('#l2-chart-tfs .l2-tf-btn').forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
-            _l2ChartTF = btn.dataset.tf;
-            // Full reload: reset delta tracking, fetch all history
-            _l2LastCandleTime = 0;
-            _l2FetchCandles(true);
-            _l2SocketSubscribe(); // tell server about new timeframe
+            _l2SwitchTimeframe(btn.dataset.tf);
         });
     });
 
@@ -4458,8 +4441,7 @@ function _l2InitCandleChart() {
 let _l2LastCandleTime = 0;
 
 // ── Chained setTimeout polling (FALLBACK — only used when Socket.IO unavailable) ──
-// Socket.IO handles live candle push. This polls as backup every 3s.
-const _L2_POLL_INTERVAL = _sioConnected ? 5000 : 500; // fast if no WS, slow if WS active
+// Socket.IO handles live candle push. This polls as backup every 3-5s.
 
 function _l2ScheduleNextPoll() {
     // Only schedule if we're still on the L2 tab and have a chart
@@ -4472,8 +4454,134 @@ function _l2ScheduleNextPoll() {
     }, interval);
 }
 
-function _l2FetchCandles(fullRedraw) {
+// ── Loading / Error overlay helpers ──
+function _l2ShowOverlay(msg, isError) {
+    let overlay = document.getElementById('l2-chart-overlay');
+    const container = document.getElementById('t-l2-candle-chart')
+                   || document.getElementById('l2-candle-chart');
+    if (!container) return;
+    if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.id = 'l2-chart-overlay';
+        overlay.style.cssText = 'position:absolute;top:0;left:0;right:0;bottom:0;display:flex;align-items:center;justify-content:center;z-index:50;pointer-events:none;font-family:"JetBrains Mono",monospace;font-size:12px;';
+        container.style.position = 'relative';
+        container.appendChild(overlay);
+    }
+    overlay.style.display = 'flex';
+    overlay.style.color = isError ? 'rgba(224,48,96,0.9)' : 'rgba(140,160,200,0.8)';
+    overlay.style.background = isError ? 'rgba(30,10,15,0.6)' : 'rgba(10,10,20,0.5)';
+    overlay.innerHTML = msg;
+}
+
+function _l2HideOverlay() {
+    const overlay = document.getElementById('l2-chart-overlay');
+    if (overlay) overlay.style.display = 'none';
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UNIFIED SWITCH FUNCTIONS — all symbol/timeframe switching goes through here
+// ═══════════════════════════════════════════════════════════════════════════
+
+function _l2SwitchSymbol(sym) {
+    if (sym === _l2ChartSymbol) return;
+
+    // 1. Cancel in-flight fetch
+    if (_l2FetchController) { _l2FetchController.abort(); _l2FetchController = null; }
+
+    // 2. Cancel poll timer
+    if (_l2CandlePollTimer) { clearTimeout(_l2CandlePollTimer); _l2CandlePollTimer = null; }
+
+    // 3. Clear chart data immediately (no stale candles)
+    if (_l2CandleSeries) _l2CandleSeries.setData([]);
+    if (_l2VolumeSeries) _l2VolumeSeries.setData([]);
+    if (_l2BubbleSeries) _l2BubbleSeries.setData([]);
+
+    // 4. Set new symbol + reset delta tracking
+    _l2ChartSymbol = sym;
+    _l2LastCandleTime = 0;
+    _l2FetchVersion++;
+
+    // 5. Update price format for symbol-specific tick size
+    const tickSize = L2_TICK_SIZES[sym] || 0.25;
+    if (_l2CandleSeries) {
+        _l2CandleSeries.applyOptions({
+            priceFormat: { type: 'price', precision: 2, minMove: tickSize },
+        });
+    }
+    if (_l2BubbleSeries) {
+        try { _l2BubbleSeries.applyOptions({ priceFormat: { type: 'price', precision: 2, minMove: tickSize } }); } catch(e) {}
+    }
+
+    // 6. Show loading overlay
+    _l2ShowOverlay(`Loading ${sym}...`, false);
+
+    // 7. Tell Socket.IO server about new symbol
+    _l2SocketSubscribe();
+
+    // 8. Fetch full candle history + restart poll on success
+    _l2FetchCandles(true).then(() => {
+        _l2HideOverlay();
+        _l2ScheduleNextPoll();
+    });
+
+    // 9. Sync button active states across both button sets
+    document.querySelectorAll('#t-symbols .t-btn, #l2-chart-symbols .l2-tf-btn').forEach(b => {
+        b.classList.toggle('active', b.dataset.sym === sym);
+    });
+}
+
+function _l2SwitchTimeframe(tf) {
+    if (tf === _l2ChartTF) return;
+
+    // 1. Cancel in-flight fetch
+    if (_l2FetchController) { _l2FetchController.abort(); _l2FetchController = null; }
+
+    // 2. Cancel poll timer
+    if (_l2CandlePollTimer) { clearTimeout(_l2CandlePollTimer); _l2CandlePollTimer = null; }
+
+    // 3. Clear chart data immediately
+    if (_l2CandleSeries) _l2CandleSeries.setData([]);
+    if (_l2VolumeSeries) _l2VolumeSeries.setData([]);
+    if (_l2BubbleSeries) _l2BubbleSeries.setData([]);
+
+    // 4. Set new timeframe + reset delta tracking
+    _l2ChartTF = tf;
+    _l2LastCandleTime = 0;
+    _l2FetchVersion++;
+
+    // 5. Show loading overlay
+    _l2ShowOverlay(`Loading ${_l2ChartSymbol} ${tf}...`, false);
+
+    // 6. Tell Socket.IO server about new timeframe
+    _l2SocketSubscribe();
+
+    // 7. Fetch full candle history + restart poll on success
+    _l2FetchCandles(true).then(() => {
+        _l2HideOverlay();
+        _l2ScheduleNextPoll();
+    });
+
+    // 8. Sync button active states
+    document.querySelectorAll('#t-timeframes .t-btn, #l2-chart-tfs .l2-tf-btn').forEach(b => {
+        b.classList.toggle('active', b.dataset.tf === tf);
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FETCH WITH RETRY + ABORT + ERROR HANDLING
+// ═══════════════════════════════════════════════════════════════════════════
+
+function _l2FetchCandles(fullRedraw, _retryCount) {
     if (!_l2CandleSeries) return Promise.resolve();
+    const attempt = _retryCount || 0;
+    const MAX_RETRIES = 3;
+    const myVersion = _l2FetchVersion; // capture to detect stale responses
+
+    // Abort any previous in-flight fetch
+    if (fullRedraw) {
+        if (_l2FetchController) _l2FetchController.abort();
+        _l2FetchController = new AbortController();
+    }
 
     // Build URL: omit ?since= on full redraws to get all history
     let url = `/api/l2/candles?symbol=${_l2ChartSymbol}&tf=${_l2ChartTF}`;
@@ -4481,15 +4589,19 @@ function _l2FetchCandles(fullRedraw) {
         url += `&since=${_l2LastCandleTime}`;
     }
 
-    return authFetch(url)
+    const fetchOpts = _l2FetchController ? { signal: _l2FetchController.signal } : {};
+
+    return authFetch(url, fetchOpts)
         .then(r => r.json())
         .then(resp => {
+            // Discard stale response if user switched symbol/tf during fetch
+            if (myVersion !== _l2FetchVersion) return;
+
             const candles = resp.candles;
             if (!Array.isArray(candles) || candles.length === 0) return;
 
             if (fullRedraw) {
                 // ── FULL HISTORY: setData() once ──
-                // All timestamps offset to ET for x-axis display
                 const ohlc = candles.map(c => ({
                     time: _utcToET(c.time),
                     open: c.open,
@@ -4566,8 +4678,25 @@ function _l2FetchCandles(fullRedraw) {
 
             // Track the newest candle timestamp (raw UTC for ?since= param)
             _l2LastCandleTime = candles[candles.length - 1].time;
+            _l2HideOverlay(); // clear any error overlay
         })
-        .catch(() => {});
+        .catch(err => {
+            // Aborted fetches are normal during rapid switching — ignore silently
+            if (err && err.name === 'AbortError') return;
+            // Stale request — ignore
+            if (myVersion !== _l2FetchVersion) return;
+
+            console.warn(`[L2Chart] Fetch error (attempt ${attempt + 1}/${MAX_RETRIES}):`, err);
+
+            if (attempt < MAX_RETRIES) {
+                const delay = 1000 * (attempt + 1); // 1s, 2s, 3s backoff
+                _l2ShowOverlay(`Connection error — retrying (${attempt + 1}/${MAX_RETRIES})...`, true);
+                return new Promise(resolve => setTimeout(resolve, delay))
+                    .then(() => _l2FetchCandles(fullRedraw, attempt + 1));
+            } else {
+                _l2ShowOverlay('⚠ Failed to load chart data — click a symbol to retry', true);
+            }
+        });
 }
 
 function _l2Render(data) {
@@ -4591,7 +4720,7 @@ function _l2Render(data) {
     _l2RenderDOM(data.dom);
     _l2RenderTape(data.trades || {});
     _l2RenderSignals(data.signals);
-    _l2InitCandleChart();
+    // BUG 3 FIX: removed redundant _l2InitCandleChart() — it's already called once in DOMContentLoaded
 }
 
 // ── L2 DOM/Trade polling (also chained setTimeout, not setInterval) ──
@@ -4616,8 +4745,7 @@ function _startL2Poll() {
     loadL2();
     // Start chained DOM polling (replaces setInterval)
     _l2ScheduleDomPoll();
-    // Kickstart candle chart if not yet initialized
-    _l2InitCandleChart();
+    // BUG 3 FIX: removed redundant _l2InitCandleChart() — it's already called once in DOMContentLoaded
     // Initialize Socket.IO for real-time push
     _l2InitSocketIO();
 }
@@ -4857,31 +4985,9 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!terminal) return;  // fallback: old layout mode
 
     // ── Toolbar: Symbol buttons ──
+    // ── Toolbar: Symbol buttons — delegate to unified handler ──
     document.querySelectorAll('#t-symbols .t-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-            document.querySelectorAll('#t-symbols .t-btn').forEach(b => b.classList.remove('active'));
-            btn.classList.add('active');
-            _l2ChartSymbol = btn.dataset.sym;
-            _l2LastCandleTime = 0;
-            // Update price format for symbol-specific tick size
-            const tickSize = L2_TICK_SIZES[_l2ChartSymbol] || 0.25;
-            if (_l2CandleSeries) {
-                _l2CandleSeries.applyOptions({
-                    priceFormat: { type: 'price', precision: 2, minMove: tickSize },
-                });
-            }
-            // Update bubble series price format too
-            if (_l2BubbleSeries) {
-                try {
-                    _l2BubbleSeries.applyOptions({
-                        priceFormat: { type: 'price', precision: 2, minMove: tickSize },
-                    });
-                } catch(e) { /* custom series may not support applyOptions */ }
-            }
-            _l2FetchCandles(true);
-            // Re-fetch walls for new symbol (NQ→QQQ, GC→GLD)
-            _l2UpdateWallLines();
-        });
+        btn.addEventListener('click', () => _l2SwitchSymbol(btn.dataset.sym));
     });
 
     // ── Toolbar: Walls overlay toggle ──
@@ -4891,15 +4997,9 @@ document.addEventListener('DOMContentLoaded', () => {
         wallsBtn.classList.toggle('active', _l2ShowWalls);
     }
 
-    // ── Toolbar: Timeframe buttons ──
+    // ── Toolbar: Timeframe buttons — delegate to unified handler ──
     document.querySelectorAll('#t-timeframes .t-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-            document.querySelectorAll('#t-timeframes .t-btn').forEach(b => b.classList.remove('active'));
-            btn.classList.add('active');
-            _l2ChartTF = btn.dataset.tf;
-            _l2LastCandleTime = 0;
-            _l2FetchCandles(true);
-        });
+        btn.addEventListener('click', () => _l2SwitchTimeframe(btn.dataset.tf));
     });
 
     // ── Auto-start L2 chart (skip tab routing) ──
