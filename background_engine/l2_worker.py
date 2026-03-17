@@ -58,6 +58,17 @@ _CANDLES: dict[str, dict[str, deque]] = defaultdict(
 # Current (incomplete) candle being built: {symbol: {tf: {t,o,h,l,c,v}}}
 _CURRENT_CANDLE: dict[str, dict[str, dict]] = defaultdict(dict)
 
+# ── Socket.IO reference (set by server.py at startup) ──
+_socketio = None
+_last_emit_time: dict = {}  # throttle: {"symbol:tf": timestamp}
+_EMIT_MIN_INTERVAL = 0.15   # max ~6.6 emits/sec per symbol/tf
+
+def set_socketio(sio):
+    """Called by server.py to inject the SocketIO instance for real-time push."""
+    global _socketio
+    _socketio = sio
+    log.info("Socket.IO reference set for real-time candle push")
+
 # Dedicated lock for candle data — separate from _L2_LOCK to avoid
 # contention with DOM/trade state reads during high-volume periods.
 _CANDLE_LOCK = threading.Lock()
@@ -131,6 +142,31 @@ def _feed_candle(symbol: str, price: float, volume: int, timestamp: float,
                     else:
                         bp[qp] = [volume if side == "b" else 0,
                                   volume if side == "s" else 0]
+
+            # ── Emit candle update via Socket.IO (throttled) ──
+            if _socketio is not None:
+                emit_key = f"{symbol}:{tf}"
+                now = time.time()
+                last = _last_emit_time.get(emit_key, 0)
+                if now - last >= _EMIT_MIN_INTERVAL:
+                    _last_emit_time[emit_key] = now
+                    cur = _CURRENT_CANDLE[symbol].get(tf)
+                    if cur:
+                        candle_data = {
+                            "symbol": symbol,
+                            "tf": tf,
+                            "time": cur["t"],
+                            "open": cur["o"],
+                            "high": cur["h"],
+                            "low": cur["l"],
+                            "close": cur["c"],
+                            "volume": cur["v"],
+                            "bp": cur.get("bp"),
+                        }
+                        try:
+                            _socketio.emit("candle_update", candle_data, namespace="/")
+                        except Exception:
+                            pass  # don't let emit errors break the candle engine
 
 
 def _freeze_candle(candle: dict) -> dict:
@@ -330,6 +366,19 @@ def on_trade(symbol: str, trade: dict):
         if symbol not in L2_STATE["trades"]:
             L2_STATE["trades"][symbol] = deque(maxlen=500)
         L2_STATE["trades"][symbol].append(trade)
+
+    # ── Emit trade tick via Socket.IO ──
+    if _socketio is not None and price > 0:
+        try:
+            _socketio.emit("trade_tick", {
+                "symbol": symbol,
+                "price": price,
+                "volume": vol,
+                "side": side,
+                "timestamp": ts,
+            }, namespace="/")
+        except Exception:
+            pass
 
 
 # ── Heavy framework pre-compute (runs every 60s in background) ────────────────

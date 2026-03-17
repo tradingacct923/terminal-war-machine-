@@ -8,6 +8,7 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 from flask import Flask, jsonify, request, send_from_directory, Response, make_response
 from flask_cors import CORS
+from flask_socketio import SocketIO, emit
 from data_provider import fetch_all
 from config import TICKER as _DEFAULT_TICKER
 
@@ -145,6 +146,8 @@ def _cached_fetch_all(ticker: str):
 
 app = Flask(__name__, static_folder="web", static_url_path="")
 CORS(app)  # Open CORS — user will configure domain later
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading",
+                    ping_timeout=30, ping_interval=10)
 
 # Build version = git short hash (falls back to file mtime)
 def _build_ver():
@@ -1765,8 +1768,10 @@ def _start_workers():
         print("[L2-THREAD] awake, importing l2_worker...", flush=True)
         print(f"[L2-THREAD] ENV CHECK: username={bool(os.getenv('TOPSTEPX_USERNAME'))}, api_key={bool(os.getenv('TOPSTEPX_API_KEY'))}, password={bool(os.getenv('TOPSTEPX_PASSWORD'))}, rest_base={os.getenv('TOPSTEPX_REST_BASE', '(not set)')}", flush=True)
         try:
-            from background_engine.l2_worker import start_l2_worker
-            print("[L2-THREAD] import OK, calling start_l2_worker()...", flush=True)
+            from background_engine.l2_worker import start_l2_worker, set_socketio
+            print("[L2-THREAD] import OK, injecting Socket.IO...", flush=True)
+            set_socketio(socketio)
+            print("[L2-THREAD] calling start_l2_worker()...", flush=True)
             start_l2_worker()
             print("[L2-THREAD] start_l2_worker() returned OK", flush=True)
         except Exception as e:
@@ -1799,10 +1804,26 @@ def _ensure_workers_started():
             _worker_error = str(_e)
             print(f"[startup] WARNING: workers failed to start: {_e}", flush=True)
 
+# ── Socket.IO event handlers ──
+@socketio.on('connect')
+def handle_connect():
+    print(f"[Socket.IO] Client connected: {request.sid}")
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print(f"[Socket.IO] Client disconnected: {request.sid}")
+
+@socketio.on('subscribe')
+def handle_subscribe(data):
+    """Client subscribes to a symbol+timeframe for live candle push."""
+    symbol = data.get('symbol', 'NQ')
+    tf = data.get('tf', '1m')
+    print(f"[Socket.IO] Client {request.sid} subscribed to {symbol}/{tf}")
+    emit('subscribed', {'symbol': symbol, 'tf': tf})
+
 if __name__ == "__main__":
-    print("Starting Greek Options Dashboard...")
+    print("Starting Altaris Terminal with Socket.IO...")
     print("Open http://localhost:5000 in your browser")
 
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
-
+    socketio.run(app, host="0.0.0.0", port=port, debug=False, allow_unsafe_werkzeug=True)

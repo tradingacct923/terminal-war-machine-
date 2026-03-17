@@ -4033,6 +4033,82 @@ let _l2ShowWalls = true; // toggle for options level overlays
 const L2_SYMBOLS = ['NQ', 'GC'];
 const L2_TICK_SIZES = { NQ: 0.25, GC: 0.10 };
 
+// ── Socket.IO connection for real-time candle/trade push ──
+let _sio = null;
+let _sioConnected = false;
+
+function _l2InitSocketIO() {
+    if (_sio) return; // already connected
+    if (typeof io === 'undefined') {
+        console.warn('[Socket.IO] Client library not loaded, falling back to HTTP polling');
+        return;
+    }
+    _sio = io({ transports: ['websocket', 'polling'], reconnection: true, reconnectionDelay: 1000 });
+
+    _sio.on('connect', () => {
+        _sioConnected = true;
+        console.log('[Socket.IO] Connected — real-time candle push active');
+        // Subscribe to current symbol+timeframe
+        _sio.emit('subscribe', { symbol: _l2ChartSymbol, tf: _l2ChartTF });
+    });
+
+    _sio.on('disconnect', () => {
+        _sioConnected = false;
+        console.warn('[Socket.IO] Disconnected — will reconnect');
+    });
+
+    // ── Real-time candle updates (replaces HTTP polling) ──
+    _sio.on('candle_update', (data) => {
+        if (!_l2CandleSeries) return;
+        // Only process candles matching our current symbol + timeframe
+        if (data.symbol !== _l2ChartSymbol || data.tf !== _l2ChartTF) return;
+
+        const et = _utcToET(data.time);
+        _l2CandleSeries.update({
+            time: et,
+            open: data.open,
+            high: data.high,
+            low: data.low,
+            close: data.close,
+        });
+        _l2VolumeSeries.update({
+            time: et,
+            value: data.volume || 0,
+            color: data.close >= data.open ? 'rgba(31,209,122,.25)' : 'rgba(224,48,96,.25)',
+        });
+        if (_l2BubbleSeries && data.bp) {
+            _l2BubbleSeries.update({
+                time: et,
+                close: data.close,
+                bp: data.bp,
+            });
+        }
+        // Track newest candle time
+        _l2LastCandleTime = data.time;
+    });
+
+    // ── Real-time trade ticks (for tape + price strip) ──
+    _sio.on('trade_tick', (data) => {
+        // Update price strip instantly
+        const strip = document.getElementById('l2-symbol-prices');
+        if (strip) {
+            const priceEl = strip.querySelector(`[data-sym="${data.symbol}"] .price`);
+            if (priceEl) priceEl.textContent = data.price.toFixed(2);
+        }
+        // Update toolbar spot price if matching current symbol
+        if (data.symbol === _l2ChartSymbol) {
+            const spotEl = document.getElementById('t-spot');
+            if (spotEl) spotEl.textContent = data.price.toFixed(2);
+        }
+    });
+}
+
+function _l2SocketSubscribe() {
+    if (_sio && _sioConnected) {
+        _sio.emit('subscribe', { symbol: _l2ChartSymbol, tf: _l2ChartTF });
+    }
+}
+
 // ── Timezone helper: UTC epoch → Eastern Time epoch ──
 // LWC treats the time field as UTC, so we offset it to ET
 // to make the x-axis show ET hours. Handles EST/EDT automatically.
@@ -4341,7 +4417,19 @@ function _l2InitCandleChart() {
             _l2ChartSymbol = btn.dataset.sym;
             // Full reload: reset delta tracking, fetch all history
             _l2LastCandleTime = 0;
+            // Update price format for symbol-specific tick size
+            const tickSize = L2_TICK_SIZES[_l2ChartSymbol] || 0.25;
+            if (_l2CandleSeries) {
+                _l2CandleSeries.applyOptions({
+                    priceFormat: { type: 'price', precision: 2, minMove: tickSize },
+                });
+            }
+            if (_l2BubbleSeries) {
+                try { _l2BubbleSeries.applyOptions({ priceFormat: { type: 'price', precision: 2, minMove: tickSize } }); } catch(e) {}
+            }
             _l2FetchCandles(true);
+            _l2UpdateWallLines();
+            _l2SocketSubscribe(); // tell server to push candles for new symbol
         });
     });
 
@@ -4354,6 +4442,7 @@ function _l2InitCandleChart() {
             // Full reload: reset delta tracking, fetch all history
             _l2LastCandleTime = 0;
             _l2FetchCandles(true);
+            _l2SocketSubscribe(); // tell server about new timeframe
         });
     });
 
@@ -4368,20 +4457,19 @@ function _l2InitCandleChart() {
 // Live polls send ?since=_l2LastCandleTime so the server returns only 1-3 candles.
 let _l2LastCandleTime = 0;
 
-// ── Chained setTimeout polling ──
-// Unlike setInterval, this guarantees the next poll starts only AFTER the
-// previous fetch completes. Prevents request stacking during server lag.
-const _L2_POLL_INTERVAL = 1500; // 1.5s between polls
+// ── Chained setTimeout polling (FALLBACK — only used when Socket.IO unavailable) ──
+// Socket.IO handles live candle push. This polls as backup every 3s.
+const _L2_POLL_INTERVAL = _sioConnected ? 5000 : 500; // fast if no WS, slow if WS active
 
 function _l2ScheduleNextPoll() {
     // Only schedule if we're still on the L2 tab and have a chart
     if (!_l2CandleSeries) return;
+    const interval = _sioConnected ? 5000 : 500; // back off if Socket.IO is live
     _l2CandlePollTimer = setTimeout(() => {
         _l2FetchCandles(false).finally(() => {
-            // Chain: schedule next poll after this one resolves (success or error)
             _l2ScheduleNextPoll();
         });
-    }, _L2_POLL_INTERVAL);
+    }, interval);
 }
 
 function _l2FetchCandles(fullRedraw) {
@@ -4520,7 +4608,7 @@ function _l2ScheduleDomPoll() {
         loadL2().finally(() => {
             _l2ScheduleDomPoll();
         });
-    }, 1000);  // 1s between DOM/tape polls (was 500ms — reduced DOM thrash)
+    }, 500);  // 500ms DOM polls (fast fallback, Socket.IO handles trades directly)
 }
 
 function _startL2Poll() {
@@ -4530,6 +4618,8 @@ function _startL2Poll() {
     _l2ScheduleDomPoll();
     // Kickstart candle chart if not yet initialized
     _l2InitCandleChart();
+    // Initialize Socket.IO for real-time push
+    _l2InitSocketIO();
 }
 
 function _stopL2Poll() {
