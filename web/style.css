@@ -4220,11 +4220,23 @@ h3 {
 /* ── Chart Panel ── */
 .t-chart {
   grid-area: chart;
-  overflow: hidden;
+  overflow: hidden; /* clips to grid cell, chart handles internal scroll */
   background: var(--bg, #06080f);
   position: relative;
   min-height: 0;
   height: 100%;
+}
+
+/* Allow chart canvas to receive all pointer events for pan/zoom */
+.t-chart canvas,
+.t-chart .tv-lightweight-charts {
+  touch-action: none;
+  cursor: crosshair;
+}
+
+/* Dragging state: grab cursor */
+.t-chart canvas:active {
+  cursor: grabbing;
 }
 
 /* ── Options Chain Panel ── */
@@ -4642,16 +4654,20 @@ h3 {
   box-shadow: inset 3px 0 0 var(--accent, #7c5af7);
 }
 
-/* ── Button press animations ──────────────────────────────────────────── */
-button,
+/* ── Button press animations (scoped to UI buttons, not chart internals) ── */
+.t-btn,
+.t-settings-btn,
 .pill-opt,
-.ts-preset {
+.ts-preset,
+.l2-tf-btn {
   transition: all .15s ease !important;
 }
 
-button:active,
+.t-btn:active,
+.t-settings-btn:active,
 .pill-opt:active,
-.ts-preset:active {
+.ts-preset:active,
+.l2-tf-btn:active {
   transform: scale(.96);
 }
 
@@ -4832,10 +4848,19 @@ button:active,
 /* ── Candlestick chart container ────────────────────────────────────────────── */
 #l2-candle-chart {
   border-radius: 0 0 12px 12px;
-  overflow: hidden;
+  overflow: visible; /* CRITICAL: don't clip LWC interaction overlays */
   background:
     radial-gradient(ellipse 80% 60% at 50% 0%, rgba(124,90,247,.03), transparent 70%),
     linear-gradient(180deg, rgba(6,8,16,1) 0%, rgba(4,5,12,1) 100%);
+}
+
+/* Terminal chart: full-bleed, no radius clipping */
+#t-l2-candle-chart {
+  width: 100%;
+  height: 100%;
+  touch-action: none; /* enable trackpad gestures for LWC */
+  user-select: none;  /* prevent text selection while dragging chart */
+  -webkit-user-select: none;
 }
 
 /* L2 tab — no padding on chart card for full-bleed */
