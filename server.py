@@ -696,14 +696,23 @@ def api_chain():
 
 @app.route("/api/walls")
 def api_walls():
-    """Lightweight put/call wall + max pain — direct Tradier calls, no fetch_all."""
+    """Put/call wall + max pain — supports NQ (via QQQ) and GC (via GLD).
+    Query params:
+      ?symbol=NQ  (default) — uses QQQ options, maps to NQ futures
+      ?symbol=GC  — uses GLD options, maps to GC futures
+      ?ticker=XXX — override underlying ticker directly (legacy compat)
+    """
     import requests as _req
     from datetime import datetime, date
 
     TRADIER_TOKEN = os.getenv("TRADIER_TOKEN", "BkkUX4cdeBXLkAejHAm8mKeOGTzt")
     TRADIER_BASE  = "https://api.tradier.com/v1"
     HEADERS = {"Authorization": f"Bearer {TRADIER_TOKEN}", "Accept": "application/json"}
-    ticker = request.args.get("ticker", "QQQ").upper()
+
+    # Determine underlying ticker and futures symbol from ?symbol= param
+    futures_sym = request.args.get("symbol", "NQ").upper()
+    FUTURES_TO_UNDERLYING = {"NQ": "QQQ", "GC": "GLD"}
+    ticker = request.args.get("ticker", FUTURES_TO_UNDERLYING.get(futures_sym, "QQQ")).upper()
 
     try:
         # Get nearest expiry
@@ -738,13 +747,13 @@ def api_walls():
             if otype == "call":   call_oi[strike] = call_oi.get(strike, 0) + oi
             elif otype == "put":  put_oi[strike] = put_oi.get(strike, 0) + oi
 
-        qqq_put_wall  = max(put_oi, key=put_oi.get) if put_oi else 0
-        qqq_call_wall = max(call_oi, key=call_oi.get) if call_oi else 0
+        underlying_put_wall  = max(put_oi, key=put_oi.get) if put_oi else 0
+        underlying_call_wall = max(call_oi, key=call_oi.get) if call_oi else 0
 
         # Max pain
         sorted_strikes = sorted(strikes)
         min_pain = float("inf")
-        qqq_max_pain = spot
+        underlying_max_pain = spot
         for K in sorted_strikes:
             pain = 0
             for S in sorted_strikes:
@@ -752,30 +761,41 @@ def api_walls():
                 if S > K:  pain += call_oi.get(S, 0) * (S - K) * 100
             if pain < min_pain:
                 min_pain = pain
-                qqq_max_pain = K
+                underlying_max_pain = K
 
-        # Convert QQQ → NQ
+        # Convert underlying → futures price (e.g. QQQ→NQ or GLD→GC)
         try:
             from background_engine.l2_worker import get_l2_state
-            nq_mid = get_l2_state().get("mid_prices", {}).get("NQ", 0)
+            futures_mid = get_l2_state().get("mid_prices", {}).get(futures_sym, 0)
         except Exception:
-            nq_mid = 0
-        ratio = nq_mid / spot if (nq_mid > 0 and spot > 0) else 40.0
+            futures_mid = 0
+
+        # Fallback ratios if L2 isn't connected
+        DEFAULT_RATIOS = {"NQ": 40.0, "GC": 14.0}  # approx NQ/QQQ ≈ 40, GC/GLD ≈ 14
+        ratio = futures_mid / spot if (futures_mid > 0 and spot > 0) else DEFAULT_RATIOS.get(futures_sym, 1.0)
 
         result = {
-            "put_wall":      round(qqq_put_wall * ratio, 2),
-            "call_wall":     round(qqq_call_wall * ratio, 2),
-            "max_pain":      round(qqq_max_pain * ratio, 2),
-            "qqq_spot":      spot,
-            "qqq_put_wall":  qqq_put_wall,
-            "qqq_call_wall": qqq_call_wall,
-            "qqq_max_pain":  qqq_max_pain,
-            "nq_mid":        nq_mid,
-            "ratio":         round(ratio, 4),
-            "expiry":        exp_date,
+            "put_wall":              round(underlying_put_wall * ratio, 2),
+            "call_wall":             round(underlying_call_wall * ratio, 2),
+            "max_pain":              round(underlying_max_pain * ratio, 2),
+            "underlying_ticker":     ticker,
+            "underlying_spot":       spot,
+            "underlying_put_wall":   underlying_put_wall,
+            "underlying_call_wall":  underlying_call_wall,
+            "underlying_max_pain":   underlying_max_pain,
+            "futures_symbol":        futures_sym,
+            "futures_mid":           futures_mid,
+            "ratio":                 round(ratio, 4),
+            "expiry":                exp_date,
+            # Legacy compat keys (for any old code referencing qqq_* directly)
+            "qqq_spot":              spot if ticker == "QQQ" else None,
+            "qqq_put_wall":          underlying_put_wall if ticker == "QQQ" else None,
+            "qqq_call_wall":         underlying_call_wall if ticker == "QQQ" else None,
+            "qqq_max_pain":          underlying_max_pain if ticker == "QQQ" else None,
+            "nq_mid":                futures_mid if futures_sym == "NQ" else None,
         }
-        print(f"[api/walls] QQQ PW={qqq_put_wall} CW={qqq_call_wall} MP={qqq_max_pain} | "
-              f"NQ r={ratio:.2f} PW={result['put_wall']} CW={result['call_wall']} MP={result['max_pain']}")
+        print(f"[api/walls] {ticker} PW={underlying_put_wall} CW={underlying_call_wall} MP={underlying_max_pain} | "
+              f"{futures_sym} r={ratio:.2f} PW={result['put_wall']} CW={result['call_wall']} MP={result['max_pain']}")
         return jsonify(result)
     except Exception as e:
         import traceback

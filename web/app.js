@@ -1963,6 +1963,8 @@ async function updateCandleChart(days) {
         };
 
         // ── 3. Volume bar panel ──────────────────────────────────────────────
+        const upColor = 'rgba(31,209,122,.45)';
+        const downColor = 'rgba(224,48,96,.45)';
         const volColors = d.candles.map((c, i) =>
             i === 0 ? upColor : (c.c >= d.candles[i - 1].c ? upColor : downColor)
         );
@@ -3863,6 +3865,12 @@ function renderProb() {
 // ── Global Theme Switcher ─────────────────────────────────────────────────────
 // Header button just cycles through 3 global themes by calling applyTheme
 const _CYCLE_LIST = ['void', 'terminal', 'arctic'];
+const THEME_LABELS = {
+    void: '\u{1f319} Midnight',
+    midnight: '\u{1f319} Midnight',
+    terminal: '\u{1f4bb} Terminal',
+    arctic: '\u2600\ufe0f Arctic',
+};
 function cycleTheme() {
     const curr = localStorage.getItem('dashTheme') || 'void';
     const idx = _CYCLE_LIST.indexOf(curr);
@@ -4020,6 +4028,7 @@ let _l2TapeAll = [];   // accumulated trades, newest first
 let _l2WallLines = [];   // stored price line refs for cleanup
 let _l2WallTimer = null; // refresh interval
 let _ocRefreshTimer = null; // options chain auto-refresh
+let _l2ShowWalls = true; // toggle for options level overlays
 
 const L2_SYMBOLS = ['NQ', 'GC'];
 const L2_TICK_SIZES = { NQ: 0.25, GC: 0.10 };
@@ -4647,7 +4656,7 @@ function _ocPopulateChain(selectedExp) {
         .catch(err => console.warn('[OptionsChain] fetch error:', err));
 }
 
-// ── Wall / Max Pain overlays on L2 chart ──
+// ── Wall / Max Pain overlays on L2 chart (symbol-aware) ──
 function _l2UpdateWallLines() {
     if (!_l2CandleSeries) return;
 
@@ -4657,26 +4666,33 @@ function _l2UpdateWallLines() {
     }
     _l2WallLines = [];
 
-    authFetch('/api/walls')
+    // If walls toggled off, just clear and return
+    if (!_l2ShowWalls) return;
+
+    // Pick underlying: NQ → QQQ, GC → GLD
+    const sym = _l2ChartSymbol || 'NQ';
+    const wallUrl = `/api/walls?symbol=${sym}`;
+
+    authFetch(wallUrl)
         .then(r => r.json())
         .then(data => {
             if (data.error) return;
 
-            // Wall prices are now in NQ-equivalent (converted by backend)
+            const underlying = data.underlying_ticker || 'QQQ';
             const lines = [
                 {
                     price: data.put_wall,
-                    title: `PUT WALL (QQQ ${data.qqq_put_wall || '?'})`,
+                    title: `PUT WALL (${underlying} ${data.underlying_put_wall || '?'})`,
                     color: 'rgba(224, 48, 96, 0.8)',
                 },
                 {
                     price: data.call_wall,
-                    title: `CALL WALL (QQQ ${data.qqq_call_wall || '?'})`,
+                    title: `CALL WALL (${underlying} ${data.underlying_call_wall || '?'})`,
                     color: 'rgba(31, 209, 122, 0.8)',
                 },
                 {
                     price: data.max_pain,
-                    title: `MAX PAIN (QQQ ${data.qqq_max_pain || '?'})`,
+                    title: `MAX PAIN (${underlying} ${data.underlying_max_pain || '?'})`,
                     color: 'rgba(255, 200, 50, 0.85)',
                 },
             ];
@@ -4694,17 +4710,36 @@ function _l2UpdateWallLines() {
                 _l2WallLines.push(pl);
             }
 
-            // Update toolbar metrics with QQQ values
+            // Update toolbar metrics with underlying values
             const setCW = document.getElementById('t-cw');
             const setPW = document.getElementById('t-pw');
             const setMP = document.getElementById('t-mp');
-            if (setCW) setCW.textContent = data.qqq_call_wall || '—';
-            if (setPW) setPW.textContent = data.qqq_put_wall || '—';
-            if (setMP) setMP.textContent = data.qqq_max_pain || '—';
+            if (setCW) setCW.textContent = data.underlying_call_wall || '—';
+            if (setPW) setPW.textContent = data.underlying_put_wall || '—';
+            if (setMP) setMP.textContent = data.underlying_max_pain || '—';
 
-            console.log(`[Walls] NQ: PW=${data.put_wall} CW=${data.call_wall} MP=${data.max_pain} | QQQ: PW=${data.qqq_put_wall} CW=${data.qqq_call_wall} MP=${data.qqq_max_pain}`);
+            console.log(`[Walls] ${sym}: PW=${data.put_wall} CW=${data.call_wall} MP=${data.max_pain} | ${underlying}: PW=${data.underlying_put_wall} CW=${data.underlying_call_wall} MP=${data.underlying_max_pain}`);
         })
         .catch(() => {});
+}
+
+// Toggle options walls visibility
+function toggleWalls() {
+    _l2ShowWalls = !_l2ShowWalls;
+    const btn = document.getElementById('t-walls-toggle');
+    if (btn) {
+        btn.classList.toggle('active', _l2ShowWalls);
+        btn.title = _l2ShowWalls ? 'Hide Options Levels' : 'Show Options Levels';
+    }
+    if (_l2ShowWalls) {
+        _l2UpdateWallLines();
+    } else {
+        // Remove all lines
+        for (const line of _l2WallLines) {
+            try { _l2CandleSeries.removePriceLine(line); } catch(e) {}
+        }
+        _l2WallLines = [];
+    }
 }
 
 // ── Bridge: push existing dashboard metrics into toolbar ──
@@ -4745,9 +4780,26 @@ document.addEventListener('DOMContentLoaded', () => {
                     priceFormat: { type: 'price', precision: 2, minMove: tickSize },
                 });
             }
+            // Update bubble series price format too
+            if (_l2BubbleSeries) {
+                try {
+                    _l2BubbleSeries.applyOptions({
+                        priceFormat: { type: 'price', precision: 2, minMove: tickSize },
+                    });
+                } catch(e) { /* custom series may not support applyOptions */ }
+            }
             _l2FetchCandles(true);
+            // Re-fetch walls for new symbol (NQ→QQQ, GC→GLD)
+            _l2UpdateWallLines();
         });
     });
+
+    // ── Toolbar: Walls overlay toggle ──
+    const wallsBtn = document.getElementById('t-walls-toggle');
+    if (wallsBtn) {
+        wallsBtn.addEventListener('click', toggleWalls);
+        wallsBtn.classList.toggle('active', _l2ShowWalls);
+    }
 
     // ── Toolbar: Timeframe buttons ──
     document.querySelectorAll('#t-timeframes .t-btn').forEach(btn => {
