@@ -96,6 +96,46 @@ _TRADE_SIZE_HISTORY: dict = defaultdict(lambda: deque(maxlen=500))
 # {symbol: deque of (timestamp, price), max 200}
 _ICE_PRICE_HISTORY: dict = defaultdict(lambda: deque(maxlen=200))
 
+# ── DOM Cross-Validation State (Elite Feature #1) ──
+# {symbol: {price_str: bid_size_int}}  — latest DOM bid sizes
+_DOM_BID_SNAP: dict = defaultdict(dict)
+# {symbol: {price_str: ask_size_int}}  — latest DOM ask sizes
+_DOM_ASK_SNAP: dict = defaultdict(dict)
+# {symbol: {price_str: bid_size_int}}  — PREVIOUS DOM bid sizes
+_DOM_BID_PREV: dict = defaultdict(dict)
+# {symbol: {price_str: ask_size_int}}
+_DOM_ASK_PREV: dict = defaultdict(dict)
+# Fills between DOM snapshots: {symbol: {price_str: total_vol}}
+_DOM_FILLS_PENDING: dict = defaultdict(lambda: defaultdict(int))
+
+# ── Drifting Iceberg State (Elite Feature #4) ──
+_DRIFT_WINDOW_SEC      = 30.0   # look back 30 seconds
+_DRIFT_MIN_FILLS       = 5      # need at least 5 same-side fills
+_DRIFT_MAX_CV          = 0.40   # clip consistency (looser for drift)
+_DRIFT_MIN_PRICE_SPREAD = 3     # must span 3+ distinct prices
+# {symbol: {"b": deque, "s": deque}}
+_DRIFT_TRACKER: dict = defaultdict(lambda: {"b": deque(maxlen=100),
+                                             "s": deque(maxlen=100)})
+
+# ── Level Memory State (Elite Feature #5) ──
+# {symbol: {price_str: {"count": N, "total_vol": V, "last_side": s, "last_ts": T, "avg_size": f}}}
+_ICE_LEVEL_MEMORY: dict = defaultdict(lambda: defaultdict(lambda: {
+    "count": 0, "total_vol": 0, "last_side": "", "last_ts": 0, "avg_size": 0.0
+}))
+
+# ── Post-Iceberg Prediction State (Elite Feature #6) ──
+# {symbol: deque of outcome dicts, maxlen=100}
+_ICE_OUTCOMES: dict = defaultdict(lambda: deque(maxlen=100))
+# {symbol: list of pending outcome checks}
+_ICE_PENDING: dict = defaultdict(list)
+
+# ── Wall Gone Detection State ──
+_ICE_GONE_TIMEOUT = 3.0  # seconds without refill = wall gone
+# {symbol: {price_str: {"last_refill_ts": T, "was_active": bool, "gone_announced": bool}}}
+_ICE_WALL_STATE: dict = defaultdict(lambda: defaultdict(lambda: {
+    "last_refill_ts": 0, "was_active": False, "gone_announced": False
+}))
+
 # ── Sweep Detection Constants ──
 _SWEEP_MIN_LEVELS     = 3       # min consecutive price levels swept
 _SWEEP_WINDOW_SEC     = 0.200   # 200ms window for sweep
@@ -144,18 +184,231 @@ _DOM_PREV: dict = defaultdict(dict)
 # {symbol: {price_str: [{"fake_size": V, "side": s, "ts": T}, ...]}}
 _SPOOF_TRACKER: dict = defaultdict(lambda: defaultdict(list))
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ELITE HELPER FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _dom_update_snapshots(symbol: str, dom: dict):
+    """Called from on_dom_update to store bid/ask snapshots for cross-validation."""
+    _DOM_BID_PREV[symbol] = _DOM_BID_SNAP[symbol].copy()
+    _DOM_ASK_PREV[symbol] = _DOM_ASK_SNAP[symbol].copy()
+    new_bids = {}
+    new_asks = {}
+    for lvl in dom.get("bids", []):
+        if isinstance(lvl, dict):
+            p = str(lvl.get("price", ""))
+            if p:
+                new_bids[p] = lvl.get("size", 0)
+    for lvl in dom.get("asks", []):
+        if isinstance(lvl, dict):
+            p = str(lvl.get("price", ""))
+            if p:
+                new_asks[p] = lvl.get("size", 0)
+    _DOM_BID_SNAP[symbol] = new_bids
+    _DOM_ASK_SNAP[symbol] = new_asks
+    # Resolve pending fill validations
+    _DOM_FILLS_PENDING[symbol].clear()
+
+
+def _dom_cross_validate(symbol: str, price_str: str,
+                        volume: int, side: str):
+    """DOM cross-validation: check if order book refilled after a fill.
+    Returns (dom_confidence, refill_amount)."""
+    _DOM_FILLS_PENDING[symbol][price_str] += volume
+    if side == "b":
+        # Buyer lifted the ask → check ask side
+        dom_before = _DOM_ASK_PREV[symbol].get(price_str, 0)
+        dom_after = _DOM_ASK_SNAP[symbol].get(price_str, 0)
+    else:
+        # Seller hit the bid → check bid side
+        dom_before = _DOM_BID_PREV[symbol].get(price_str, 0)
+        dom_after = _DOM_BID_SNAP[symbol].get(price_str, 0)
+    if dom_before == 0:
+        return ("unconfirmed", 0)
+    expected = max(0, dom_before - volume)
+    refill = dom_after - expected
+    if refill <= 0:
+        return ("unconfirmed", 0)
+    ratio = refill / max(volume, 1)
+    if ratio > 0.8:
+        return ("confirmed", refill)
+    elif ratio > 0.3:
+        return ("likely", refill)
+    elif ratio > 0.0:
+        return ("possible", refill)
+    return ("unconfirmed", 0)
+
+
+def _analyze_fill_timing(fills_in_window):
+    """Inter-fill timing analysis: algo vs random.
+    Returns (gap_cv, timing_confidence)."""
+    if len(fills_in_window) < 3:
+        return (None, "insufficient")
+    timestamps = sorted([f[0] for f in fills_in_window])
+    gaps = [timestamps[i + 1] - timestamps[i] for i in range(len(timestamps) - 1)]
+    gaps = [g for g in gaps if g > 0]
+    if not gaps:
+        return (0.0, "instant")
+    mean_gap = sum(gaps) / len(gaps)
+    if mean_gap == 0:
+        return (0.0, "instant")
+    variance = sum((g - mean_gap) ** 2 for g in gaps) / len(gaps)
+    gap_cv = (variance ** 0.5) / mean_gap
+    if gap_cv < 0.3:
+        return (round(gap_cv, 3), "algo_confirmed")
+    elif gap_cv < 0.6:
+        return (round(gap_cv, 3), "algo_likely")
+    elif gap_cv < 1.0:
+        return (round(gap_cv, 3), "mixed")
+    return (round(gap_cv, 3), "random")
+
+
+def _detect_drifting_iceberg(symbol: str, price_f: float, volume: int,
+                              timestamp: float, side: str):
+    """Drifting iceberg detection — behavioral fingerprint layer.
+    Ignores price, tracks same-side clip consistency across ALL prices."""
+    if side == "n":
+        return None
+    tracker = _DRIFT_TRACKER[symbol][side]
+    tracker.append((timestamp, price_f, volume))
+    cutoff = timestamp - _DRIFT_WINDOW_SEC
+    recent = [(t, p, v) for t, p, v in tracker if t >= cutoff]
+    if len(recent) < _DRIFT_MIN_FILLS:
+        return None
+    prices = set(round(p, 2) for _, p, _ in recent)
+    if len(prices) < _DRIFT_MIN_PRICE_SPREAD:
+        return None
+    vols = [v for _, _, v in recent]
+    mean_v = sum(vols) / len(vols)
+    if mean_v == 0:
+        return None
+    var = sum((v - mean_v) ** 2 for v in vols) / len(vols)
+    cv = (var ** 0.5) / mean_v
+    if cv > _DRIFT_MAX_CV:
+        return None
+    # Timing analysis (Layer 3)
+    gap_cv_val, timing = _analyze_fill_timing([(t, 0, "") for t, _, _ in recent])
+    # Composite confidence
+    score = 0
+    if cv < 0.25:
+        score += 2
+    elif cv < 0.40:
+        score += 1
+    if timing in ("algo_confirmed",):
+        score += 2
+    elif timing in ("algo_likely",):
+        score += 1
+    drift_conf = "confirmed" if score >= 3 else "likely" if score >= 2 else "possible"
+    return {
+        "type": "drifting",
+        "fills": len(recent),
+        "prices_hit": len(prices),
+        "band_low": round(min(p for _, p, _ in recent), 2),
+        "band_high": round(max(p for _, p, _ in recent), 2),
+        "band_range": round(max(p for _, p, _ in recent) - min(p for _, p, _ in recent), 2),
+        "total_vol": sum(vols),
+        "avg_clip": round(mean_v, 1),
+        "cv": round(cv, 3),
+        "side": side,
+        "gap_cv": gap_cv_val,
+        "timing": timing,
+        "drift_confidence": drift_conf,
+    }
+
+
+def _update_level_memory(symbol: str, price_str: str, iceberg_result: dict):
+    """Record iceberg detection at this level for historical tracking."""
+    mem = _ICE_LEVEL_MEMORY[symbol][price_str]
+    mem["count"] += 1
+    mem["total_vol"] += iceberg_result.get("est_hidden", 0)
+    mem["last_side"] = iceberg_result.get("side", "")
+    mem["last_ts"] = time.time()
+    mem["avg_size"] = mem["total_vol"] / max(mem["count"], 1)
+
+
+def _record_iceberg_completion(symbol: str, price: float, side: str,
+                                ts: float, size_rank: str, confidence: str):
+    """Schedule outcome checks for post-iceberg prediction."""
+    _ICE_PENDING[symbol].append({
+        "side": side, "price": price, "ts": ts,
+        "size_rank": size_rank, "confidence": confidence,
+        "check_10s": ts + 10, "check_30s": ts + 30, "check_60s": ts + 60,
+        "outcome_10s": None, "outcome_30s": None, "outcome_60s": None,
+    })
+
+
+def _check_pending_outcomes(symbol: str, current_price: float, current_ts: float):
+    """Resolve pending post-iceberg outcome checks."""
+    still_pending = []
+    for p in _ICE_PENDING[symbol]:
+        direction = 1 if p["side"] == "b" else -1
+        if p["outcome_10s"] is None and current_ts >= p["check_10s"]:
+            p["outcome_10s"] = round((current_price - p["price"]) * direction, 2)
+        if p["outcome_30s"] is None and current_ts >= p["check_30s"]:
+            p["outcome_30s"] = round((current_price - p["price"]) * direction, 2)
+        if p["outcome_60s"] is None and current_ts >= p["check_60s"]:
+            p["outcome_60s"] = round((current_price - p["price"]) * direction, 2)
+            _ICE_OUTCOMES[symbol].append(p)
+            continue
+        still_pending.append(p)
+    _ICE_PENDING[symbol] = still_pending
+
+
+def _get_prediction(symbol: str, side: str):
+    """Get statistical prediction from historical iceberg outcomes."""
+    outcomes = [o for o in _ICE_OUTCOMES[symbol] if o["side"] == side]
+    if len(outcomes) < 5:
+        return None
+    moves = [o["outcome_30s"] for o in outcomes if o["outcome_30s"] is not None]
+    if not moves:
+        return None
+    avg_move = sum(moves) / len(moves)
+    wins = sum(1 for m in moves if m > 0)
+    n = len(moves)
+    win_rate = wins / n
+    pred_conf = "high" if n >= 20 else "medium" if n >= 10 else "low"
+    return {
+        "avg_move_30s": round(avg_move, 2),
+        "win_rate": round(win_rate * 100, 1),
+        "sample_size": n,
+        "pred_confidence": pred_conf,
+    }
+
+
+def _check_wall_gone(symbol: str, current_ts: float):
+    """Check if any active icebergs stopped refilling → wall gone."""
+    alerts = []
+    for price_str, state in list(_ICE_WALL_STATE[symbol].items()):
+        if not state["was_active"]:
+            continue
+        if current_ts - state["last_refill_ts"] >= _ICE_GONE_TIMEOUT:
+            if not state["gone_announced"]:
+                state["gone_announced"] = True
+                state["was_active"] = False
+                alerts.append({
+                    "type": "wall_gone", "price": price_str, "ts": current_ts,
+                })
+                # Record completion for prediction tracking
+                _record_iceberg_completion(
+                    symbol, float(price_str), state.get("side", "b"),
+                    current_ts, "unknown", "unknown"
+                )
+    return alerts
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN ICEBERG DETECTION — v4 FULL INTELLIGENCE
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def _detect_iceberg(symbol: str, price_str: str, volume: int,
                     timestamp: float, side: str):
-    """Iceberg detection v3 — full trading intelligence.
-    
-    Improvements over v2:
-    1. Zone detection: groups fills across ±2 ticks as same iceberg
-    2. Fill exhaustion: linear regression slope on clip sizes
-    3. Absorption context: is price stable during iceberg?
-    4. Size rank: compares to rolling trade stddev
-    5. Urgency/pressure: composite trading signal
-    
-    Returns enriched iceberg dict if detected, else None.
+    """Iceberg detection v4 — full elite trading intelligence.
+
+    Returns enriched iceberg dict with ~30 fields if detected, else None.
+    Includes: zone, decay, absorption, size rank, urgency, pressure,
+    DOM cross-validation, inter-fill timing, countdown, level memory,
+    prediction, and drifting detection.
     """
     if side == "n":
         return None
@@ -165,6 +418,9 @@ def _detect_iceberg(symbol: str, price_str: str, volume: int,
     # Track trade size + price for adaptive thresholds and absorption
     _TRADE_SIZE_HISTORY[symbol].append(volume)
     _ICE_PRICE_HISTORY[symbol].append((timestamp, price_f))
+
+    # Check pending prediction outcomes on every trade
+    _check_pending_outcomes(symbol, price_f, timestamp)
 
     # Adaptive min clip: 50% of rolling average trade size
     trade_hist = _TRADE_SIZE_HISTORY[symbol]
@@ -184,13 +440,13 @@ def _detect_iceberg(symbol: str, price_str: str, volume: int,
 
     # Prune oldest fills beyond widest window
     max_window = _ICE_WINDOWS[-1][0]  # 60s
-    cutoff = timestamp - max_window
-    while tracker and tracker[0][0] < cutoff:
+    cutoff_prune = timestamp - max_window
+    while tracker and tracker[0][0] < cutoff_prune:
         tracker.pop(0)
 
     # ── ZONE DETECTION: collect fills from adjacent ±N ticks ──
     tick_size = TICK_SIZES.get(symbol, DEFAULT_TICK_SIZE)
-    zone_fills_all = []  # all fills across the zone (for this price ± ticks)
+    zone_fills_all = []
     zone_levels_hit = set()
 
     for offset in range(-_ICE_ZONE_TICKS, _ICE_ZONE_TICKS + 1):
@@ -203,24 +459,20 @@ def _detect_iceberg(symbol: str, price_str: str, volume: int,
 
     is_zone = len(zone_levels_hit) > 1
 
-    # Try each window tier from tightest (highest confidence) to widest
+    # Try each window tier from tightest to widest
     for window_sec, confidence in _ICE_WINDOWS:
         window_cutoff = timestamp - window_sec
 
-        # Use zone fills if multi-level, else single-price fills
         raw_fills = zone_fills_all if is_zone else list(tracker)
         fills_in_window = [f for f in raw_fills if f[0] >= window_cutoff]
 
-        # Need at least N fills in this window
         if len(fills_in_window) < _ICE_REFILL_COUNT:
             continue
 
-        # Check: all same side (across the zone)
         fill_sides = [f[2] for f in fills_in_window]
         if len(set(fill_sides)) != 1:
             continue
 
-        # Clip consistency via CV
         vols = [f[1] for f in fills_in_window]
         mean_vol = sum(vols) / len(vols)
         if mean_vol == 0:
@@ -232,27 +484,175 @@ def _detect_iceberg(symbol: str, price_str: str, volume: int,
         if cv > _ICE_CV_THRESHOLD:
             continue
 
-        # ═══════════════ ICEBERG DETECTED — COMPUTE INTELLIGENCE ═══════════════
+        # ═══════════════ ICEBERG DETECTED — COMPUTE ALL INTELLIGENCE ═══════════
 
         visible_total = sum(vols)
         n_fills = len(fills_in_window)
         time_elapsed = max(fills_in_window[-1][0] - fills_in_window[0][0], 0.01)
-        fill_rate = n_fills / time_elapsed  # fills per second
-
+        fill_rate = n_fills / time_elapsed
         avg_clip = mean_vol
-        est_duration = 90.0  # assume ~90 seconds total algo run
+        est_duration = 90.0
         est_remaining_fills = max(0.0, fill_rate * (est_duration - max(time_elapsed, 0.1)))
         est_hidden = int(visible_total + est_remaining_fills * avg_clip)
+        fill_pct = min(1.0, visible_total / max(est_hidden, 1))
+        est_remaining_sec = max(0.0, est_duration - time_elapsed)
 
-        return {
-            "clips": len(fills_in_window),
+        # ── Fill exhaustion (linear regression slope) ──
+        decay = "holding"
+        slope = 0.0
+        if n_fills >= 3 and time_elapsed > 0.1:
+            t_start = fills_in_window[0][0]
+            xs = [(f[0] - t_start) / time_elapsed for f in fills_in_window]
+            ys = vols
+            x_mean = sum(xs) / len(xs)
+            y_mean = mean_vol
+            num = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys))
+            den = sum((x - x_mean) ** 2 for x in xs)
+            if den > 0 and y_mean > 0:
+                raw_slope = num / den
+                slope = round(raw_slope / y_mean, 3)
+                if slope < -0.15:
+                    decay = "exhausting"
+                elif slope > 0.15:
+                    decay = "strengthening"
+
+        # ── Absorption context ──
+        absorbing = False
+        prices_during = [p for t, p in _ICE_PRICE_HISTORY[symbol] if t >= window_cutoff]
+        if len(prices_during) >= 2:
+            price_range = max(prices_during) - min(prices_during)
+            if price_range / tick_size <= _ICE_ABSORB_MAX_MOVE:
+                absorbing = True
+
+        # ── Opposition volume & absorption ratio ──
+        opp_side = "s" if fill_sides[0] == "b" else "b"
+        opposition_vol = 0
+        for offset in range(-_ICE_ZONE_TICKS, _ICE_ZONE_TICKS + 1):
+            adj_price = round(price_f + offset * tick_size, 2)
+            adj_key = str(adj_price)
+            for ts_o, vol_o, s_o in _ICE_TRACKER[symbol].get(adj_key, []):
+                if s_o == opp_side and ts_o >= window_cutoff:
+                    opposition_vol += vol_o
+        absorption_ratio = round(opposition_vol / max(visible_total, 1), 2)
+
+        # ── Size rank (σ distance) ──
+        size_rank = "retail"
+        if len(trade_hist) > 20:
+            th_mean = sum(trade_hist) / len(trade_hist)
+            th_var = sum((v - th_mean) ** 2 for v in trade_hist) / len(trade_hist)
+            th_std = max(th_var ** 0.5, 0.01)
+            sigma = (avg_clip - th_mean) / th_std
+            if sigma >= 3.0:
+                size_rank = "whale"
+            elif sigma >= 2.0:
+                size_rank = "institutional"
+            elif sigma >= 1.0:
+                size_rank = "professional"
+
+        # ── Urgency score (0-1 composite) ──
+        time_factor = min(fill_rate / 2.0, 1.0)
+        size_factor = min(avg_clip / max(avg_trade, 1), 1.0)
+        remaining_factor = 1.0 - fill_pct
+        urgency = round(time_factor * 0.4 + size_factor * 0.3 + remaining_factor * 0.3, 3)
+
+        # ── Pressure signal (decision tree) ──
+        if decay == "exhausting" and fill_pct > 0.5:
+            pressure = "wall_exhausted"
+        elif decay == "exhausting" and not absorbing:
+            pressure = "wall_breaking"
+        elif absorbing and fill_pct < 0.3:
+            pressure = "bullish_wall" if fill_sides[0] == "b" else "bearish_wall"
+        elif absorbing:
+            pressure = "bullish_wall" if fill_sides[0] == "b" else "bearish_wall"
+        elif fill_pct < 0.2:
+            pressure = "wall_fresh"
+        else:
+            pressure = "wall_active"
+
+        # ── DOM cross-validation (Elite #1) ──
+        dom_conf, dom_refill = _dom_cross_validate(symbol, price_str, volume, side)
+
+        # ── Inter-fill timing (Elite #2) ──
+        gap_cv_val, timing_conf = _analyze_fill_timing(fills_in_window)
+
+        # Upgrade/downgrade confidence based on timing
+        final_confidence = confidence
+        if timing_conf == "algo_confirmed" and confidence != "high":
+            final_confidence = "high" if confidence == "medium" else "medium"
+        elif timing_conf == "random" and confidence == "high":
+            final_confidence = "medium"
+
+        # ── Completion countdown state (Elite #3) ──
+        if fill_pct < 0.15:
+            ice_state = "fresh"
+        elif fill_pct < 0.50:
+            ice_state = "active"
+        elif fill_pct < 0.85:
+            ice_state = "depleting"
+        else:
+            ice_state = "critical"
+        depletes_in = round(est_remaining_sec, 1)
+
+        # ── Level memory (Elite #5) ──
+        level_mem = _ICE_LEVEL_MEMORY[symbol].get(price_str, {})
+        level_ice_count = level_mem.get("count", 0)
+        level_avg_size = int(level_mem.get("avg_size", 0))
+
+        # ── Prediction (Elite #6) ──
+        prediction = _get_prediction(symbol, fill_sides[0])
+
+        # ── Update wall state for gone detection ──
+        wall_st = _ICE_WALL_STATE[symbol][price_str]
+        wall_st["last_refill_ts"] = timestamp
+        wall_st["was_active"] = True
+        wall_st["gone_announced"] = False
+        wall_st["side"] = fill_sides[0]
+
+        # ── Update level memory ──
+        result = {
+            # Core detection
+            "clips": n_fills,
             "est_total": visible_total,
             "est_hidden": est_hidden,
             "avg_clip": round(avg_clip, 1),
             "cv": round(cv, 3),
-            "confidence": confidence,
+            "confidence": final_confidence,
             "side": fill_sides[0],
+            # Zone
+            "zone": is_zone,
+            "zone_levels": len(zone_levels_hit) if is_zone else 1,
+            # Exhaustion
+            "decay": decay,
+            "slope": slope,
+            # Absorption
+            "absorbing": absorbing,
+            "opposition_vol": opposition_vol,
+            "absorption_ratio": absorption_ratio,
+            # Size & urgency
+            "size_rank": size_rank,
+            "fill_pct": round(fill_pct, 3),
+            "urgency": urgency,
+            "pressure": pressure,
+            "est_remaining_sec": depletes_in,
+            # DOM cross-validation (Elite #1)
+            "dom_confirmed": dom_conf,
+            "dom_refill": dom_refill,
+            # Inter-fill timing (Elite #2)
+            "gap_cv": gap_cv_val,
+            "timing": timing_conf,
+            # Countdown (Elite #3)
+            "state": ice_state,
+            "depletes_in_sec": depletes_in,
+            # Level memory (Elite #5)
+            "level_ice_count": level_ice_count,
+            "level_avg_size": level_avg_size,
+            # Prediction (Elite #6)
+            "prediction": prediction,
         }
+
+        _update_level_memory(symbol, price_str, result)
+
+        return result
 
     return None
 
@@ -545,6 +945,32 @@ def _cleanup_detection_state():
     # ── DOM_PREV: naturally bounded (replaced each DOM update) ──
     # No cleanup needed.
 
+    # ── DRIFT_TRACKER: prune old fills ──
+    for sym in list(_DRIFT_TRACKER.keys()):
+        for s in ["b", "s"]:
+            tracker = _DRIFT_TRACKER[sym][s]
+            while tracker and tracker[0][0] < now - _DRIFT_WINDOW_SEC:
+                tracker.popleft()
+
+    # ── WALL_STATE: prune old walls ──
+    for sym in list(_ICE_WALL_STATE.keys()):
+        stale = [p for p, st in _ICE_WALL_STATE[sym].items()
+                 if now - st["last_refill_ts"] > 300]
+        for p in stale:
+            del _ICE_WALL_STATE[sym][p]
+
+    # ── LEVEL_MEMORY: prune levels older than 4 hours ──
+    for sym in list(_ICE_LEVEL_MEMORY.keys()):
+        stale = [p for p, m in _ICE_LEVEL_MEMORY[sym].items()
+                 if now - m["last_ts"] > 14400]
+        for p in stale:
+            del _ICE_LEVEL_MEMORY[sym][p]
+
+    # ── PENDING OUTCOMES: prune stale ──
+    for sym in list(_ICE_PENDING.keys()):
+        _ICE_PENDING[sym] = [p for p in _ICE_PENDING[sym]
+                             if now - p["ts"] < 120]
+
 
 # Dedicated lock for candle data — separate from _L2_LOCK to avoid
 # contention with DOM/trade state reads during high-volume periods.
@@ -831,6 +1257,9 @@ def on_dom_update(symbol: str, dom: dict):
         if _reynolds and mid > 0:
             L2_STATE["signals"]["reynolds_number"] = _reynolds.get_signal()
 
+    # ── DOM snapshot for iceberg cross-validation (Elite #1) ──
+    _dom_update_snapshots(symbol, dom)
+
     # ── Spoof detection (DOM snapshot diff) ── runs outside lock
     spoof_hits = _detect_spoof(symbol, dom, time.time())
     if spoof_hits:
@@ -903,6 +1332,26 @@ def on_trade(symbol: str, trade: dict):
                         if "icebergs" not in cur:
                             cur["icebergs"] = {}
                         cur["icebergs"][qp] = ice_hit
+
+        # Drifting iceberg detection (Elite #4)
+        drift_hit = _detect_drifting_iceberg(symbol, price, vol, ts, side)
+        if drift_hit:
+            with _CANDLE_LOCK:
+                for tf in CANDLE_TIMEFRAMES:
+                    cur = _CURRENT_CANDLE[symbol].get(tf)
+                    if cur:
+                        cur["drifting_iceberg"] = drift_hit
+
+        # Wall Gone detection (Elite #3)
+        wall_gone_alerts = _check_wall_gone(symbol, ts)
+        if wall_gone_alerts:
+            with _CANDLE_LOCK:
+                for tf in CANDLE_TIMEFRAMES:
+                    cur = _CURRENT_CANDLE[symbol].get(tf)
+                    if cur:
+                        if "wall_gone" not in cur:
+                            cur["wall_gone"] = []
+                        cur["wall_gone"].extend(wall_gone_alerts)
 
         # Sweep detection
         sweep_hit = _detect_sweep(symbol, price, vol, ts, side)

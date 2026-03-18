@@ -722,7 +722,147 @@ class VolumeBubbleRenderer {
                             ctx.fillStyle = pressureColor;
                             ctx.fillRect(x - barW / 2, barY, barW * fillPct, barH);
                         }
+
+                        // ── ELITE LINE 2: DOM + Timing + Size Rank ──
+                        let eliteLine2 = '';
+                        // DOM confirmation
+                        const domConf = ice.dom_confirmed || '';
+                        if (domConf === 'confirmed') eliteLine2 += '✓DOM ';
+                        else if (domConf === 'likely') eliteLine2 += '~DOM ';
+                        else if (domConf === 'possible') eliteLine2 += '?DOM ';
+
+                        // Timing badge
+                        const timing = ice.timing || '';
+                        if (timing === 'algo_confirmed') eliteLine2 += '⏱algo ';
+                        else if (timing === 'algo_likely') eliteLine2 += '⏱~algo ';
+                        else if (timing === 'random') eliteLine2 += '⏱rand ';
+
+                        // Size rank icon
+                        const rank = ice.size_rank || 'retail';
+                        if (rank === 'whale') eliteLine2 += '🐋';
+                        else if (rank === 'institutional') eliteLine2 += '🏛';
+                        else if (rank === 'professional') eliteLine2 += '👔';
+
+                        if (eliteLine2.trim()) {
+                            ctx.font = '7px monospace';
+                            ctx.fillStyle = 'rgba(180,220,255,0.85)';
+                            ctx.fillText(eliteLine2.trim(), x, y + ds + 22);
+                        }
+
+                        // ── ELITE LINE 3: Countdown + Level Memory ──
+                        let eliteLine3 = '';
+                        const iceState = ice.state || '';
+                        const depletesIn = ice.depletes_in_sec || 0;
+
+                        if (iceState === 'critical') {
+                            eliteLine3 += `⚠️CRITICAL ${depletesIn.toFixed(0)}s `;
+                        } else if (iceState === 'depleting') {
+                            eliteLine3 += `↘${depletesIn.toFixed(0)}s `;
+                        } else if (iceState === 'active') {
+                            eliteLine3 += `⏳${depletesIn.toFixed(0)}s `;
+                        }
+
+                        // Level memory
+                        const lvlCount = ice.level_ice_count || 0;
+                        if (lvlCount > 1) {
+                            eliteLine3 += `📍×${lvlCount}`;
+                        }
+
+                        if (eliteLine3.trim()) {
+                            ctx.font = '7px monospace';
+                            ctx.fillStyle = iceState === 'critical' ? '#ff1744' : 'rgba(180,220,255,0.75)';
+                            ctx.fillText(eliteLine3.trim(), x, y + ds + 30);
+                        }
+
+                        // ── ELITE LINE 4: Prediction ──
+                        if (ice.prediction) {
+                            const pred = ice.prediction;
+                            const sign = pred.avg_move_30s >= 0 ? '+' : '';
+                            let predText = `${sign}${pred.avg_move_30s} / ${pred.win_rate}% (n=${pred.sample_size})`;
+                            if (pred.pred_confidence === 'high') predText += ' ✓';
+                            else if (pred.pred_confidence === 'low') predText += ' ⚠️';
+
+                            ctx.font = '7px monospace';
+                            ctx.fillStyle = pred.win_rate > 65 ? '#00e676'
+                                : pred.win_rate > 50 ? '#ffab00' : '#ff1744';
+                            ctx.fillText(predText, x, y + ds + 38);
+                        }
                     }
+                }
+            }
+
+            // ════════════════════════════════════════════════════════════════
+            // LAYER 7b: DRIFTING ICEBERG BAND OVERLAY
+            // ════════════════════════════════════════════════════════════════
+            if (!useDots) {
+                for (let i = from; i < to; i++) {
+                    const bar = d.bars[i];
+                    if (!bar || !bar.originalData || !bar.originalData.drifting_iceberg) continue;
+                    const drift = bar.originalData.drifting_iceberg;
+
+                    const yTop = priceConverter(drift.band_high);
+                    const yBot = priceConverter(drift.band_low);
+                    if (yTop == null || yBot == null || isNaN(yTop) || isNaN(yBot)) continue;
+
+                    const bandH = Math.abs(yBot - yTop);
+                    const isBuy = drift.side === 'b';
+                    const baseRGB = isBuy ? '0,230,118' : '255,23,68';
+                    const confAlpha = drift.drift_confidence === 'confirmed' ? 0.12
+                        : drift.drift_confidence === 'likely' ? 0.08 : 0.04;
+
+                    // Semi-transparent band
+                    ctx.fillStyle = `rgba(${baseRGB}, ${confAlpha})`;
+                    ctx.fillRect(bar.x - 20, Math.min(yTop, yBot), 40, bandH);
+
+                    // Dashed border
+                    ctx.strokeStyle = `rgba(${baseRGB}, ${confAlpha * 3})`;
+                    ctx.lineWidth = 1;
+                    ctx.setLineDash([4, 2]);
+                    ctx.beginPath();
+                    ctx.moveTo(bar.x - 20, yTop);
+                    ctx.lineTo(bar.x + 20, yTop);
+                    ctx.moveTo(bar.x - 20, yBot);
+                    ctx.lineTo(bar.x + 20, yBot);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+
+                    // Label
+                    const sideLabel = isBuy ? 'STEALTH BUY' : 'STEALTH SELL';
+                    const confIcon = drift.drift_confidence === 'confirmed' ? '✓✓'
+                        : drift.drift_confidence === 'likely' ? '✓' : '?';
+                    ctx.font = '7px monospace';
+                    ctx.textAlign = 'center';
+                    ctx.fillStyle = `rgba(${baseRGB}, 0.9)`;
+                    ctx.fillText(
+                        `${sideLabel} ${confIcon} ${drift.fills}×${drift.avg_clip}`,
+                        bar.x, Math.min(yTop, yBot) - 4
+                    );
+                }
+            }
+
+            // ════════════════════════════════════════════════════════════════
+            // LAYER 7c: WALL GONE FLASH ALERTS
+            // ════════════════════════════════════════════════════════════════
+            for (let i = from; i < to; i++) {
+                const bar = d.bars[i];
+                if (!bar || !bar.originalData || !bar.originalData.wall_gone) continue;
+
+                for (const wg of bar.originalData.wall_gone) {
+                    const price = parseFloat(wg.price);
+                    if (isNaN(price)) continue;
+                    const yWg = priceConverter(price);
+                    if (yWg == null || isNaN(yWg)) continue;
+
+                    // Green flash pulse
+                    ctx.fillStyle = 'rgba(0,230,118,0.3)';
+                    ctx.beginPath();
+                    ctx.arc(bar.x, yWg, 12, 0, Math.PI * 2);
+                    ctx.fill();
+
+                    ctx.font = BUBBLE_CONFIG.FONT_BADGE;
+                    ctx.fillStyle = '#00e676';
+                    ctx.textAlign = 'center';
+                    ctx.fillText('WALL GONE ✅', bar.x, yWg - 14);
                 }
             }
 
