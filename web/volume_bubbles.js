@@ -594,72 +594,278 @@ class VolumeBubbleRenderer {
                 const icebergs = bar.originalData.icebergs;
                 const x = bar.x;
 
-                // ── HEDGE FUND RULE: pick only the BEST iceberg per candle ──
-                // HIGH confidence only + minimum 2k volume to avoid false positives
-                let best = null;
-                let bestVol = 0;
                 for (const priceStr in icebergs) {
                     const ice = icebergs[priceStr];
-                    const conf = ice.confidence || 'low';
-                    // STRICT: only high confidence (refill within 5s)
-                    if (conf !== 'high') continue;
-                    const vol = ice.est_total || 0;
-                    // Minimum volume: skip tiny icebergs
-                    if (vol < 2000) continue;
-                    if (vol > bestVol) {
-                        bestVol = vol;
-                        best = { price: parseFloat(priceStr), ice };
+                    const price = parseFloat(priceStr);
+                    if (isNaN(price)) continue;
+                    const y = priceConverter(price);
+                    if (y === null || y === undefined || isNaN(y)) continue;
+
+                    const isBuy = ice.side === 'b';
+                    const color = isBuy ? BUBBLE_CONFIG.ICE_BUY_COLOR : BUBBLE_CONFIG.ICE_SELL_COLOR;
+
+                    if (useDots) {
+                        // Macro zoom: small diamond dot
+                        ctx.fillStyle = _rgba(color, 0.8);
+                        ctx.beginPath();
+                        const ds = BUBBLE_CONFIG.ICE_DOT_SIZE;
+                        ctx.moveTo(x, y - ds);
+                        ctx.lineTo(x + ds, y);
+                        ctx.lineTo(x, y + ds);
+                        ctx.lineTo(x - ds, y);
+                        ctx.closePath();
+                        ctx.fill();
+                    } else {
+                        // Full zoom: diamond with glow + pulse + label
+                        const ds = BUBBLE_CONFIG.ICE_DIAMOND_SIZE;
+
+                        // Pulse speed varies by confidence: high=fast, low=slow
+                        const conf = ice.confidence || 'high';
+                        const pulseSpeed = conf === 'high' ? BUBBLE_CONFIG.ICE_PULSE_SPEED
+                            : conf === 'medium' ? BUBBLE_CONFIG.ICE_PULSE_SPEED * 1.5
+                            : BUBBLE_CONFIG.ICE_PULSE_SPEED * 2.5;
+                        const t = (performance.now() % pulseSpeed) / pulseSpeed;
+                        const pulseAlpha = 0.6 + 0.4 * Math.sin(t * Math.PI * 2);
+
+                        // Glow — wider for high confidence
+                        const glowMult = conf === 'high' ? 2.5 : conf === 'medium' ? 2.0 : 1.5;
+                        const glowGrad = ctx.createRadialGradient(x, y, ds * 0.5, x, y, ds * glowMult);
+                        glowGrad.addColorStop(0, _rgba(color, 0.3 * pulseAlpha));
+                        glowGrad.addColorStop(1, 'rgba(0,0,0,0)');
+                        ctx.fillStyle = glowGrad;
+                        ctx.beginPath();
+                        ctx.arc(x, y, ds * glowMult, 0, Math.PI * 2);
+                        ctx.fill();
+
+                        // Diamond shape
+                        ctx.fillStyle = _rgba(color, 0.85 * pulseAlpha);
+                        ctx.beginPath();
+                        ctx.moveTo(x, y - ds);
+                        ctx.lineTo(x + ds * 0.7, y);
+                        ctx.lineTo(x, y + ds);
+                        ctx.lineTo(x - ds * 0.7, y);
+                        ctx.closePath();
+                        ctx.fill();
+
+                        // Diamond border
+                        ctx.strokeStyle = _rgba(color, 0.9);
+                        ctx.lineWidth = 1.5;
+                        ctx.stroke();
+
+                        // Volume label: visible / est hidden
+                        const visVol = ice.est_total >= 1000
+                            ? (ice.est_total / 1000).toFixed(1) + 'k'
+                            : String(ice.est_total);
+                        const estHidden = ice.est_hidden && ice.est_hidden > ice.est_total
+                            ? (ice.est_hidden >= 1000
+                                ? '~' + (ice.est_hidden / 1000).toFixed(1) + 'k'
+                                : '~' + ice.est_hidden)
+                            : null;
+                        const volLabel = estHidden ? `${visVol}/${estHidden}` : `~${visVol}`;
+
+                        ctx.font = BUBBLE_CONFIG.FONT_SMALL;
+                        ctx.textAlign = 'center';
+                        ctx.textBaseline = 'middle';
+                        ctx.fillStyle = 'rgba(0,0,0,0.5)';
+                        ctx.fillText(volLabel, x + 1, y + 1);
+                        ctx.fillStyle = BUBBLE_CONFIG.TEXT_COLOR;
+                        ctx.fillText(volLabel, x, y);
+
+                        // ── PRESSURE + DECAY BADGE ──
+                        const pressure = ice.pressure || 'wall_active';
+                        const decay = ice.decay || 'holding';
+                        const isZone = ice.zone || false;
+
+                        // Decay arrow: ⬇ exhausting, ⬆ strengthening, ─ holding
+                        const decayArrow = decay === 'exhausting' ? '⬇'
+                            : decay === 'strengthening' ? '⬆' : '─';
+
+                        // Pressure label
+                        let pressureLabel = '';
+                        let pressureColor = color;
+                        if (pressure === 'bullish_wall') {
+                            pressureLabel = 'BUY WALL';
+                            pressureColor = '#00e676';
+                        } else if (pressure === 'bearish_wall') {
+                            pressureLabel = 'SELL WALL';
+                            pressureColor = '#ff1744';
+                        } else if (pressure === 'wall_breaking') {
+                            pressureLabel = 'BREAKING';
+                            pressureColor = '#ffab00';
+                        } else if (pressure === 'wall_exhausted') {
+                            pressureLabel = 'EMPTY';
+                            pressureColor = '#ff6d00';
+                        } else if (pressure === 'wall_fresh') {
+                            pressureLabel = 'FRESH';
+                            pressureColor = '#00b0ff';
+                        } else {
+                            pressureLabel = conf === 'high' ? 'ICE·H'
+                                : conf === 'medium' ? 'ICE·M' : 'ICE·L';
+                        }
+
+                        // Zone prefix
+                        const zonePrefix = isZone ? 'Z:' : '';
+                        const badgeText = `${zonePrefix}${pressureLabel}${decayArrow}`;
+
+                        ctx.font = BUBBLE_CONFIG.FONT_BADGE;
+                        ctx.fillStyle = pressureColor;
+                        ctx.fillText(badgeText, x, y + ds + 8);
+
+                        // Fill % micro-bar below badge (tiny progress indicator)
+                        const fillPct = ice.fill_pct || 0;
+                        if (fillPct > 0 && fillPct < 1) {
+                            const barW = ds * 1.4;
+                            const barH = 2;
+                            const barY = y + ds + 14;
+                            ctx.fillStyle = 'rgba(255,255,255,0.15)';
+                            ctx.fillRect(x - barW / 2, barY, barW, barH);
+                            ctx.fillStyle = pressureColor;
+                            ctx.fillRect(x - barW / 2, barY, barW * fillPct, barH);
+                        }
+
+                        // ── ELITE LINE 2: DOM + Timing + Size Rank ──
+                        let eliteLine2 = '';
+                        // DOM confirmation
+                        const domConf = ice.dom_confirmed || '';
+                        if (domConf === 'confirmed') eliteLine2 += '✓DOM ';
+                        else if (domConf === 'likely') eliteLine2 += '~DOM ';
+                        else if (domConf === 'possible') eliteLine2 += '?DOM ';
+
+                        // Timing badge
+                        const timing = ice.timing || '';
+                        if (timing === 'algo_confirmed') eliteLine2 += '⏱algo ';
+                        else if (timing === 'algo_likely') eliteLine2 += '⏱~algo ';
+                        else if (timing === 'random') eliteLine2 += '⏱rand ';
+
+                        // Size rank icon
+                        const rank = ice.size_rank || 'retail';
+                        if (rank === 'whale') eliteLine2 += '🐋';
+                        else if (rank === 'institutional') eliteLine2 += '🏛';
+                        else if (rank === 'professional') eliteLine2 += '👔';
+
+                        if (eliteLine2.trim()) {
+                            ctx.font = '7px monospace';
+                            ctx.fillStyle = 'rgba(180,220,255,0.85)';
+                            ctx.fillText(eliteLine2.trim(), x, y + ds + 22);
+                        }
+
+                        // ── ELITE LINE 3: Countdown + Level Memory ──
+                        let eliteLine3 = '';
+                        const iceState = ice.state || '';
+                        const depletesIn = ice.depletes_in_sec || 0;
+
+                        if (iceState === 'critical') {
+                            eliteLine3 += `⚠️CRITICAL ${depletesIn.toFixed(0)}s `;
+                        } else if (iceState === 'depleting') {
+                            eliteLine3 += `↘${depletesIn.toFixed(0)}s `;
+                        } else if (iceState === 'active') {
+                            eliteLine3 += `⏳${depletesIn.toFixed(0)}s `;
+                        }
+
+                        // Level memory
+                        const lvlCount = ice.level_ice_count || 0;
+                        if (lvlCount > 1) {
+                            eliteLine3 += `📍×${lvlCount}`;
+                        }
+
+                        if (eliteLine3.trim()) {
+                            ctx.font = '7px monospace';
+                            ctx.fillStyle = iceState === 'critical' ? '#ff1744' : 'rgba(180,220,255,0.75)';
+                            ctx.fillText(eliteLine3.trim(), x, y + ds + 30);
+                        }
+
+                        // ── ELITE LINE 4: Prediction ──
+                        if (ice.prediction) {
+                            const pred = ice.prediction;
+                            const sign = pred.avg_move_30s >= 0 ? '+' : '';
+                            let predText = `${sign}${pred.avg_move_30s} / ${pred.win_rate}% (n=${pred.sample_size})`;
+                            if (pred.pred_confidence === 'high') predText += ' ✓';
+                            else if (pred.pred_confidence === 'low') predText += ' ⚠️';
+
+                            ctx.font = '7px monospace';
+                            ctx.fillStyle = pred.win_rate > 65 ? '#00e676'
+                                : pred.win_rate > 50 ? '#ffab00' : '#ff1744';
+                            ctx.fillText(predText, x, y + ds + 38);
+                        }
                     }
-                }
-                if (!best || isNaN(best.price)) continue;
-
-                const ice = best.ice;
-                const price = best.price;
-                const y = priceConverter(price);
-                if (y === null || y === undefined || isNaN(y)) continue;
-
-                const isBuy = ice.side === 'b';
-                const color = isBuy ? BUBBLE_CONFIG.ICE_BUY_COLOR : BUBBLE_CONFIG.ICE_SELL_COLOR;
-                const conf = ice.confidence || 'high';
-
-                if (useDots) {
-                    // Macro zoom: small diamond dot
-                    ctx.fillStyle = _rgba(color, 0.8);
-                    ctx.beginPath();
-                    const ds = BUBBLE_CONFIG.ICE_DOT_SIZE;
-                    ctx.moveTo(x, y - ds);
-                    ctx.lineTo(x + ds, y);
-                    ctx.lineTo(x, y + ds);
-                    ctx.lineTo(x - ds, y);
-                    ctx.closePath();
-                    ctx.fill();
-                } else {
-                    // Full zoom: YELLOW BUBBLE for iceberg
-                    const r = Math.max(6, Math.min(bestVol / 500, 14));  // size = volume
-
-                    // Subtle yellow glow
-                    const glowGrad = ctx.createRadialGradient(x, y, r * 0.3, x, y, r * 2);
-                    glowGrad.addColorStop(0, 'rgba(255,215,0,0.25)');
-                    glowGrad.addColorStop(1, 'rgba(0,0,0,0)');
-                    ctx.fillStyle = glowGrad;
-                    ctx.beginPath();
-                    ctx.arc(x, y, r * 2, 0, Math.PI * 2);
-                    ctx.fill();
-
-                    // Yellow filled bubble
-                    ctx.fillStyle = 'rgba(255,215,0,0.6)';
-                    ctx.beginPath();
-                    ctx.arc(x, y, r, 0, Math.PI * 2);
-                    ctx.fill();
-
-                    // Yellow border
-                    ctx.strokeStyle = 'rgba(255,215,0,0.9)';
-                    ctx.lineWidth = 1.5;
-                    ctx.stroke();
                 }
             }
 
-            // (REMOVED: Drift bands, wall gone → moved to side panel)
+            // ════════════════════════════════════════════════════════════════
+            // LAYER 7b: DRIFTING ICEBERG BAND OVERLAY
+            // ════════════════════════════════════════════════════════════════
+            if (!useDots) {
+                for (let i = from; i < to; i++) {
+                    const bar = d.bars[i];
+                    if (!bar || !bar.originalData || !bar.originalData.drifting_iceberg) continue;
+                    const drift = bar.originalData.drifting_iceberg;
+
+                    const yTop = priceConverter(drift.band_high);
+                    const yBot = priceConverter(drift.band_low);
+                    if (yTop == null || yBot == null || isNaN(yTop) || isNaN(yBot)) continue;
+
+                    const bandH = Math.abs(yBot - yTop);
+                    const isBuy = drift.side === 'b';
+                    const baseRGB = isBuy ? '0,230,118' : '255,23,68';
+                    const confAlpha = drift.drift_confidence === 'confirmed' ? 0.12
+                        : drift.drift_confidence === 'likely' ? 0.08 : 0.04;
+
+                    // Semi-transparent band
+                    ctx.fillStyle = `rgba(${baseRGB}, ${confAlpha})`;
+                    ctx.fillRect(bar.x - 20, Math.min(yTop, yBot), 40, bandH);
+
+                    // Dashed border
+                    ctx.strokeStyle = `rgba(${baseRGB}, ${confAlpha * 3})`;
+                    ctx.lineWidth = 1;
+                    ctx.setLineDash([4, 2]);
+                    ctx.beginPath();
+                    ctx.moveTo(bar.x - 20, yTop);
+                    ctx.lineTo(bar.x + 20, yTop);
+                    ctx.moveTo(bar.x - 20, yBot);
+                    ctx.lineTo(bar.x + 20, yBot);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+
+                    // Label
+                    const sideLabel = isBuy ? 'STEALTH BUY' : 'STEALTH SELL';
+                    const confIcon = drift.drift_confidence === 'confirmed' ? '✓✓'
+                        : drift.drift_confidence === 'likely' ? '✓' : '?';
+                    const leakStr = drift.dom_leak != null ? ` leak:${drift.dom_leak}` : '';
+                    ctx.font = '7px monospace';
+                    ctx.textAlign = 'center';
+                    ctx.fillStyle = `rgba(${baseRGB}, 0.9)`;
+                    ctx.fillText(
+                        `${sideLabel} ${confIcon} ${drift.fills}×${drift.avg_clip}${leakStr}`,
+                        bar.x, Math.min(yTop, yBot) - 4
+                    );
+                }
+            }
+
+            // ════════════════════════════════════════════════════════════════
+            // LAYER 7c: WALL GONE FLASH ALERTS
+            // ════════════════════════════════════════════════════════════════
+            for (let i = from; i < to; i++) {
+                const bar = d.bars[i];
+                if (!bar || !bar.originalData || !bar.originalData.wall_gone) continue;
+
+                for (const wg of bar.originalData.wall_gone) {
+                    const price = parseFloat(wg.price);
+                    if (isNaN(price)) continue;
+                    const yWg = priceConverter(price);
+                    if (yWg == null || isNaN(yWg)) continue;
+
+                    // Green flash pulse
+                    ctx.fillStyle = 'rgba(0,230,118,0.3)';
+                    ctx.beginPath();
+                    ctx.arc(bar.x, yWg, 12, 0, Math.PI * 2);
+                    ctx.fill();
+
+                    ctx.font = BUBBLE_CONFIG.FONT_BADGE;
+                    ctx.fillStyle = '#00e676';
+                    ctx.textAlign = 'center';
+                    ctx.fillText('WALL GONE ✅', bar.x, yWg - 14);
+                }
+            }
 
             // ════════════════════════════════════════════════════════════════
             // LAYER 8: SWEEP DETECTION (⚡ lightning bolt lines)
@@ -821,12 +1027,157 @@ class VolumeBubbleRenderer {
                 ctx.textAlign = 'center';  // reset
             }
 
-            // (REMOVED: Delta divergence → moved to side panel)
+            // ════════════════════════════════════════════════════════════════
+            // LAYER 9: DELTA DIVERGENCE (╱╱ dashed divergence lines)
+            // ════════════════════════════════════════════════════════════════
+            if (!useDots) {
+                for (let i = from; i < to; i++) {
+                    const bar = d.bars[i];
+                    if (!bar || !bar.originalData || !bar.originalData.delta_div) continue;
 
-            // (REMOVED: Momentum ignition → moved to side panel)
+                    const div = bar.originalData.delta_div;
+                    const x = bar.x;
+                    const isBear = div.type === 'bearish';
+                    const color = isBear ? BUBBLE_CONFIG.DIV_BEAR_COLOR : BUBBLE_CONFIG.DIV_BULL_COLOR;
+
+                    // Current price point
+                    const priceKey = isBear ? 'price_high' : 'price_low';
+                    const prevKey = isBear ? 'price_prev' : 'price_prev';
+                    const yNow = priceConverter(div[priceKey]);
+                    const yPrev = priceConverter(div[prevKey]);
+                    if (!yNow || !yPrev || isNaN(yNow) || isNaN(yPrev)) continue;
+
+                    // Find previous bar X (approximate from t_prev)
+                    let xPrev = x - 80; // fallback
+                    for (let j = from; j < i; j++) {
+                        const pb = d.bars[j];
+                        if (pb && pb.originalData && pb.originalData.time === div.t_prev) {
+                            xPrev = pb.x;
+                            break;
+                        }
+                    }
+
+                    // Dashed divergence line
+                    ctx.save();
+                    ctx.strokeStyle = _rgba(color, 0.8);
+                    ctx.lineWidth = BUBBLE_CONFIG.DIV_LINE_WIDTH;
+                    ctx.setLineDash(BUBBLE_CONFIG.DIV_DASH);
+                    ctx.beginPath();
+                    ctx.moveTo(xPrev, yPrev);
+                    ctx.lineTo(x, yNow);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+                    ctx.restore();
+
+                    // Divergence label
+                    const divLabel = isBear ? 'DIV ▼' : 'DIV ▲';
+                    const labelX = (xPrev + x) / 2;
+                    const labelY = (yPrev + yNow) / 2 - 12;
+                    ctx.font = BUBBLE_CONFIG.FONT_SMALL;
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+
+                    // Background pill
+                    const dtm = ctx.measureText(divLabel);
+                    ctx.fillStyle = 'rgba(0,0,0,0.75)';
+                    ctx.beginPath();
+                    ctx.roundRect(labelX - dtm.width / 2 - 5, labelY - 7, dtm.width + 10, 14, 4);
+                    ctx.fill();
+
+                    ctx.fillStyle = _rgba(color, 0.95);
+                    ctx.fillText(divLabel, labelX, labelY);
+
+                    // Circle markers at both endpoints
+                    ctx.fillStyle = _rgba(color, 0.7);
+                    ctx.beginPath();
+                    ctx.arc(xPrev, yPrev, 4, 0, Math.PI * 2);
+                    ctx.fill();
+                    ctx.beginPath();
+                    ctx.arc(x, yNow, 4, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+            }
 
             // ════════════════════════════════════════════════════════════════
-            // LAYER 11: SPOOF DETECTION — "F" marker (orange hollow ring)
+            // LAYER 10: MOMENTUM IGNITION (⚠️ warning zones)
+            // ════════════════════════════════════════════════════════════════
+            for (let i = from; i < to; i++) {
+                const bar = d.bars[i];
+                if (!bar || !bar.originalData || !bar.originalData.ignition) continue;
+
+                const ignitions = bar.originalData.ignition;
+                const x = bar.x;
+
+                for (const ign of ignitions) {
+                    const yMin = priceConverter(ign.price_min);
+                    const yMax = priceConverter(ign.price_max);
+                    if (!yMin || !yMax || isNaN(yMin) || isNaN(yMax)) continue;
+
+                    const isReversed = ign.reversed === true;
+                    const color = isReversed ? BUBBLE_CONFIG.IGN_TRAP_COLOR : BUBBLE_CONFIG.IGN_COLOR;
+                    const yTop = Math.min(yMin, yMax);
+                    const yBot = Math.max(yMin, yMax);
+                    const zoneH = Math.max(yBot - yTop, 4);
+
+                    if (useDots) {
+                        // Macro zoom: thin vertical line
+                        ctx.strokeStyle = _rgba(color, 0.5);
+                        ctx.lineWidth = 2;
+                        ctx.beginPath();
+                        ctx.moveTo(x, yTop);
+                        ctx.lineTo(x, yBot);
+                        ctx.stroke();
+                    } else {
+                        // Full zoom: warning zone rectangle
+                        const zoneW = 24;
+
+                        // Semi-transparent fill
+                        ctx.fillStyle = _rgba(color, BUBBLE_CONFIG.IGN_ZONE_ALPHA);
+                        ctx.fillRect(x - zoneW / 2, yTop, zoneW, zoneH);
+
+                        // Border (pulsing if not reversed)
+                        if (!isReversed) {
+                            const t = (performance.now() % 1500) / 1500;
+                            const borderAlpha = 0.4 + 0.4 * Math.sin(t * Math.PI * 2);
+                            ctx.strokeStyle = _rgba(color, borderAlpha);
+                            ctx.lineWidth = 1.5;
+                            ctx.setLineDash([4, 3]);
+                        } else {
+                            ctx.strokeStyle = _rgba(color, 0.9);
+                            ctx.lineWidth = 2;
+                            ctx.setLineDash([]);
+                        }
+                        ctx.strokeRect(x - zoneW / 2, yTop, zoneW, zoneH);
+                        ctx.setLineDash([]);
+
+                        // Direction arrow
+                        const arrowY = ign.direction === 'up' ? yTop - 10 : yBot + 10;
+                        const arrowChar = ign.direction === 'up' ? '↑' : '↓';
+                        ctx.font = BUBBLE_CONFIG.FONT;
+                        ctx.textAlign = 'center';
+                        ctx.textBaseline = 'middle';
+                        ctx.fillStyle = _rgba(color, 0.9);
+                        ctx.fillText(arrowChar, x, arrowY);
+
+                        // Label
+                        const ignLabel = isReversed ? '⚠ TRAP' : 'IGN';
+                        ctx.font = BUBBLE_CONFIG.FONT_BADGE;
+                        ctx.fillStyle = _rgba(color, 0.9);
+
+                        const itm = ctx.measureText(ignLabel);
+                        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+                        ctx.beginPath();
+                        ctx.roundRect(x - itm.width / 2 - 3, yBot + 14, itm.width + 6, 11, 3);
+                        ctx.fill();
+
+                        ctx.fillStyle = _rgba(color, 0.95);
+                        ctx.fillText(ignLabel, x, yBot + 19);
+                    }
+                }
+            }
+
+            // ════════════════════════════════════════════════════════════════
+            // LAYER 11: SPOOF DETECTION (👻 ghost markers)
             // ════════════════════════════════════════════════════════════════
             for (let i = from; i < to; i++) {
                 const bar = d.bars[i];
@@ -835,42 +1186,76 @@ class VolumeBubbleRenderer {
                 const spoofs = bar.originalData.spoofs;
                 const x = bar.x;
 
-                // Max 1 spoof marker per candle (pick largest fake_size)
-                let bestSpoof = null;
-                let bestSize = 0;
                 for (const spoof of spoofs) {
-                    const sz = spoof.fake_size || 0;
-                    if (sz > bestSize) { bestSize = sz; bestSpoof = spoof; }
-                }
-                if (!bestSpoof) continue;
+                    const price = parseFloat(spoof.price);
+                    if (isNaN(price)) continue;
+                    const y = priceConverter(price);
+                    if (y === null || y === undefined || isNaN(y)) continue;
 
-                const price = parseFloat(bestSpoof.price);
-                if (isNaN(price)) continue;
-                const y = priceConverter(price);
-                if (y === null || y === undefined || isNaN(y)) continue;
+                    const color = BUBBLE_CONFIG.SPOOF_COLOR;
+                    const r = BUBBLE_CONFIG.SPOOF_RADIUS;
 
-                const r = Math.max(5, Math.min(bestSize / 800, 12));
+                    if (useDots) {
+                        // Macro: small X mark
+                        ctx.strokeStyle = _rgba(color, 0.5);
+                        ctx.lineWidth = 1.5;
+                        ctx.beginPath();
+                        ctx.moveTo(x - 3, y - 3);
+                        ctx.lineTo(x + 3, y + 3);
+                        ctx.moveTo(x + 3, y - 3);
+                        ctx.lineTo(x - 3, y + 3);
+                        ctx.stroke();
+                    } else {
+                        // Full zoom: ghost circle with dashed border
+                        ctx.save();
 
-                if (useDots) {
-                    // Macro: small orange dot
-                    ctx.fillStyle = 'rgba(255,152,0,0.6)';
-                    ctx.beginPath();
-                    ctx.arc(x, y, 3, 0, Math.PI * 2);
-                    ctx.fill();
-                } else {
-                    // Orange hollow ring
-                    ctx.strokeStyle = 'rgba(255,152,0,0.7)';
-                    ctx.lineWidth = 2;
-                    ctx.beginPath();
-                    ctx.arc(x, y, r, 0, Math.PI * 2);
-                    ctx.stroke();
+                        // Translucent fill
+                        ctx.fillStyle = _rgba(color, 0.1);
+                        ctx.beginPath();
+                        ctx.arc(x, y, r, 0, Math.PI * 2);
+                        ctx.fill();
 
-                    // "F" inside the ring
-                    ctx.font = 'bold 8px monospace';
-                    ctx.textAlign = 'center';
-                    ctx.textBaseline = 'middle';
-                    ctx.fillStyle = 'rgba(255,152,0,0.9)';
-                    ctx.fillText('F', x, y);
+                        // Dashed border
+                        ctx.strokeStyle = _rgba(color, 0.5);
+                        ctx.lineWidth = 1.5;
+                        ctx.setLineDash(BUBBLE_CONFIG.SPOOF_DASH);
+                        ctx.stroke();
+                        ctx.setLineDash([]);
+
+                        // Red X through it
+                        ctx.strokeStyle = 'rgba(255, 60, 60, 0.7)';
+                        ctx.lineWidth = 2;
+                        ctx.beginPath();
+                        ctx.moveTo(x - r * 0.5, y - r * 0.5);
+                        ctx.lineTo(x + r * 0.5, y + r * 0.5);
+                        ctx.moveTo(x + r * 0.5, y - r * 0.5);
+                        ctx.lineTo(x - r * 0.5, y + r * 0.5);
+                        ctx.stroke();
+                        ctx.restore();
+
+                        // Fake size label
+                        const fakeLabel = spoof.fake_size >= 1000
+                            ? (spoof.fake_size / 1000).toFixed(1) + 'k'
+                            : String(spoof.fake_size);
+                        ctx.font = BUBBLE_CONFIG.FONT_SMALL;
+                        ctx.textAlign = 'center';
+                        ctx.textBaseline = 'middle';
+                        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+                        ctx.fillText(fakeLabel, x + 1, y + 1);
+                        ctx.fillStyle = _rgba(color, 0.9);
+                        ctx.fillText(fakeLabel, x, y);
+
+                        // "SPOOF" badge below
+                        ctx.font = BUBBLE_CONFIG.FONT_BADGE;
+                        ctx.fillStyle = 'rgba(255, 60, 60, 0.85)';
+                        ctx.fillText('SPOOF', x, y + r + 10);
+
+                        // Occurrence count badge
+                        if (spoof.count > 2) {
+                            ctx.fillStyle = _rgba(color, 0.7);
+                            ctx.fillText('x' + spoof.count, x, y + r + 20);
+                        }
+                    }
                 }
             }
         });
