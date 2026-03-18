@@ -20,9 +20,13 @@
 // CONFIG
 // ═══════════════════════════════════════════════════════════════════════════
 const BUBBLE_CONFIG = {
-    // ── Thresholds ──
-    MIN_BUBBLE_VOL: 1,            // min total vol to draw (set to 10+ for NY open noise filter)
-    INSTITUTIONAL_THRESHOLD: 100, // 100+ contracts = institutional print
+    // ── Adaptive Thresholds (Approach 3: Dual Threshold) ──
+    ADAPTIVE_MULTIPLIER: 2.0,     // threshold = rolling_avg × this (2x above average = significant)
+    ADAPTIVE_ABS_MIN: 3,          // never filter below this many contracts
+    HIGH_DOMINANCE: 0.90,         // 90%+ one-sided = always show (bypass filter)
+    HIGH_DOMINANCE_MIN_VOL: 10,   // min vol for high-dominance bypass
+    MIN_BUBBLE_VOL: 1,            // absolute floor (safety net, should rarely trigger)
+    INSTITUTIONAL_THRESHOLD: 100, // 100+ contracts = institutional print (always shows)
     ABSORPTION_MIN: 50,           // both buy AND sell must exceed this for absorption
     ABSORPTION_RATIO: 0.35,       // minor side must be at least 35% of total (no 95/5 splits)
 
@@ -160,6 +164,26 @@ class VolumeBubbleRenderer {
             }
             if (maxVol === 0) return;
 
+            // ── Adaptive threshold: compute rolling average vol per level ──
+            const allLevelVols = [];
+            for (let i = from; i < to; i++) {
+                const bar = d.bars[i];
+                if (!bar || !bar.originalData || !bar.originalData.bp) continue;
+                const bp = bar.originalData.bp;
+                for (const key in bp) {
+                    const entry = bp[key];
+                    const tv = entry[0] + entry[1];
+                    if (tv > 0) allLevelVols.push(tv);
+                }
+            }
+            const avgVol = allLevelVols.length > 0
+                ? allLevelVols.reduce((a, b) => a + b, 0) / allLevelVols.length
+                : 0;
+            const adaptiveThreshold = Math.max(
+                avgVol * BUBBLE_CONFIG.ADAPTIVE_MULTIPLIER,
+                BUBBLE_CONFIG.ADAPTIVE_ABS_MIN
+            );
+
             // ── Classify all bubbles ──
             const glowBubbles = [];     // institutional prints (drawn first, behind)
             const buyBubbles = [];
@@ -180,8 +204,19 @@ class VolumeBubbleRenderer {
                     const sellVol = entry[1];
                     const totalVol = buyVol + sellVol;
 
-                    // ── Noise filter ──
-                    if (totalVol < BUBBLE_CONFIG.MIN_BUBBLE_VOL) continue;
+                    // ── Classify early (needed for adaptive filter bypass) ──
+                    const isBuy = buyVol >= sellVol;
+                    const dominance = _dominance(buyVol, sellVol);
+                    const isAbsorb = _isAbsorption(buyVol, sellVol);
+                    const isInstitutional = totalVol >= BUBBLE_CONFIG.INSTITUTIONAL_THRESHOLD;
+                    const highDominance = dominance >= BUBBLE_CONFIG.HIGH_DOMINANCE
+                        && totalVol >= BUBBLE_CONFIG.HIGH_DOMINANCE_MIN_VOL;
+
+                    // ── Adaptive noise filter (Approach 3: Dual Threshold) ──
+                    // Always show: absorption, institutional, high-dominance
+                    // Otherwise: must exceed adaptive threshold (2x rolling avg)
+                    if (!isAbsorb && !isInstitutional && !highDominance
+                        && totalVol < adaptiveThreshold) continue;
 
                     // Convert price to Y coordinate
                     const price = parseFloat(priceStr);
@@ -189,12 +224,7 @@ class VolumeBubbleRenderer {
                     const y = priceConverter(price);
                     if (y === null || y === undefined || isNaN(y)) continue;
 
-                    // ── Classify ──
-                    const isBuy = buyVol >= sellVol;
-                    const dominance = _dominance(buyVol, sellVol);
                     const opacity = _opacityFromDominance(dominance);
-                    const isAbsorb = _isAbsorption(buyVol, sellVol);
-                    const isInstitutional = totalVol >= BUBBLE_CONFIG.INSTITUTIONAL_THRESHOLD;
 
                     // ── Radius ──
                     let radius;
