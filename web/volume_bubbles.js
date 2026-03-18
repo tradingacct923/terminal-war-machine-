@@ -671,12 +671,57 @@ class VolumeBubbleRenderer {
                         ctx.fillStyle = BUBBLE_CONFIG.TEXT_COLOR;
                         ctx.fillText(volLabel, x, y);
 
-                        // Confidence badge: ICE·H / ICE·M / ICE·L
-                        const confBadge = conf === 'high' ? 'ICE·H'
-                            : conf === 'medium' ? 'ICE·M' : 'ICE·L';
+                        // ── PRESSURE + DECAY BADGE ──
+                        const pressure = ice.pressure || 'wall_active';
+                        const decay = ice.decay || 'holding';
+                        const isZone = ice.zone || false;
+
+                        // Decay arrow: ⬇ exhausting, ⬆ strengthening, ─ holding
+                        const decayArrow = decay === 'exhausting' ? '⬇'
+                            : decay === 'strengthening' ? '⬆' : '─';
+
+                        // Pressure label
+                        let pressureLabel = '';
+                        let pressureColor = color;
+                        if (pressure === 'bullish_wall') {
+                            pressureLabel = 'BUY WALL';
+                            pressureColor = '#00e676';
+                        } else if (pressure === 'bearish_wall') {
+                            pressureLabel = 'SELL WALL';
+                            pressureColor = '#ff1744';
+                        } else if (pressure === 'wall_breaking') {
+                            pressureLabel = 'BREAKING';
+                            pressureColor = '#ffab00';
+                        } else if (pressure === 'wall_exhausted') {
+                            pressureLabel = 'EMPTY';
+                            pressureColor = '#ff6d00';
+                        } else if (pressure === 'wall_fresh') {
+                            pressureLabel = 'FRESH';
+                            pressureColor = '#00b0ff';
+                        } else {
+                            pressureLabel = conf === 'high' ? 'ICE·H'
+                                : conf === 'medium' ? 'ICE·M' : 'ICE·L';
+                        }
+
+                        // Zone prefix
+                        const zonePrefix = isZone ? 'Z:' : '';
+                        const badgeText = `${zonePrefix}${pressureLabel}${decayArrow}`;
+
                         ctx.font = BUBBLE_CONFIG.FONT_BADGE;
-                        ctx.fillStyle = _rgba(color, conf === 'high' ? 0.95 : conf === 'medium' ? 0.75 : 0.55);
-                        ctx.fillText(confBadge, x, y + ds + 8);
+                        ctx.fillStyle = pressureColor;
+                        ctx.fillText(badgeText, x, y + ds + 8);
+
+                        // Fill % micro-bar below badge (tiny progress indicator)
+                        const fillPct = ice.fill_pct || 0;
+                        if (fillPct > 0 && fillPct < 1) {
+                            const barW = ds * 1.4;
+                            const barH = 2;
+                            const barY = y + ds + 14;
+                            ctx.fillStyle = 'rgba(255,255,255,0.15)';
+                            ctx.fillRect(x - barW / 2, barY, barW, barH);
+                            ctx.fillStyle = pressureColor;
+                            ctx.fillRect(x - barW / 2, barY, barW * fillPct, barH);
+                        }
                     }
                 }
             }

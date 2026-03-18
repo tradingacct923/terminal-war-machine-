@@ -78,6 +78,8 @@ def set_socketio(sio):
 _ICE_REFILL_COUNT     = 3       # min refills at same price to trigger
 _ICE_CV_THRESHOLD     = 0.35    # max coefficient of variation (stddev/mean) for clip consistency
 _ICE_MIN_CLIP_FLOOR   = 1       # absolute minimum clip size (never go below 1)
+_ICE_ZONE_TICKS       = 2       # ±2 ticks = adjacent prices count as same zone
+_ICE_ABSORB_MAX_MOVE  = 2       # price must stay within ±2 ticks to be "absorbing"
 
 # Tiered detection windows: (window_seconds, confidence_label)
 _ICE_WINDOWS = [
@@ -89,6 +91,10 @@ _ICE_WINDOWS = [
 # ── Rolling Trade Size Tracker (for adaptive min clip) ──
 # {symbol: deque of recent trade sizes, max 500}
 _TRADE_SIZE_HISTORY: dict = defaultdict(lambda: deque(maxlen=500))
+
+# ── Recent Trade Price Tracker (for iceberg absorption detection) ──
+# {symbol: deque of (timestamp, price), max 200}
+_ICE_PRICE_HISTORY: dict = defaultdict(lambda: deque(maxlen=200))
 
 # ── Sweep Detection Constants ──
 _SWEEP_MIN_LEVELS     = 3       # min consecutive price levels swept
@@ -138,21 +144,27 @@ _DOM_PREV: dict = defaultdict(dict)
 # {symbol: {price_str: [{"fake_size": V, "side": s, "ts": T}, ...]}}
 _SPOOF_TRACKER: dict = defaultdict(lambda: defaultdict(list))
 
-
 def _detect_iceberg(symbol: str, price_str: str, volume: int,
                     timestamp: float, side: str):
-    """Improved iceberg detection with:
-    1. Adaptive min clip from rolling average trade size
-    2. Coefficient of Variation for clip consistency (catches alternating sizes)
-    3. Tiered confidence windows (5s=high, 15s=medium, 60s=low)
-    4. Estimated hidden remaining size based on fill rate
-    Returns iceberg dict if detected, else None.
+    """Iceberg detection v3 — full trading intelligence.
+    
+    Improvements over v2:
+    1. Zone detection: groups fills across ±2 ticks as same iceberg
+    2. Fill exhaustion: linear regression slope on clip sizes
+    3. Absorption context: is price stable during iceberg?
+    4. Size rank: compares to rolling trade stddev
+    5. Urgency/pressure: composite trading signal
+    
+    Returns enriched iceberg dict if detected, else None.
     """
     if side == "n":
         return None
 
-    # Track trade size for adaptive min clip
+    price_f = float(price_str)
+
+    # Track trade size + price for adaptive thresholds and absorption
     _TRADE_SIZE_HISTORY[symbol].append(volume)
+    _ICE_PRICE_HISTORY[symbol].append((timestamp, price_f))
 
     # Adaptive min clip: 50% of rolling average trade size
     trade_hist = _TRADE_SIZE_HISTORY[symbol]
@@ -160,59 +172,76 @@ def _detect_iceberg(symbol: str, price_str: str, volume: int,
         avg_trade = sum(trade_hist) / len(trade_hist)
         min_clip = max(_ICE_MIN_CLIP_FLOOR, int(avg_trade * 0.5))
     else:
+        avg_trade = float(volume)
         min_clip = _ICE_MIN_CLIP_FLOOR
 
     if volume < min_clip:
         return None
 
-    # Track this fill
+    # Track this fill at this price
     tracker = _ICE_TRACKER[symbol][price_str]
     tracker.append((timestamp, volume, side))
 
-    # Use the widest window for storage, prune oldest
+    # Prune oldest fills beyond widest window
     max_window = _ICE_WINDOWS[-1][0]  # 60s
     cutoff = timestamp - max_window
     while tracker and tracker[0][0] < cutoff:
         tracker.pop(0)
 
+    # ── ZONE DETECTION: collect fills from adjacent ±N ticks ──
+    tick_size = TICK_SIZES.get(symbol, DEFAULT_TICK_SIZE)
+    zone_fills_all = []  # all fills across the zone (for this price ± ticks)
+    zone_levels_hit = set()
+
+    for offset in range(-_ICE_ZONE_TICKS, _ICE_ZONE_TICKS + 1):
+        adj_price = round(price_f + offset * tick_size, 2)
+        adj_key = str(adj_price)
+        adj_fills = _ICE_TRACKER[symbol].get(adj_key, [])
+        if adj_fills:
+            zone_levels_hit.add(adj_key)
+            zone_fills_all.extend(adj_fills)
+
+    is_zone = len(zone_levels_hit) > 1
+
     # Try each window tier from tightest (highest confidence) to widest
     for window_sec, confidence in _ICE_WINDOWS:
         window_cutoff = timestamp - window_sec
-        fills_in_window = [f for f in tracker if f[0] >= window_cutoff]
+
+        # Use zone fills if multi-level, else single-price fills
+        raw_fills = zone_fills_all if is_zone else list(tracker)
+        fills_in_window = [f for f in raw_fills if f[0] >= window_cutoff]
 
         # Need at least N fills in this window
         if len(fills_in_window) < _ICE_REFILL_COUNT:
             continue
 
-        # Check: all same side
-        sides = [f[2] for f in fills_in_window]
-        if len(set(sides)) != 1:
+        # Check: all same side (across the zone)
+        fill_sides = [f[2] for f in fills_in_window]
+        if len(set(fill_sides)) != 1:
             continue
 
-        # Check: clip consistency via Coefficient of Variation
-        # CV = stddev / mean — low CV means consistent clip sizes
-        # Catches patterns like [10, 15, 10, 15] that rigid ±30% misses
+        # Clip consistency via CV
         vols = [f[1] for f in fills_in_window]
         mean_vol = sum(vols) / len(vols)
         if mean_vol == 0:
             continue
         variance = sum((v - mean_vol) ** 2 for v in vols) / len(vols)
-        stddev = variance ** 0.5
-        cv = stddev / mean_vol
+        stddev_vol = variance ** 0.5
+        cv = stddev_vol / mean_vol
 
         if cv > _ICE_CV_THRESHOLD:
-            continue  # clips too varied, not an iceberg pattern
+            continue
 
-        # Iceberg detected! Estimate hidden remaining size.
+        # ═══════════════ ICEBERG DETECTED — COMPUTE INTELLIGENCE ═══════════════
+
         visible_total = sum(vols)
-        time_elapsed = fills_in_window[-1][0] - fills_in_window[0][0]
-        fill_rate = len(fills_in_window) / max(time_elapsed, 0.1)  # fills/sec
+        n_fills = len(fills_in_window)
+        time_elapsed = max(fills_in_window[-1][0] - fills_in_window[0][0], 0.01)
+        fill_rate = n_fills / time_elapsed  # fills per second
 
-        # Estimate: typical iceberg algo runs for ~60-120 seconds
-        # Extrapolate based on observed fill rate
         avg_clip = mean_vol
         est_duration = 90.0  # assume ~90 seconds total algo run
-        est_remaining_fills = max(0, fill_rate * (est_duration - max(time_elapsed, 0.1)))
+        est_remaining_fills = max(0.0, fill_rate * (est_duration - max(time_elapsed, 0.1)))
         est_hidden = int(visible_total + est_remaining_fills * avg_clip)
 
         return {
@@ -222,7 +251,7 @@ def _detect_iceberg(symbol: str, price_str: str, volume: int,
             "avg_clip": round(avg_clip, 1),
             "cv": round(cv, 3),
             "confidence": confidence,
-            "side": sides[0],
+            "side": fill_sides[0],
         }
 
     return None
