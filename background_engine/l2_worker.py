@@ -74,7 +74,126 @@ def set_socketio(sio):
 # ORDERFLOW DETECTION — Iceberg + Sweep engines
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── Iceberg Detection Constants ──
+# ══════════════════════════════════════════════════════════════════════════════
+# REGIME-ADAPTIVE THRESHOLDS — Options-driven market regime classifier
+# ══════════════════════════════════════════════════════════════════════════════
+# 5 regimes, each with tuned thresholds for iceberg + drifting detection.
+# Updated by server.py whenever options data refreshes (~every 5 min).
+
+_REGIME_THRESHOLDS = {
+    # PIN / MEAN-REVERT: long gamma, high GEX, IV cheap, spot between walls
+    # Heavy MM activity, walls everywhere → strict filter or drown in signals
+    "pin_mean_revert": {
+        "ice_cv": 0.25, "ice_refill_count": 4,
+        "drift_cv": 0.25, "drift_min_fills": 7, "drift_min_spread": 5,
+    },
+    # LONG GAMMA / STABLE: long gamma, GEX positive, normal
+    # Standard range-bound. Default detection settings
+    "long_gamma_stable": {
+        "ice_cv": 0.30, "ice_refill_count": 3,
+        "drift_cv": 0.30, "drift_min_fills": 5, "drift_min_spread": 4,
+    },
+    # TRANSITION: spot near gamma flip (±0.5%)
+    # Anything goes — regime could shift mid-detection
+    "transition": {
+        "ice_cv": 0.35, "ice_refill_count": 3,
+        "drift_cv": 0.35, "drift_min_fills": 5, "drift_min_spread": 3,
+    },
+    # SHORT GAMMA / VOLATILE: short gamma, negative GEX
+    # Trending. Fewer walls, but ones that show up are significant
+    "short_gamma_volatile": {
+        "ice_cv": 0.40, "ice_refill_count": 3,
+        "drift_cv": 0.45, "drift_min_fills": 4, "drift_min_spread": 3,
+    },
+    # CRASH / TAIL RISK: short gamma, GEX < -1B, IV rich, spot below put wall
+    # Panic. Any wall is a massive signal. Catch everything
+    "crash_tail_risk": {
+        "ice_cv": 0.45, "ice_refill_count": 3,
+        "drift_cv": 0.50, "drift_min_fills": 3, "drift_min_spread": 2,
+    },
+}
+
+# Current regime state — updated by update_regime() called from server.py
+_CURRENT_REGIME = "transition"  # safe default until first options refresh
+_REGIME_DATA = {
+    "regime": "transition",
+    "spot": 0, "gamma_flip": 0, "total_gex": 0,
+    "call_wall": 0, "put_wall": 0,
+    "flow_ratio": 0.5, "iv_rv_spread": 0,
+    "updated_at": 0,
+}
+
+
+def _classify_regime(spot: float, gamma_flip: float, total_gex: float,
+                     call_wall: float, put_wall: float,
+                     flow_ratio: float = 0.5,
+                     iv_rv_spread: float = 0.0) -> str:
+    """Classify market regime from options signals.
+
+    Returns one of: pin_mean_revert, long_gamma_stable, transition,
+    short_gamma_volatile, crash_tail_risk
+    """
+    if spot <= 0 or gamma_flip <= 0:
+        return "transition"  # no data yet
+
+    dist_to_flip = abs(spot - gamma_flip) / spot
+    is_long_gamma = spot > gamma_flip
+
+    # Near the flip → regime uncertain
+    if dist_to_flip < 0.005:
+        return "transition"
+
+    # Short gamma regimes
+    if not is_long_gamma:
+        if total_gex < -1e9 and iv_rv_spread > 10 and spot < put_wall:
+            return "crash_tail_risk"
+        return "short_gamma_volatile"
+
+    # Long gamma regimes
+    if total_gex > 0.5e9 and iv_rv_spread < 0 and put_wall < spot < call_wall:
+        return "pin_mean_revert"
+
+    return "long_gamma_stable"
+
+
+def update_regime(spot: float, gamma_flip: float, total_gex: float,
+                  call_wall: float, put_wall: float,
+                  flow_ratio: float = 0.5,
+                  iv_rv_spread: float = 0.0):
+    """Called by server.py when options data refreshes.
+    Updates the module-level regime state for all detection functions.
+    """
+    global _CURRENT_REGIME, _REGIME_DATA
+    import time as _t
+
+    new_regime = _classify_regime(
+        spot, gamma_flip, total_gex, call_wall, put_wall,
+        flow_ratio, iv_rv_spread
+    )
+
+    old_regime = _CURRENT_REGIME
+    _CURRENT_REGIME = new_regime
+    _REGIME_DATA = {
+        "regime": new_regime,
+        "spot": spot, "gamma_flip": gamma_flip, "total_gex": total_gex,
+        "call_wall": call_wall, "put_wall": put_wall,
+        "flow_ratio": flow_ratio, "iv_rv_spread": iv_rv_spread,
+        "updated_at": _t.time(),
+    }
+
+    if new_regime != old_regime:
+        log.info(f"[REGIME] {old_regime} → {new_regime} | "
+                 f"spot={spot:.0f} flip={gamma_flip:.0f} "
+                 f"gex={total_gex/1e6:.0f}M")
+
+
+def _get_regime_thresholds() -> dict:
+    """Get current adaptive thresholds based on market regime."""
+    return _REGIME_THRESHOLDS.get(_CURRENT_REGIME,
+                                  _REGIME_THRESHOLDS["transition"])
+
+
+# ── Iceberg Detection Constants (defaults, overridden by regime) ──
 _ICE_REFILL_COUNT     = 3       # min refills at same price to trigger
 _ICE_CV_THRESHOLD     = 0.35    # max coefficient of variation (stddev/mean) for clip consistency
 _ICE_MIN_CLIP_FLOOR   = 1       # absolute minimum clip size (never go below 1)
@@ -278,14 +397,20 @@ def _detect_drifting_iceberg(symbol: str, price_f: float, volume: int,
     """
     if side == "n":
         return None
+    # ── Regime-adaptive thresholds ──
+    _rt = _get_regime_thresholds()
+    drift_min_fills = _rt["drift_min_fills"]
+    drift_min_spread = _rt["drift_min_spread"]
+    drift_cv_max = _rt["drift_cv"]
+
     tracker = _DRIFT_TRACKER[symbol][side]
     tracker.append((timestamp, price_f, volume))
     cutoff = timestamp - _DRIFT_WINDOW_SEC
     recent = [(t, p, v) for t, p, v in tracker if t >= cutoff]
-    if len(recent) < _DRIFT_MIN_FILLS:
+    if len(recent) < drift_min_fills:
         return None
     prices = set(round(p, 2) for _, p, _ in recent)
-    if len(prices) < _DRIFT_MIN_PRICE_SPREAD:
+    if len(prices) < drift_min_spread:
         return None
     vols = [v for _, _, v in recent]
     mean_v = sum(vols) / len(vols)
@@ -293,7 +418,7 @@ def _detect_drifting_iceberg(symbol: str, price_f: float, volume: int,
         return None
     var = sum((v - mean_v) ** 2 for v in vols) / len(vols)
     cv = (var ** 0.5) / mean_v
-    if cv > _DRIFT_MAX_CV:
+    if cv > drift_cv_max:
         return None
 
     # ── Layer 2: DOM Total Depth Anomaly ──
@@ -513,7 +638,9 @@ def _detect_iceberg(symbol: str, price_str: str, volume: int,
         raw_fills = zone_fills_all if is_zone else list(tracker)
         fills_in_window = [f for f in raw_fills if f[0] >= window_cutoff]
 
-        if len(fills_in_window) < _ICE_REFILL_COUNT:
+        # ── Regime-adaptive thresholds ──
+        _rt = _get_regime_thresholds()
+        if len(fills_in_window) < _rt["ice_refill_count"]:
             continue
 
         fill_sides = [f[2] for f in fills_in_window]
@@ -528,7 +655,7 @@ def _detect_iceberg(symbol: str, price_str: str, volume: int,
         stddev_vol = variance ** 0.5
         cv = stddev_vol / mean_vol
 
-        if cv > _ICE_CV_THRESHOLD:
+        if cv > _rt["ice_cv"]:
             continue
 
         # ═══════════════ ICEBERG DETECTED — COMPUTE ALL INTELLIGENCE ═══════════
@@ -695,6 +822,8 @@ def _detect_iceberg(symbol: str, price_str: str, volume: int,
             "level_avg_size": level_avg_size,
             # Prediction (Elite #6)
             "prediction": prediction,
+            # Regime (adaptive thresholds)
+            "regime": _CURRENT_REGIME,
         }
 
         _update_level_memory(symbol, price_str, result)
