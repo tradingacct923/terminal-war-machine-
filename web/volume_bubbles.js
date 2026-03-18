@@ -204,7 +204,7 @@ class VolumeBubbleRenderer {
                     const sellVol = entry[1];
                     const totalVol = buyVol + sellVol;
 
-                    // ── Classify early (needed for adaptive filter bypass) ──
+                    // ── Classify ──
                     const isBuy = buyVol >= sellVol;
                     const dominance = _dominance(buyVol, sellVol);
                     const isAbsorb = _isAbsorption(buyVol, sellVol);
@@ -212,11 +212,8 @@ class VolumeBubbleRenderer {
                     const highDominance = dominance >= BUBBLE_CONFIG.HIGH_DOMINANCE
                         && totalVol >= BUBBLE_CONFIG.HIGH_DOMINANCE_MIN_VOL;
 
-                    // ── Adaptive noise filter (Approach 3: Dual Threshold) ──
-                    // Always show: absorption, institutional, high-dominance
-                    // Otherwise: must exceed adaptive threshold (2x rolling avg)
-                    if (!isAbsorb && !isInstitutional && !highDominance
-                        && totalVol < adaptiveThreshold) continue;
+                    // ── Absolute floor: skip truly empty levels ──
+                    if (totalVol < BUBBLE_CONFIG.MIN_BUBBLE_VOL) continue;
 
                     // Convert price to Y coordinate
                     const price = parseFloat(priceStr);
@@ -224,19 +221,38 @@ class VolumeBubbleRenderer {
                     const y = priceConverter(price);
                     if (y === null || y === undefined || isNaN(y)) continue;
 
-                    const opacity = _opacityFromDominance(dominance);
+                    // ── Adaptive dim-not-hide (nothing hidden, noise faded) ──
+                    // Determine if this bubble is "significant"
+                    const isSignificant = isAbsorb || isInstitutional || highDominance
+                        || totalVol >= adaptiveThreshold;
+
+                    let opacity, radius;
+                    if (isSignificant) {
+                        // Above threshold → full visibility + boost
+                        opacity = _opacityFromDominance(dominance);
+                        // Extra brightness for special events
+                        if (isAbsorb || isInstitutional || highDominance) {
+                            opacity = Math.min(opacity + 0.15, 0.95);
+                        }
+                    } else {
+                        // Below threshold → faded background dot
+                        opacity = 0.08;
+                    }
 
                     // ── Radius ──
-                    let radius;
                     if (useDots) {
-                        radius = BUBBLE_CONFIG.DOT_RADIUS;
-                        // Slightly bigger dots for institutional
+                        radius = isSignificant ? BUBBLE_CONFIG.DOT_RADIUS : 1.5;
                         if (isInstitutional) radius = 4;
                     } else {
-                        const ratio = totalVol / maxVol;
-                        radius = BUBBLE_CONFIG.MIN_RADIUS +
-                            ratio * (BUBBLE_CONFIG.MAX_RADIUS - BUBBLE_CONFIG.MIN_RADIUS);
-                        radius = Math.min(radius, BUBBLE_CONFIG.MAX_RADIUS);
+                        if (isSignificant) {
+                            const ratio = totalVol / maxVol;
+                            radius = BUBBLE_CONFIG.MIN_RADIUS +
+                                ratio * (BUBBLE_CONFIG.MAX_RADIUS - BUBBLE_CONFIG.MIN_RADIUS);
+                            radius = Math.min(radius, BUBBLE_CONFIG.MAX_RADIUS);
+                        } else {
+                            // Noise → tiny dot
+                            radius = 1.5;
+                        }
                     }
 
                     const bubble = { x, y, radius, totalVol, buyVol, sellVol, opacity, isAbsorb, isInstitutional };
