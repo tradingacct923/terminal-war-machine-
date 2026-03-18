@@ -32,9 +32,8 @@ const BUBBLE_CONFIG = {
     MIN_BUBBLE_VOL: 1,            // absolute floor (skip truly empty levels)
 
     // ── Gradient Display (The Eyes) ──
-    // Maps sigma distance → opacity (smooth, no binary jumps)
+    // Maps sigma distance → opacity (exponential curve, not linear)
     GRADIENT_BASE_OPACITY: 0.04,  // opacity for noise (barely visible)
-    GRADIENT_SCALE: 0.20,         // opacity gain per 1σ above average
     GRADIENT_MAX_OPACITY: 0.92,   // cap
 
     // ── Cluster Detection ──
@@ -188,22 +187,26 @@ class VolumeBubbleRenderer {
                     if (tv > 0) allLevelVols.push(tv);
                 }
             }
-            // ── Step 1: THE BRAIN — Compute StdDev ──
+            // ── Step 1: THE BRAIN — Log-Transform StdDev ──
+            // Log-transform compresses scale so outliers don’t break sigma.
+            // Without: one 200-lot makes threshold=91, hiding 50-lot prints.
+            // With: threshold adapts properly, 50-lot prints show correctly.
             const n = allLevelVols.length;
-            const avg = n > 0 ? allLevelVols.reduce((a, b) => a + b, 0) / n : 0;
-            const variance = n > 0
-                ? allLevelVols.reduce((sum, v) => {
-                    const diff = v - avg;
-                    return sum + diff * diff;
-                }, 0) / n
-                : 0;
-            const stddev = Math.sqrt(variance);
+            if (n === 0) return;
 
-            // Adaptive significance levels (all σ-based, zero fixed numbers)
-            const sigThreshold  = avg + BUBBLE_CONFIG.SIGMA_SIGNIFICANT * stddev;
-            const instThreshold = avg + BUBBLE_CONFIG.SIGMA_INSTITUTIONAL * stddev;
-            const absorbMinVol  = avg + BUBBLE_CONFIG.SIGMA_ABSORPTION * stddev;
-            const highDomMinVol = avg + BUBBLE_CONFIG.SIGMA_HIGH_DOM * stddev;
+            const logVols = allLevelVols.map(v => Math.log(v + 1));
+            const logAvg = logVols.reduce((a, b) => a + b, 0) / n;
+            const logVariance = logVols.reduce((sum, v) => {
+                const diff = v - logAvg;
+                return sum + diff * diff;
+            }, 0) / n;
+            const logStddev = Math.sqrt(logVariance);
+
+            // Significance thresholds: computed in log-space, converted back
+            const sigThreshold  = Math.exp(logAvg + BUBBLE_CONFIG.SIGMA_SIGNIFICANT * logStddev) - 1;
+            const instThreshold = Math.exp(logAvg + BUBBLE_CONFIG.SIGMA_INSTITUTIONAL * logStddev) - 1;
+            const absorbMinVol  = Math.exp(logAvg + BUBBLE_CONFIG.SIGMA_ABSORPTION * logStddev) - 1;
+            const highDomMinVol = Math.exp(logAvg + BUBBLE_CONFIG.SIGMA_HIGH_DOM * logStddev) - 1;
 
             // ── Cluster map: find significant-volume price levels hit 3+ times ──
             const clusterMap = {};  // {priceStr → [{idx, x, buy, sell, total}, ...]}
@@ -266,29 +269,28 @@ class VolumeBubbleRenderer {
                     const y = priceConverter(price);
                     if (y === null || y === undefined || isNaN(y)) continue;
 
-                    // ── Step 3: THE EYES — Gradient from σ distance ──
-                    // How many σ above average is this bubble?
-                    const sigmaDistance = stddev > 0
-                        ? (totalVol - avg) / stddev
-                        : (totalVol > avg ? 1 : 0);
+                    // ── Step 3: THE EYES — Exponential gradient from log-σ ──
+                    // Sigma distance in log-space (immune to outlier distortion)
+                    const logVol = Math.log(totalVol + 1);
+                    const sigmaDistance = logStddev > 0
+                        ? (logVol - logAvg) / logStddev
+                        : (totalVol > 0 ? 1 : 0);
 
-                    // Opacity: smooth gradient based on sigma distance
-                    // 0σ → base (0.04), each σ adds 0.20, capped at 0.92
+                    // Exponential opacity: σ² curve keeps noise dim, extremes POP
+                    // 1σ=0.09, 2σ=0.24, 3σ=0.49, 4σ=0.84
                     let opacity = BUBBLE_CONFIG.GRADIENT_BASE_OPACITY
-                        + Math.max(sigmaDistance, 0) * BUBBLE_CONFIG.GRADIENT_SCALE;
+                        + Math.pow(Math.max(sigmaDistance, 0), 2) * 0.05;
                     opacity = Math.min(opacity, BUBBLE_CONFIG.GRADIENT_MAX_OPACITY);
 
                     // Cluster boost: smooth +0.15 for repeated significant levels
                     if (isInCluster) opacity = Math.min(opacity + 0.15, BUBBLE_CONFIG.GRADIENT_MAX_OPACITY);
 
-                    // Radius: smooth gradient based on sigma distance
+                    // Radius: exponential σ-based scaling
                     let radius;
                     if (useDots) {
-                        // Dots: scale 1.0 → 4.0 based on sigma
-                        radius = Math.min(1.0 + Math.max(sigmaDistance, 0) * 0.8, 4.0);
+                        radius = Math.min(1.0 + Math.pow(Math.max(sigmaDistance, 0), 1.5) * 0.5, 4.0);
                     } else {
-                        // Full bubbles: scale MIN_RADIUS → MAX_RADIUS based on sigma
-                        const sigmaRatio = Math.min(Math.max(sigmaDistance, 0) / 4, 1);
+                        const sigmaRatio = Math.min(Math.pow(Math.max(sigmaDistance, 0) / 4, 1.5), 1);
                         radius = BUBBLE_CONFIG.MIN_RADIUS
                             + sigmaRatio * (BUBBLE_CONFIG.MAX_RADIUS - BUBBLE_CONFIG.MIN_RADIUS);
                     }
@@ -489,13 +491,17 @@ class VolumeBubbleRenderer {
                         ctx.fill();
                     }
 
-                    // ── Badge: hit count + raw ratio (no labels, just data) ──
+                    // ── Badge: hit count + net delta (instantly readable) ──
                     const badgeX = xEnd + 6;
                     ctx.font = BUBBLE_CONFIG.CLUSTER_BADGE_FONT;
                     ctx.textAlign = 'left';
                     ctx.textBaseline = 'middle';
 
-                    const badge = `${hits.length}× ${accelRatio.toFixed(1)}r`;
+                    const totalBuyBadge = hits.reduce((a, h) => a + h.buy, 0);
+                    const totalSellBadge = hits.reduce((a, h) => a + h.sell, 0);
+                    const netDelta = totalBuyBadge - totalSellBadge;
+                    const deltaSign = netDelta >= 0 ? '+' : '';
+                    const badge = `${hits.length}× ${deltaSign}${netDelta}Δ`;
                     const badgeAlpha = Math.min(lineAlpha + 0.20, 0.90);
 
                     // Badge shadow
