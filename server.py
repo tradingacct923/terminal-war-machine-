@@ -883,6 +883,32 @@ def api_data():
     except Exception as e:
         print(f"[api/data] NQ conversion warning: {e}")
 
+    # ── Update iceberg detection regime from options data ──
+    try:
+        from background_engine.l2_worker import update_regime
+        # Total net GEX from all strikes
+        total_gex = sum(data["gex"]["net_gex"].values())
+        # Gamma flip: find where cumulative net GEX crosses zero
+        net_gex = data["gex"]["net_gex"]
+        sorted_strikes = sorted(net_gex.keys())
+        gamma_flip = data["spot"]  # default to spot if no flip found
+        for i in range(1, len(sorted_strikes)):
+            s0, s1 = sorted_strikes[i-1], sorted_strikes[i]
+            if net_gex[s0] * net_gex[s1] < 0:  # sign change
+                ratio_gf = abs(net_gex[s0]) / (abs(net_gex[s0]) + abs(net_gex[s1]))
+                gamma_flip = s0 + ratio_gf * (s1 - s0)
+                break
+        # Use NQ-equivalent if available, otherwise QQQ
+        nq_ratio = result.get("ratio", 1.0)
+        update_regime(
+            spot=result.get("nq_mid", data["spot"]) or data["spot"],
+            gamma_flip=gamma_flip * nq_ratio,
+            total_gex=total_gex,
+            call_wall=result.get("call_wall", data["gex"]["call_wall"] * nq_ratio),
+            put_wall=result.get("put_wall", data["gex"]["put_wall"] * nq_ratio),
+        )
+    except Exception as e:
+        print(f"[api/data] Regime update warning: {e}")
     return jsonify(result)
 
 @app.route("/api/vol_skew_multi")
