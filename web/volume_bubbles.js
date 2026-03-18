@@ -44,6 +44,16 @@ const BUBBLE_CONFIG = {
     CLUSTER_LINE_WIDTH: 1.5,      // connecting line width
     CLUSTER_BADGE_FONT: '9px "JetBrains Mono", "SF Mono", monospace',
 
+    // ── Cumulative Level Delta (sidebar bars) ──
+    CUML_DELTA_ENABLED: true,          // toggle on/off
+    CUML_DELTA_BAR_MAX_WIDTH: 60,     // max horizontal bar width in px
+    CUML_DELTA_BAR_HEIGHT: 2,         // bar thickness in px
+    CUML_DELTA_BAR_ALPHA: 0.35,       // bar fill opacity
+    CUML_DELTA_LABEL_ALPHA: 0.75,     // text label opacity
+    CUML_DELTA_RIGHT_MARGIN: 8,       // px from right edge of chart
+    CUML_DELTA_FONT: '8px "JetBrains Mono", "SF Mono", monospace',
+    CUML_DELTA_MIN_SIGMA: 0.5,        // only show levels above 0.5σ cumulative vol
+
     // ── Sizing ──
     MAX_RADIUS: 24,               // max bubble radius in px
     MIN_RADIUS: 3,                // min bubble radius
@@ -202,6 +212,35 @@ class VolumeBubbleRenderer {
             const instThreshold = Math.exp(logAvg + BUBBLE_CONFIG.SIGMA_INSTITUTIONAL * logStddev) - 1;
             const absorbMinVol  = Math.exp(logAvg + BUBBLE_CONFIG.SIGMA_ABSORPTION * logStddev) - 1;
             const highDomMinVol = Math.exp(logAvg + BUBBLE_CONFIG.SIGMA_HIGH_DOM * logStddev) - 1;
+
+            // ── Cumulative Level Delta: aggregate buy/sell per price level ──
+            const cumlDelta = {};  // {priceStr → {buy, sell, total}}
+            for (let i = from; i < to; i++) {
+                const bar = d.bars[i];
+                if (!bar || !bar.originalData || !bar.originalData.bp) continue;
+                const bp = bar.originalData.bp;
+                for (const priceStr in bp) {
+                    const bv = bp[priceStr][0], sv = bp[priceStr][1];
+                    if (!cumlDelta[priceStr]) cumlDelta[priceStr] = { buy: 0, sell: 0, total: 0 };
+                    cumlDelta[priceStr].buy += bv;
+                    cumlDelta[priceStr].sell += sv;
+                    cumlDelta[priceStr].total += (bv + sv);
+                }
+            }
+
+            // Sigma-filter cumulative levels (same log-stddev approach)
+            let cumlMinVol = 0;
+            const cumlTotals = Object.values(cumlDelta).map(d => d.total);
+            if (cumlTotals.length > 0) {
+                const cumlLogTotals = cumlTotals.map(v => Math.log(v + 1));
+                const cumlLogAvg = cumlLogTotals.reduce((a, b) => a + b, 0) / cumlLogTotals.length;
+                const cumlLogVar = cumlLogTotals.reduce((s, v) => {
+                    const diff = v - cumlLogAvg;
+                    return s + diff * diff;
+                }, 0) / cumlLogTotals.length;
+                const cumlLogStd = Math.sqrt(cumlLogVar);
+                cumlMinVol = Math.exp(cumlLogAvg + BUBBLE_CONFIG.CUML_DELTA_MIN_SIGMA * cumlLogStd) - 1;
+            }
 
             // ── Cluster map: find significant-volume price levels hit 3+ times ──
             const clusterMap = {};  // {priceStr → [{idx, x, buy, sell, total}, ...]}
@@ -692,6 +731,59 @@ class VolumeBubbleRenderer {
                         ctx.fillText('SWP', x, endY + bs + 10);
                     }
                 }
+            }
+
+            // ════════════════════════════════════════════════════════════════
+            // LAYER 8.5: CUMULATIVE LEVEL DELTA (sidebar bars)
+            // Aggregates all buy/sell per price level across visible candles.
+            // Shows supply/demand zones at a glance on the right edge.
+            // ════════════════════════════════════════════════════════════════
+            if (BUBBLE_CONFIG.CUML_DELTA_ENABLED && !useDots) {
+                // Find max absolute delta for proportional scaling
+                let maxAbsDelta = 0;
+                const filteredLevels = [];
+                for (const priceStr in cumlDelta) {
+                    const cd = cumlDelta[priceStr];
+                    if (cd.total < cumlMinVol) continue;  // σ-filtered
+                    const net = cd.buy - cd.sell;
+                    const absDelta = Math.abs(net);
+                    if (absDelta > maxAbsDelta) maxAbsDelta = absDelta;
+                    filteredLevels.push({ priceStr, net, total: cd.total });
+                }
+                if (maxAbsDelta === 0) maxAbsDelta = 1;
+
+                const rightEdge = mediaSize.width - BUBBLE_CONFIG.CUML_DELTA_RIGHT_MARGIN;
+
+                ctx.font = BUBBLE_CONFIG.CUML_DELTA_FONT;
+                ctx.textBaseline = 'middle';
+
+                for (const level of filteredLevels) {
+                    const price = parseFloat(level.priceStr);
+                    if (isNaN(price)) continue;
+                    const y = priceConverter(price);
+                    if (y === null || y === undefined || isNaN(y)) continue;
+
+                    const net = level.net;
+                    const barWidth = (Math.abs(net) / maxAbsDelta) * BUBBLE_CONFIG.CUML_DELTA_BAR_MAX_WIDTH;
+                    const color = net >= 0 ? BUBBLE_CONFIG.BUY_COLOR : BUBBLE_CONFIG.SELL_COLOR;
+
+                    // Horizontal bar: extends LEFT from right edge
+                    ctx.fillStyle = _rgba(color, BUBBLE_CONFIG.CUML_DELTA_BAR_ALPHA);
+                    ctx.fillRect(
+                        rightEdge - barWidth,
+                        y - BUBBLE_CONFIG.CUML_DELTA_BAR_HEIGHT / 2,
+                        barWidth,
+                        BUBBLE_CONFIG.CUML_DELTA_BAR_HEIGHT
+                    );
+
+                    // Delta label: right-aligned next to bar
+                    const sign = net >= 0 ? '+' : '';
+                    const label = `${sign}${net}Δ`;
+                    ctx.textAlign = 'right';
+                    ctx.fillStyle = _rgba(color, BUBBLE_CONFIG.CUML_DELTA_LABEL_ALPHA);
+                    ctx.fillText(label, rightEdge - barWidth - 3, y);
+                }
+                ctx.textAlign = 'center';  // reset
             }
 
             // ════════════════════════════════════════════════════════════════
