@@ -29,6 +29,18 @@ const BUBBLE_CONFIG = {
     ABSORPTION_MIN: 50,           // both buy AND sell must exceed this for absorption
     ABSORPTION_RATIO: 0.35,       // minor side must be at least 35% of total (no 95/5 splits)
 
+    // ── Cluster + Acceleration Detection ──
+    CLUSTER_MIN_HITS: 3,          // minimum significant hits at same price to form a cluster
+    CLUSTER_LINE_WIDTH: 1.5,      // connecting line width
+    CLUSTER_LINE_ALPHA: 0.45,     // connecting line base opacity
+    CLUSTER_OPACITY_BOOST: 0.20,  // extra opacity for bubbles in a cluster
+    CLUSTER_BADGE_FONT: '9px "JetBrains Mono", "SF Mono", monospace',
+    ACCEL_UP_THRESHOLD: 1.3,      // secondHalf/firstHalf > 1.3 = accelerating
+    ACCEL_DOWN_THRESHOLD: 0.7,    // secondHalf/firstHalf < 0.7 = decelerating
+    EXHAUST_SPIKE: 3.0,           // single candle 3x+ average of others = exhaustion
+    EXHAUST_COLOR: [255, 180, 0], // orange for exhaustion warning
+    ACCEL_COLOR: [100, 255, 160], // bright green for acceleration
+
     // ── Sizing ──
     MAX_RADIUS: 24,               // max bubble radius in px
     MIN_RADIUS: 3,                // min bubble radius
@@ -180,6 +192,29 @@ class VolumeBubbleRenderer {
                 : 0;
             const adaptiveThreshold = avgVol * BUBBLE_CONFIG.ADAPTIVE_MULTIPLIER;
 
+            // ── Cluster map: find significant-volume price levels hit 3+ times ──
+            const clusterMap = {};  // {priceStr → [{idx, x, buy, sell, total}, ...]}
+            for (let i = from; i < to; i++) {
+                const bar = d.bars[i];
+                if (!bar || !bar.originalData || !bar.originalData.bp) continue;
+                const bp = bar.originalData.bp;
+                for (const priceStr in bp) {
+                    const bv = bp[priceStr][0], sv = bp[priceStr][1];
+                    const tv = bv + sv;
+                    if (tv >= adaptiveThreshold) {  // only significant prints
+                        if (!clusterMap[priceStr]) clusterMap[priceStr] = [];
+                        clusterMap[priceStr].push({ idx: i, x: bar.x, buy: bv, sell: sv, total: tv });
+                    }
+                }
+            }
+            // Build set of clustered prices for quick lookup
+            const clusteredPrices = new Set();
+            for (const priceStr in clusterMap) {
+                if (clusterMap[priceStr].length >= BUBBLE_CONFIG.CLUSTER_MIN_HITS) {
+                    clusteredPrices.add(priceStr);
+                }
+            }
+
             // ── Classify all bubbles ──
             const glowBubbles = [];     // institutional prints (drawn first, behind)
             const buyBubbles = [];
@@ -219,6 +254,7 @@ class VolumeBubbleRenderer {
 
                     // ── Adaptive dim-not-hide (nothing hidden, noise faded) ──
                     // Determine if this bubble is "significant"
+                    const isInCluster = clusteredPrices.has(priceStr);
                     const isSignificant = isAbsorb || isInstitutional || highDominance
                         || totalVol >= adaptiveThreshold;
 
@@ -229,6 +265,10 @@ class VolumeBubbleRenderer {
                         // Extra brightness for special events
                         if (isAbsorb || isInstitutional || highDominance) {
                             opacity = Math.min(opacity + 0.15, 0.95);
+                        }
+                        // Cluster boost: repeated significant volume at same price
+                        if (isInCluster) {
+                            opacity = Math.min(opacity + BUBBLE_CONFIG.CLUSTER_OPACITY_BOOST, 0.95);
                         }
                     } else {
                         // Below threshold → faded background dot
@@ -394,6 +434,116 @@ class VolumeBubbleRenderer {
                         ctx.fillStyle = _rgba(BUBBLE_CONFIG.ABSORPTION_COLOR, 0.9);
                         ctx.fillText('ABS', b.x, b.y + b.radius + 8);
                     }
+                }
+            }
+
+            // ════════════════════════════════════════════════════════════════
+            // LAYER 6.5: CLUSTER DETECTION + VOLUME ACCELERATION
+            // ════════════════════════════════════════════════════════════════
+            if (!useDots) {
+                for (const priceStr of clusteredPrices) {
+                    const hits = clusterMap[priceStr];
+                    const price = parseFloat(priceStr);
+                    if (isNaN(price)) continue;
+                    const y = priceConverter(price);
+                    if (y === null || y === undefined || isNaN(y)) continue;
+
+                    // ── Acceleration analysis ──
+                    const vols = hits.map(h => h.total);
+                    const halfLen = Math.floor(vols.length / 2);
+                    const firstHalf = vols.slice(0, halfLen);
+                    const secondHalf = vols.slice(halfLen);
+                    const avgFirst = firstHalf.reduce((a, b) => a + b, 0) / (firstHalf.length || 1);
+                    const avgSecond = secondHalf.reduce((a, b) => a + b, 0) / (secondHalf.length || 1);
+                    const accelRatio = avgFirst > 0 ? avgSecond / avgFirst : 1;
+
+                    // Exhaustion check: one candle 3x+ the rest
+                    const maxV = Math.max(...vols);
+                    const othersAvg = vols.filter(v => v !== maxV);
+                    const avgOthers = othersAvg.length > 0
+                        ? othersAvg.reduce((a, b) => a + b, 0) / othersAvg.length : maxV;
+                    const isExhaustion = maxV >= avgOthers * BUBBLE_CONFIG.EXHAUST_SPIKE;
+
+                    // Classify acceleration state
+                    let accelState = 'stable';  // default
+                    if (isExhaustion) accelState = 'exhaustion';
+                    else if (accelRatio > BUBBLE_CONFIG.ACCEL_UP_THRESHOLD) accelState = 'accelerating';
+                    else if (accelRatio < BUBBLE_CONFIG.ACCEL_DOWN_THRESHOLD) accelState = 'decelerating';
+
+                    // ── Draw connecting line across all cluster hits ──
+                    const xStart = hits[0].x;
+                    const xEnd = hits[hits.length - 1].x;
+
+                    // Line color based on acceleration state
+                    let lineColor, lineAlpha;
+                    if (accelState === 'exhaustion') {
+                        lineColor = BUBBLE_CONFIG.EXHAUST_COLOR;
+                        lineAlpha = 0.7;
+                    } else if (accelState === 'accelerating') {
+                        lineColor = BUBBLE_CONFIG.ACCEL_COLOR;
+                        lineAlpha = 0.6;
+                    } else if (accelState === 'decelerating') {
+                        // Dominant side color but faded
+                        const totalBuy = hits.reduce((a, h) => a + h.buy, 0);
+                        const totalSell = hits.reduce((a, h) => a + h.sell, 0);
+                        lineColor = totalBuy >= totalSell
+                            ? BUBBLE_CONFIG.BUY_COLOR : BUBBLE_CONFIG.SELL_COLOR;
+                        lineAlpha = 0.15;  // very faded = dying
+                    } else {
+                        // Stable: dominant side color
+                        const totalBuy = hits.reduce((a, h) => a + h.buy, 0);
+                        const totalSell = hits.reduce((a, h) => a + h.sell, 0);
+                        lineColor = totalBuy >= totalSell
+                            ? BUBBLE_CONFIG.BUY_COLOR : BUBBLE_CONFIG.SELL_COLOR;
+                        lineAlpha = BUBBLE_CONFIG.CLUSTER_LINE_ALPHA;
+                    }
+
+                    // Draw the connecting line
+                    ctx.strokeStyle = _rgba(lineColor, lineAlpha);
+                    ctx.lineWidth = BUBBLE_CONFIG.CLUSTER_LINE_WIDTH;
+                    ctx.setLineDash([]);
+                    ctx.beginPath();
+                    ctx.moveTo(xStart, y);
+                    ctx.lineTo(xEnd, y);
+                    ctx.stroke();
+
+                    // Draw dots at each hit point
+                    for (const hit of hits) {
+                        ctx.fillStyle = _rgba(lineColor, lineAlpha + 0.15);
+                        ctx.beginPath();
+                        ctx.arc(hit.x, y, 2.5, 0, Math.PI * 2);
+                        ctx.fill();
+                    }
+
+                    // ── Badge: hit count + acceleration state ──
+                    const badgeX = xEnd + 6;
+                    ctx.font = BUBBLE_CONFIG.CLUSTER_BADGE_FONT;
+                    ctx.textAlign = 'left';
+                    ctx.textBaseline = 'middle';
+
+                    let badge = `${hits.length}×`;
+                    let badgeColor;
+                    if (accelState === 'exhaustion') {
+                        badge += ' ⚠';
+                        badgeColor = _rgba(BUBBLE_CONFIG.EXHAUST_COLOR, 0.9);
+                    } else if (accelState === 'accelerating') {
+                        badge += ' ↑';
+                        badgeColor = _rgba(BUBBLE_CONFIG.ACCEL_COLOR, 0.9);
+                    } else if (accelState === 'decelerating') {
+                        badge += ' ↓';
+                        badgeColor = _rgba(lineColor, 0.4);
+                    } else {
+                        badgeColor = _rgba(lineColor, 0.7);
+                    }
+
+                    // Badge shadow
+                    ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+                    ctx.fillText(badge, badgeX + 1, y + 1);
+                    // Badge text
+                    ctx.fillStyle = badgeColor;
+                    ctx.fillText(badge, badgeX, y);
+
+                    ctx.textAlign = 'center';  // reset
                 }
             }
 
