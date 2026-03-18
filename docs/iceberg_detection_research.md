@@ -1774,3 +1774,591 @@ and EVERY integration point needed to build the complete elite-level
 iceberg detection system. Nothing is missing.
 
 Build it exactly as specified above.
+
+---
+
+## APPENDIX A: MISSING SECTIONS (Gap Fixes)
+
+These sections fill gaps identified in the TOC that had no body content.
+
+---
+
+### A.1 DOM Cross-Validation — Edge Cases (was 2.5)
+
+```
+EDGE CASE 1: DOM update arrives LATE (stale snapshot)
+  Problem: DOM snapshot is 200ms old, trade happened 50ms ago.
+  The "after" snapshot may not yet reflect the refill.
+  
+  Solution: Allow a 1-snapshot grace period. If the current snapshot
+  doesn't show a refill, check the NEXT snapshot too. Store pending
+  validations:
+  
+  _DOM_PENDING_VALIDATION[symbol][price_str] = {
+      "trade_vol": volume,
+      "dom_before": dom_before,
+      "ts": timestamp,
+      "ttl": 2  # check next 2 DOM updates
+  }
+  
+  On each DOM update, resolve pending validations.
+
+EDGE CASE 2: Multiple trades at same price between DOM updates
+  Problem: 3 trades of 5 contracts each print at 25200 between
+  two DOM snapshots. Total fill = 15, but we only see one
+  "before→after" change.
+  
+  Solution: Aggregate fills between DOM updates:
+  
+  _DOM_FILLS_PENDING[symbol][price_str] += volume  # accumulate
+  
+  When DOM updates:
+    total_fills = _DOM_FILLS_PENDING[symbol][price_str]
+    expected = max(0, dom_before - total_fills)
+    refill = dom_after - expected
+    _DOM_FILLS_PENDING[symbol][price_str] = 0  # reset
+
+EDGE CASE 3: New limit orders from OTHER participants
+  Problem: Someone else places a new limit order at 25200 between
+  DOM snapshots. This looks like a "refill" but it is not the iceberg.
+  
+  Solution: Cross-reference with tape. If a refill is detected
+  but there was NOT a corresponding fill at that price in the same
+  window, it is a new order, not a refill. Only count refills that
+  occur WITHIN 500ms of a fill at the same price.
+
+EDGE CASE 4: Price level disappears entirely then reappears
+  Problem: dom_before = 15, trade fills all 15, dom_after = 0.
+  Next DOM update: dom = 12 (iceberg refilled after a gap).
+  
+  Solution: Track "recently emptied" levels:
+  
+  _DOM_RECENTLY_EMPTIED[symbol][price_str] = {
+      "ts": timestamp,
+      "last_fill_vol": volume,
+  }
+  
+  If a level reappears within 2 seconds of being emptied,
+  AND there was a fill at that price, count as iceberg refill.
+
+EDGE CASE 5: Partial fills (trade volume < showing size)
+  Problem: DOM shows 15, trade prints 3, DOM shows 12.
+  Expected: 15 - 3 = 12. Actual: 12. Refill = 0.
+  But the iceberg might have refilled 3 and then 3 more were taken.
+  
+  Solution: For partial fills, only flag as refill if
+  dom_after > expected_remaining by a meaningful amount (> 1 contract).
+  Don't flag partial fills where dom_after == expected as icebergs.
+```
+
+---
+
+### A.2 DOM Cross-Validation — Test Scenarios (was 2.9)
+
+```
+TEST 1: Basic iceberg (should CONFIRM)
+  Setup: DOM bid=20 at 25200
+  Action: Trade 15 at 25200
+  DOM after: bid=18 at 25200
+  Expected: refill = 18 - max(0, 20-15) = 18 - 5 = 13
+  Result: dom_confidence = "confirmed" (13/15 = 0.87 > 0.8) ✅
+
+TEST 2: Normal fill (should NOT confirm)
+  Setup: DOM bid=20 at 25200
+  Action: Trade 15 at 25200
+  DOM after: bid=5 at 25200
+  Expected: refill = 5 - max(0, 20-15) = 5 - 5 = 0
+  Result: dom_confidence = "unconfirmed" ✅
+
+TEST 3: Full consumption (should NOT confirm)
+  Setup: DOM bid=10 at 25200
+  Action: Trade 10 at 25200
+  DOM after: bid=0 at 25200
+  Expected: refill = 0 - max(0, 10-10) = 0 - 0 = 0
+  Result: dom_confidence = "unconfirmed" ✅
+
+TEST 4: Varying show size iceberg (should CONFIRM)
+  Setup: DOM bid=12 at 25200
+  Action: Trade 10 at 25200
+  DOM after: bid=8 at 25200
+  Expected: refill = 8 - max(0, 12-10) = 8 - 2 = 6
+  Result: dom_confidence = "likely" (6/10 = 0.6, > 0.3) ✅
+
+TEST 5: Small refill (should mark POSSIBLE)
+  Setup: DOM bid=20 at 25200
+  Action: Trade 15 at 25200
+  DOM after: bid=6 at 25200
+  Expected: refill = 6 - max(0, 20-15) = 6 - 5 = 1
+  Result: dom_confidence = "possible" (1/15 = 0.07, > 0.0) ✅
+
+TEST 6: New order from someone else (should handle)
+  Setup: DOM bid=20 at 25200
+  Action: NO trade at 25200 (trade was at 25199.75)
+  DOM after: bid=30 at 25200
+  Expected: No fill at this price → new limit order, NOT iceberg
+  Result: Skip validation (no fill to cross-reference) ✅
+
+TEST 7: Multiple fills between DOM updates
+  Setup: DOM bid=50 at 25200
+  Action: Trade 10 + Trade 8 + Trade 12 = 30 total at 25200
+  DOM after: bid=40 at 25200
+  Expected: refill = 40 - max(0, 50-30) = 40 - 20 = 20
+  Result: dom_confidence = "likely" (20/30 = 0.67) ✅
+```
+
+---
+
+### A.3 Inter-Fill Timing — Test Scenarios (was 3.6)
+
+```
+TEST 1: Perfect algo timing (should mark algo_confirmed)
+  Fills at: t=0, t=2.0, t=4.0, t=6.0, t=8.0
+  Gaps: [2.0, 2.0, 2.0, 2.0]
+  Gap CV: 0 / 2.0 = 0.0
+  Result: timing = "algo_confirmed" ✅
+
+TEST 2: Realistic algo with jitter (should mark algo_confirmed)
+  Fills at: t=0, t=1.8, t=3.5, t=5.2, t=7.1, t=8.9
+  Gaps: [1.8, 1.7, 1.7, 1.9, 1.8]
+  Mean: 1.78, Stddev: 0.07
+  Gap CV: 0.07 / 1.78 = 0.039
+  Result: timing = "algo_confirmed" ✅
+
+TEST 3: Random fills (should mark random)
+  Fills at: t=0, t=0.05, t=12.3, t=12.4, t=58.1
+  Gaps: [0.05, 12.25, 0.1, 45.7]
+  Mean: 14.53, Stddev: 19.2
+  Gap CV: 19.2 / 14.53 = 1.32
+  Result: timing = "random" ✅
+
+TEST 4: Mixed timing (should mark mixed)
+  Fills at: t=0, t=1.5, t=5.0, t=6.2, t=8.0
+  Gaps: [1.5, 3.5, 1.2, 1.8]
+  Mean: 2.0, Stddev: 0.93
+  Gap CV: 0.93 / 2.0 = 0.465
+  Result: timing = "mixed" (between 0.3 and 0.6... wait, 0.465 < 0.6)
+  Actually: timing = "algo_likely" ✅
+
+TEST 5: Only 2 fills (insufficient data)
+  Fills at: t=0, t=3.0
+  Gaps: [3.0]
+  Result: timing = "insufficient" (need >= 3 fills) ✅
+```
+
+---
+
+### A.4 Completion Countdown — Wall Gone Detection (was missing from 4.3)
+
+```python
+# ── Wall Gone Detection State ──
+# {symbol: {price_str: {"last_refill_ts": float, "was_active": bool}}}
+_ICE_WALL_STATE: dict = defaultdict(lambda: defaultdict(lambda: {
+    "last_refill_ts": 0, "was_active": False, "gone_announced": False
+}))
+
+_ICE_GONE_TIMEOUT = 3.0  # seconds without refill = wall gone
+
+def _check_wall_gone(symbol, current_ts):
+    """Check if any active icebergs have stopped refilling."""
+    alerts = []
+    
+    for price_str, state in _ICE_WALL_STATE[symbol].items():
+        if not state["was_active"]:
+            continue
+        
+        time_since_refill = current_ts - state["last_refill_ts"]
+        
+        if time_since_refill >= _ICE_GONE_TIMEOUT and not state["gone_announced"]:
+            state["gone_announced"] = True
+            state["was_active"] = False
+            
+            alerts.append({
+                "type": "wall_gone",
+                "price": price_str,
+                "ts": current_ts,
+                "message": f"WALL GONE at {price_str} — no refill for {_ICE_GONE_TIMEOUT}s",
+                "signal": "entry_trigger",  # this is when you enter the trade
+            })
+    
+    return alerts
+
+def _update_wall_state(symbol, price_str, timestamp):
+    """Called whenever an iceberg fill is detected."""
+    state = _ICE_WALL_STATE[symbol][price_str]
+    state["last_refill_ts"] = timestamp
+    state["was_active"] = True
+    state["gone_announced"] = False
+```
+
+Frontend rendering for "WALL GONE":
+```javascript
+// When wall_gone alert received:
+if (ice.state === 'gone') {
+    // Green checkmark badge
+    ctx.font = BUBBLE_CONFIG.FONT_BADGE;
+    ctx.fillStyle = '#00e676';
+    ctx.fillText('WALL GONE ✅', x, y + ds + 8);
+    
+    // Flash effect: bright pulse for 5 seconds then fade out
+    const timeSinceGone = (performance.now() - ice.gone_ts) / 1000;
+    if (timeSinceGone < 5) {
+        const flashAlpha = 0.8 * (1 - timeSinceGone / 5);
+        const flashGrad = ctx.createRadialGradient(x, y, 0, x, y, ds * 3);
+        flashGrad.addColorStop(0, `rgba(0, 230, 118, ${flashAlpha})`);
+        flashGrad.addColorStop(1, 'rgba(0,0,0,0)');
+        ctx.fillStyle = flashGrad;
+        ctx.beginPath();
+        ctx.arc(x, y, ds * 3, 0, Math.PI * 2);
+        ctx.fill();
+    }
+}
+```
+
+---
+
+### A.5 Drifting Iceberg — Frontend Band Overlay (was 5.7)
+
+```javascript
+// ════════════════════════════════════════════════════════════════
+// DRIFTING ICEBERG: Draw band overlay on chart
+// ════════════════════════════════════════════════════════════════
+
+function drawDriftingIceberg(ctx, drift, priceToY, chartWidth) {
+    if (!drift || drift.type !== 'drifting') return;
+    
+    const yTop = priceToY(drift.band_high);
+    const yBottom = priceToY(drift.band_low);
+    const bandHeight = yBottom - yTop;
+    
+    // Side color: green for buy, red for sell
+    const baseColor = drift.side === 'b'
+        ? [0, 230, 118]    // green
+        : [255, 23, 68];   // red
+    
+    // Semi-transparent band across the full chart width
+    const alpha = drift.drift_confidence === 'confirmed' ? 0.12
+        : drift.drift_confidence === 'likely' ? 0.08
+        : 0.04;
+    
+    ctx.fillStyle = `rgba(${baseColor.join(',')}, ${alpha})`;
+    ctx.fillRect(0, yTop, chartWidth, bandHeight);
+    
+    // Dashed border on top and bottom of band
+    ctx.strokeStyle = `rgba(${baseColor.join(',')}, ${alpha * 3})`;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([6, 3]);
+    ctx.beginPath();
+    ctx.moveTo(0, yTop);
+    ctx.lineTo(chartWidth, yTop);
+    ctx.moveTo(0, yBottom);
+    ctx.lineTo(chartWidth, yBottom);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    
+    // Label at right edge of band
+    const labelY = yTop + bandHeight / 2;
+    ctx.font = '10px monospace';
+    ctx.textAlign = 'right';
+    ctx.fillStyle = `rgba(${baseColor.join(',')}, 0.9)`;
+    
+    const sideLabel = drift.side === 'b' ? 'STEALTH BUY' : 'STEALTH SELL';
+    const confLabel = drift.drift_confidence === 'confirmed' ? '✓✓'
+        : drift.drift_confidence === 'likely' ? '✓' : '?';
+    
+    ctx.fillText(
+        `${sideLabel} ${confLabel} | ${drift.fills} fills @ ${drift.prices_hit} prices | ~${drift.total_vol} vol`,
+        chartWidth - 10,
+        labelY
+    );
+    
+    // Draw small dots at each fill price within the band
+    if (drift.fill_prices) {
+        for (const fp of drift.fill_prices) {
+            const dotY = priceToY(fp.price);
+            ctx.fillStyle = `rgba(${baseColor.join(',')}, 0.6)`;
+            ctx.beginPath();
+            ctx.arc(chartWidth - 20, dotY, 2, 0, Math.PI * 2);
+            ctx.fill();
+        }
+    }
+    
+    ctx.textAlign = 'center';  // reset
+}
+```
+
+Visual result:
+```
+Chart with drifting iceberg band:
+
+  25205 ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─   (dashed border)
+  █████████████████████████████████████████████   
+  ██ translucent green band across full width ██  STEALTH BUY ✓✓ | 6 fills @ 5 prices | ~60 vol
+  █████████████████████████████████████████████   
+  25195 ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─   (dashed border)
+  
+  Small dots at each fill price within the band.
+  Band opacity increases with confidence level.
+```
+
+---
+
+### A.6 Level Memory — Session Persistence (was 6.7)
+
+```python
+import json
+import os
+
+_ICE_LEVEL_FILE = "data/ice_level_memory.json"
+
+def _save_level_memory():
+    """Save level memory to disk for cross-session persistence."""
+    data = {}
+    for symbol, levels in _ICE_LEVEL_MEMORY.items():
+        data[symbol] = {}
+        for price_str, mem in levels.items():
+            data[symbol][price_str] = {
+                "count": mem["count"],
+                "total_vol": mem["total_vol"],
+                "last_side": mem["last_side"],
+                "last_ts": mem["last_ts"],
+                "avg_size": mem["avg_size"],
+            }
+    
+    os.makedirs(os.path.dirname(_ICE_LEVEL_FILE), exist_ok=True)
+    with open(_ICE_LEVEL_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def _load_level_memory():
+    """Load level memory from disk on startup."""
+    if not os.path.exists(_ICE_LEVEL_FILE):
+        return
+    
+    try:
+        with open(_ICE_LEVEL_FILE, "r") as f:
+            data = json.load(f)
+        
+        for symbol, levels in data.items():
+            for price_str, mem in levels.items():
+                _ICE_LEVEL_MEMORY[symbol][price_str].update(mem)
+        
+        print(f"[ICE] Loaded level memory: {sum(len(v) for v in data.values())} levels")
+    except Exception as e:
+        print(f"[ICE] Failed to load level memory: {e}")
+
+# Save every 5 minutes (called from main loop cleanup)
+_LEVEL_MEMORY_LAST_SAVE = 0
+_LEVEL_MEMORY_SAVE_INTERVAL = 300  # 5 minutes
+
+def _maybe_save_level_memory(current_ts):
+    global _LEVEL_MEMORY_LAST_SAVE
+    if current_ts - _LEVEL_MEMORY_LAST_SAVE >= _LEVEL_MEMORY_SAVE_INTERVAL:
+        _save_level_memory()
+        _LEVEL_MEMORY_LAST_SAVE = current_ts
+```
+
+Startup integration:
+```python
+# In the worker startup / initialization:
+_load_level_memory()  # restore from last session
+```
+
+File format (data/ice_level_memory.json):
+```json
+{
+  "NQ": {
+    "25200.00": {
+      "count": 7,
+      "total_vol": 2450,
+      "last_side": "b",
+      "last_ts": 1710732000.0,
+      "avg_size": 350.0
+    },
+    "25250.00": {
+      "count": 3,
+      "total_vol": 2400,
+      "last_side": "s",
+      "last_ts": 1710731500.0,
+      "avg_size": 800.0
+    }
+  }
+}
+```
+
+---
+
+### A.7 Post-Iceberg Prediction — Minimum Sample Size (was 7.7)
+
+```
+MINIMUM SAMPLE SIZE RULES:
+
+The prediction system requires a minimum number of completed outcomes
+before it starts showing predictions. This prevents misleading statistics
+from tiny sample sizes.
+
+Thresholds:
+  n < 5     → No prediction shown at all
+                "Insufficient data" — badge is blank
+  
+  n = 5-9   → Show prediction with LOW confidence warning
+                Badge: "+4.2 / 72% (n=7) ⚠️"
+                The ⚠️ warns trader that sample is small
+  
+  n = 10-19 → Show prediction with MEDIUM confidence  
+                Badge: "+5.8 / 81% (n=14)"
+                No warning, but no "reliable" label either
+  
+  n >= 20   → Show prediction with HIGH confidence
+                Badge: "+6.2 / 85% (n=23) ✓"
+                The ✓ indicates statistically meaningful sample
+
+Statistical note:
+  With n=5, a 100% win rate could easily be luck (p=0.03 one-tail).
+  With n=20, an 85% win rate is statistically significant (p<0.001).
+  We use n=20 as the threshold for "reliable" because:
+    - Binomial test: 85% win rate at n=20 → p=0.0002 (very unlikely by chance)
+    - Provides enough data to see both winning and losing scenarios
+    - Balances speed (don't wait too long) with reliability
+
+Code:
+```python
+def _get_prediction(symbol, side):
+    outcomes = [o for o in _ICE_OUTCOMES[symbol] if o["side"] == side]
+    
+    if len(outcomes) < 5:
+        return None  # not enough data, show nothing
+    
+    moves_30s = [o["outcome_30s"] for o in outcomes
+                 if o["outcome_30s"] is not None]
+    
+    if not moves_30s:
+        return None
+    
+    avg_move = sum(moves_30s) / len(moves_30s)
+    wins = sum(1 for m in moves_30s if m > 0)
+    win_rate = wins / len(moves_30s)
+    n = len(moves_30s)
+    
+    # Confidence tier
+    if n >= 20:
+        pred_confidence = "high"
+    elif n >= 10:
+        pred_confidence = "medium"
+    else:
+        pred_confidence = "low"
+    
+    return {
+        "avg_move_30s": round(avg_move, 2),
+        "win_rate": round(win_rate * 100, 1),
+        "sample_size": n,
+        "pred_confidence": pred_confidence,
+        "best": round(max(moves_30s), 2),
+        "worst": round(min(moves_30s), 2),
+        "median": round(sorted(moves_30s)[n // 2], 2),
+    }
+```
+
+Frontend badge rendering:
+```javascript
+if (ice.prediction) {
+    const pred = ice.prediction;
+    const sign = pred.avg_move_30s >= 0 ? '+' : '';
+    let predText = `${sign}${pred.avg_move_30s} / ${pred.win_rate}% (n=${pred.sample_size})`;
+    
+    // Add confidence indicator
+    if (pred.pred_confidence === 'high') {
+        predText += ' ✓';
+    } else if (pred.pred_confidence === 'low') {
+        predText += ' ⚠️';
+    }
+    
+    ctx.font = '8px monospace';
+    ctx.fillStyle = pred.win_rate > 65
+        ? '#00e676'   // green = profitable
+        : pred.win_rate > 50
+        ? '#ffab00'   // yellow = marginal
+        : '#ff1744';  // red = losing (should stop trading this pattern)
+    ctx.fillText(predText, x, y + ds + 30);
+}
+```
+
+---
+
+### A.8 Opposition Volume / Absorption Ratio (was missing from Part 1)
+
+These fields are in the v3 return dict but were not documented in Part 1:
+
+```
+OPPOSITION VOLUME:
+  The total volume that traded AGAINST the iceberg during the window.
+  If the iceberg is buying (side="b"), opposition_vol = total sell volume
+  at or near the iceberg price during the same window.
+
+MATH:
+  opposition_vol = sum of all trades on the OPPOSITE side within
+                   the iceberg's zone during the detection window
+  
+  For a buy iceberg at 25200 (zone: 25199.50-25200.50):
+    All sells in zone during window: [5, 8, 12, 3, 7] = 35
+    opposition_vol = 35
+
+ABSORPTION RATIO:
+  How much of the opposing flow the iceberg has absorbed.
+  
+  absorption_ratio = opposition_vol / max(visible_total, 1)
+  
+  Example:
+    visible_total = 44 (what the iceberg has bought)
+    opposition_vol = 35 (what sellers threw at it)
+    absorption_ratio = 35 / 44 = 0.80
+    
+    80% = the iceberg absorbed most of the selling pressure
+    If absorption_ratio > 1.0 → more opposition than iceberg fills
+                                 (wall may be overwhelmed)
+
+USAGE IN PRESSURE SIGNAL:
+  absorption_ratio < 0.5  → iceberg easily absorbing (low opposition)
+  absorption_ratio 0.5-1.0 → iceberg being tested (moderate opposition)
+  absorption_ratio > 1.0  → iceberg being overwhelmed (may break)
+
+CODE:
+```python
+# Collect opposition trades during iceberg window
+opp_side = "s" if fill_sides[0] == "b" else "b"
+opposition_vol = 0
+
+for offset in range(-_ICE_ZONE_TICKS, _ICE_ZONE_TICKS + 1):
+    adj_price = round(price_f + offset * tick_size, 2)
+    adj_key = str(adj_price)
+    adj_fills = _ICE_TRACKER[symbol].get(adj_key, [])
+    for ts, vol, s in adj_fills:
+        if s == opp_side and ts >= window_cutoff:
+            opposition_vol += vol
+
+absorption_ratio = opposition_vol / max(visible_total, 1)
+```
+
+Added to return dict:
+```python
+return {
+    ...
+    "opposition_vol": opposition_vol,
+    "absorption_ratio": round(absorption_ratio, 2),
+    ...
+}
+```
+
+---
+
+## END OF APPENDIX — ALL 7 GAPS FILLED
+
+Summary of additions:
+  A.1: DOM edge cases (stale snapshots, multiple fills, new orders, empty→reappear, partial fills)
+  A.2: DOM test scenarios (7 test cases with expected inputs/outputs)
+  A.3: Inter-fill timing test scenarios (5 test cases)
+  A.4: Wall Gone detection (state machine + frontend flash)
+  A.5: Drifting iceberg frontend band overlay (full JavaScript rendering)
+  A.6: Level memory session persistence (JSON save/load + auto-save every 5 min)
+  A.7: Post-iceberg prediction minimum sample size (statistical justification + tiered confidence)
+  A.8: Opposition volume and absorption ratio (full math + code)
+
+Total document is now complete. Zero gaps remaining.
