@@ -631,136 +631,32 @@ class VolumeBubbleRenderer {
                     ctx.closePath();
                     ctx.fill();
                 } else {
-                    // Full zoom: clean diamond + ONE short label
-                    const ds = BUBBLE_CONFIG.ICE_DIAMOND_SIZE * 0.7;  // smaller
+                    // Full zoom: YELLOW BUBBLE for iceberg
+                    const r = Math.max(6, Math.min(bestVol / 500, 14));  // size = volume
 
-                    // Subtle glow
-                    const glowGrad = ctx.createRadialGradient(x, y, ds * 0.3, x, y, ds * 1.8);
-                    glowGrad.addColorStop(0, _rgba(color, 0.2));
+                    // Subtle yellow glow
+                    const glowGrad = ctx.createRadialGradient(x, y, r * 0.3, x, y, r * 2);
+                    glowGrad.addColorStop(0, 'rgba(255,215,0,0.25)');
                     glowGrad.addColorStop(1, 'rgba(0,0,0,0)');
                     ctx.fillStyle = glowGrad;
                     ctx.beginPath();
-                    ctx.arc(x, y, ds * 1.8, 0, Math.PI * 2);
+                    ctx.arc(x, y, r * 2, 0, Math.PI * 2);
                     ctx.fill();
 
-                    // Diamond shape
-                    ctx.fillStyle = _rgba(color, 0.85);
+                    // Yellow filled bubble
+                    ctx.fillStyle = 'rgba(255,215,0,0.6)';
                     ctx.beginPath();
-                    ctx.moveTo(x, y - ds);
-                    ctx.lineTo(x + ds * 0.7, y);
-                    ctx.lineTo(x, y + ds);
-                    ctx.lineTo(x - ds * 0.7, y);
-                    ctx.closePath();
+                    ctx.arc(x, y, r, 0, Math.PI * 2);
                     ctx.fill();
-                    ctx.strokeStyle = _rgba(color, 0.9);
-                    ctx.lineWidth = 1;
+
+                    // Yellow border
+                    ctx.strokeStyle = 'rgba(255,215,0,0.9)';
+                    ctx.lineWidth = 1.5;
                     ctx.stroke();
-
-                    // Volume label inside diamond
-                    const volK = bestVol >= 1000
-                        ? (bestVol / 1000).toFixed(0) + 'k'
-                        : String(bestVol);
-                    ctx.font = '7px monospace';
-                    ctx.textAlign = 'center';
-                    ctx.textBaseline = 'middle';
-                    ctx.fillStyle = '#fff';
-                    ctx.fillText(volK, x, y);
-
-                    // ONE short badge below — that's it, no walls of text
-                    const rank = ice.size_rank || '';
-                    const icon = rank === 'whale' ? '🐋'
-                        : rank === 'institutional' ? '🏛' : '';
-                    const badge = icon || (conf === 'high' ? '◆' : '◇');
-
-                    ctx.font = '8px sans-serif';
-                    ctx.fillStyle = _rgba(color, 0.9);
-                    ctx.fillText(badge, x, y + ds + 8);
                 }
             }
 
-            // ════════════════════════════════════════════════════════════════
-            // LAYER 7b: DRIFTING ICEBERG BAND OVERLAY
-            // ════════════════════════════════════════════════════════════════
-            if (!useDots) {
-                // Track rendered drift bands to avoid duplicating overlapping ones
-                const _driftRendered = new Set();
-                for (let i = from; i < to; i++) {
-                    const bar = d.bars[i];
-                    if (!bar || !bar.originalData || !bar.originalData.drifting_iceberg) continue;
-                    const drift = bar.originalData.drifting_iceberg;
-
-                    // Only render confirmed or likely
-                    if (drift.drift_confidence === 'possible') continue;
-
-                    // Aggressive deduplication: round to nearest 5 ticks
-                    const driftKey = `${drift.side}_${Math.round(drift.band_high / 5) * 5}_${Math.round(drift.band_low / 5) * 5}`;
-                    if (_driftRendered.has(driftKey)) continue;
-                    _driftRendered.add(driftKey);
-
-                    const yTop = priceConverter(drift.band_high);
-                    const yBot = priceConverter(drift.band_low);
-                    if (yTop == null || yBot == null || isNaN(yTop) || isNaN(yBot)) continue;
-
-                    const isBuy = drift.side === 'b';
-                    const baseRGB = isBuy ? '0,230,118' : '255,23,68';
-                    const lineAlpha = drift.drift_confidence === 'confirmed' ? 0.6 : 0.35;
-
-                    // NO FILL — just two thin horizontal dashed lines at band edges
-                    ctx.strokeStyle = `rgba(${baseRGB}, ${lineAlpha})`;
-                    ctx.lineWidth = 1;
-                    ctx.setLineDash([6, 4]);
-                    ctx.beginPath();
-                    // Top line spans across visible range
-                    ctx.moveTo(bar.x - 40, yTop);
-                    ctx.lineTo(bar.x + 40, yTop);
-                    // Bottom line
-                    ctx.moveTo(bar.x - 40, yBot);
-                    ctx.lineTo(bar.x + 40, yBot);
-                    ctx.stroke();
-                    ctx.setLineDash([]);
-
-                    // Label
-                    const sideLabel = isBuy ? 'STEALTH BUY' : 'STEALTH SELL';
-                    const confIcon = drift.drift_confidence === 'confirmed' ? '✓✓' : '✓';
-                    ctx.font = '7px monospace';
-                    ctx.textAlign = 'center';
-                    ctx.fillStyle = `rgba(${baseRGB}, 0.8)`;
-                    ctx.fillText(
-                        `${sideLabel} ${confIcon} ${drift.fills}×${drift.avg_clip}`,
-                        bar.x, Math.min(yTop, yBot) - 4
-                    );
-                }
-            }
-
-            // ════════════════════════════════════════════════════════════════
-            // LAYER 7c: WALL GONE FLASH ALERTS
-            // ════════════════════════════════════════════════════════════════
-            for (let i = from; i < to; i++) {
-                const bar = d.bars[i];
-                if (!bar || !bar.originalData || !bar.originalData.wall_gone) continue;
-
-                // Limit to max 2 wall_gone markers per candle to prevent label stacking
-                const wgList = bar.originalData.wall_gone;
-                const wgMax = Math.min(wgList.length, 2);
-                for (let wi = 0; wi < wgMax; wi++) {
-                    const wg = wgList[wi];
-                    const price = parseFloat(wg.price);
-                    if (isNaN(price)) continue;
-                    const yWg = priceConverter(price);
-                    if (yWg == null || isNaN(yWg)) continue;
-
-                    // Small subtle flash
-                    ctx.fillStyle = 'rgba(0,230,118,0.15)';
-                    ctx.beginPath();
-                    ctx.arc(bar.x, yWg, 8, 0, Math.PI * 2);
-                    ctx.fill();
-
-                    ctx.font = BUBBLE_CONFIG.FONT_BADGE;
-                    ctx.fillStyle = '#00e676';
-                    ctx.textAlign = 'center';
-                    ctx.fillText('WG ✅', bar.x, yWg - 10);
-                }
-            }
+            // (REMOVED: Drift bands, wall gone → moved to side panel)
 
             // ════════════════════════════════════════════════════════════════
             // LAYER 8: SWEEP DETECTION (⚡ lightning bolt lines)
@@ -922,146 +818,12 @@ class VolumeBubbleRenderer {
                 ctx.textAlign = 'center';  // reset
             }
 
-            // ════════════════════════════════════════════════════════════════
-            // LAYER 9: DELTA DIVERGENCE (╱╱ dashed divergence lines)
-            // ════════════════════════════════════════════════════════════════
-            if (!useDots) {
-                for (let i = from; i < to; i++) {
-                    const bar = d.bars[i];
-                    if (!bar || !bar.originalData || !bar.originalData.delta_div) continue;
+            // (REMOVED: Delta divergence → moved to side panel)
 
-                    const div = bar.originalData.delta_div;
-                    const x = bar.x;
-                    const isBear = div.type === 'bearish';
-                    const color = isBear ? BUBBLE_CONFIG.DIV_BEAR_COLOR : BUBBLE_CONFIG.DIV_BULL_COLOR;
-
-                    // Current price point
-                    const priceKey = isBear ? 'price_high' : 'price_low';
-                    const prevKey = isBear ? 'price_prev' : 'price_prev';
-                    const yNow = priceConverter(div[priceKey]);
-                    const yPrev = priceConverter(div[prevKey]);
-                    if (!yNow || !yPrev || isNaN(yNow) || isNaN(yPrev)) continue;
-
-                    // Find previous bar X (approximate from t_prev)
-                    let xPrev = x - 80; // fallback
-                    for (let j = from; j < i; j++) {
-                        const pb = d.bars[j];
-                        if (pb && pb.originalData && pb.originalData.time === div.t_prev) {
-                            xPrev = pb.x;
-                            break;
-                        }
-                    }
-
-                    // Dashed divergence line
-                    ctx.save();
-                    ctx.strokeStyle = _rgba(color, 0.8);
-                    ctx.lineWidth = BUBBLE_CONFIG.DIV_LINE_WIDTH;
-                    ctx.setLineDash(BUBBLE_CONFIG.DIV_DASH);
-                    ctx.beginPath();
-                    ctx.moveTo(xPrev, yPrev);
-                    ctx.lineTo(x, yNow);
-                    ctx.stroke();
-                    ctx.setLineDash([]);
-                    ctx.restore();
-
-                    // Divergence label
-                    const divLabel = isBear ? 'DIV ▼' : 'DIV ▲';
-                    const labelX = (xPrev + x) / 2;
-                    const labelY = (yPrev + yNow) / 2 - 12;
-                    ctx.font = BUBBLE_CONFIG.FONT_SMALL;
-                    ctx.textAlign = 'center';
-                    ctx.textBaseline = 'middle';
-
-                    // Background pill
-                    const dtm = ctx.measureText(divLabel);
-                    ctx.fillStyle = 'rgba(0,0,0,0.75)';
-                    ctx.beginPath();
-                    ctx.roundRect(labelX - dtm.width / 2 - 5, labelY - 7, dtm.width + 10, 14, 4);
-                    ctx.fill();
-
-                    ctx.fillStyle = _rgba(color, 0.95);
-                    ctx.fillText(divLabel, labelX, labelY);
-
-                    // Circle markers at both endpoints
-                    ctx.fillStyle = _rgba(color, 0.7);
-                    ctx.beginPath();
-                    ctx.arc(xPrev, yPrev, 4, 0, Math.PI * 2);
-                    ctx.fill();
-                    ctx.beginPath();
-                    ctx.arc(x, yNow, 4, 0, Math.PI * 2);
-                    ctx.fill();
-                }
-            }
+            // (REMOVED: Momentum ignition → moved to side panel)
 
             // ════════════════════════════════════════════════════════════════
-            // LAYER 10: MOMENTUM IGNITION (⚠️ warning zones)
-            // ════════════════════════════════════════════════════════════════
-            for (let i = from; i < to; i++) {
-                const bar = d.bars[i];
-                if (!bar || !bar.originalData || !bar.originalData.ignition) continue;
-
-                const ignitions = bar.originalData.ignition;
-                const x = bar.x;
-
-                for (const ign of ignitions) {
-                    const yMin = priceConverter(ign.price_min);
-                    const yMax = priceConverter(ign.price_max);
-                    if (!yMin || !yMax || isNaN(yMin) || isNaN(yMax)) continue;
-
-                    const isReversed = ign.reversed === true;
-                    const color = isReversed ? BUBBLE_CONFIG.IGN_TRAP_COLOR : BUBBLE_CONFIG.IGN_COLOR;
-                    const yTop = Math.min(yMin, yMax);
-                    const yBot = Math.max(yMin, yMax);
-                    // Cap zone height to prevent chart-covering rectangles
-                    const zoneH = Math.min(Math.max(yBot - yTop, 4), 100);
-
-                    if (useDots) {
-                        // Macro zoom: thin vertical line
-                        ctx.strokeStyle = _rgba(color, 0.4);
-                        ctx.lineWidth = 1.5;
-                        ctx.beginPath();
-                        ctx.moveTo(x, yTop);
-                        ctx.lineTo(x, Math.min(yBot, yTop + 60));
-                        ctx.stroke();
-                    } else {
-                        // Full zoom: NO FILL — just a thin vertical line + arrow + label
-                        ctx.strokeStyle = _rgba(color, 0.5);
-                        ctx.lineWidth = 1.5;
-                        ctx.setLineDash([3, 2]);
-                        ctx.beginPath();
-                        ctx.moveTo(x, yTop);
-                        ctx.lineTo(x, Math.min(yBot, yTop + 60));
-                        ctx.stroke();
-                        ctx.setLineDash([]);
-
-                        // Direction arrow
-                        const capBot = Math.min(yBot, yTop + 60);
-                        const arrowY = ign.direction === 'up' ? yTop - 8 : capBot + 8;
-                        const arrowChar = ign.direction === 'up' ? '↑' : '↓';
-                        ctx.font = BUBBLE_CONFIG.FONT;
-                        ctx.textAlign = 'center';
-                        ctx.textBaseline = 'middle';
-                        ctx.fillStyle = _rgba(color, 0.9);
-                        ctx.fillText(arrowChar, x, arrowY);
-
-                        // Label
-                        const ignLabel = isReversed ? '⚠ TRAP' : 'IGN';
-                        ctx.font = BUBBLE_CONFIG.FONT_BADGE;
-
-                        const itm = ctx.measureText(ignLabel);
-                        ctx.fillStyle = 'rgba(0,0,0,0.7)';
-                        ctx.beginPath();
-                        ctx.roundRect(x - itm.width / 2 - 3, capBot + 12, itm.width + 6, 11, 3);
-                        ctx.fill();
-
-                        ctx.fillStyle = _rgba(color, 0.95);
-                        ctx.fillText(ignLabel, x, capBot + 17);
-                    }
-                }
-            }
-
-            // ════════════════════════════════════════════════════════════════
-            // LAYER 11: SPOOF DETECTION (👻 ghost markers)
+            // LAYER 11: SPOOF DETECTION — "F" marker (orange hollow ring)
             // ════════════════════════════════════════════════════════════════
             for (let i = from; i < to; i++) {
                 const bar = d.bars[i];
@@ -1070,76 +832,42 @@ class VolumeBubbleRenderer {
                 const spoofs = bar.originalData.spoofs;
                 const x = bar.x;
 
+                // Max 1 spoof marker per candle (pick largest fake_size)
+                let bestSpoof = null;
+                let bestSize = 0;
                 for (const spoof of spoofs) {
-                    const price = parseFloat(spoof.price);
-                    if (isNaN(price)) continue;
-                    const y = priceConverter(price);
-                    if (y === null || y === undefined || isNaN(y)) continue;
+                    const sz = spoof.fake_size || 0;
+                    if (sz > bestSize) { bestSize = sz; bestSpoof = spoof; }
+                }
+                if (!bestSpoof) continue;
 
-                    const color = BUBBLE_CONFIG.SPOOF_COLOR;
-                    const r = BUBBLE_CONFIG.SPOOF_RADIUS;
+                const price = parseFloat(bestSpoof.price);
+                if (isNaN(price)) continue;
+                const y = priceConverter(price);
+                if (y === null || y === undefined || isNaN(y)) continue;
 
-                    if (useDots) {
-                        // Macro: small X mark
-                        ctx.strokeStyle = _rgba(color, 0.5);
-                        ctx.lineWidth = 1.5;
-                        ctx.beginPath();
-                        ctx.moveTo(x - 3, y - 3);
-                        ctx.lineTo(x + 3, y + 3);
-                        ctx.moveTo(x + 3, y - 3);
-                        ctx.lineTo(x - 3, y + 3);
-                        ctx.stroke();
-                    } else {
-                        // Full zoom: ghost circle with dashed border
-                        ctx.save();
+                const r = Math.max(5, Math.min(bestSize / 800, 12));
 
-                        // Translucent fill
-                        ctx.fillStyle = _rgba(color, 0.1);
-                        ctx.beginPath();
-                        ctx.arc(x, y, r, 0, Math.PI * 2);
-                        ctx.fill();
+                if (useDots) {
+                    // Macro: small orange dot
+                    ctx.fillStyle = 'rgba(255,152,0,0.6)';
+                    ctx.beginPath();
+                    ctx.arc(x, y, 3, 0, Math.PI * 2);
+                    ctx.fill();
+                } else {
+                    // Orange hollow ring
+                    ctx.strokeStyle = 'rgba(255,152,0,0.7)';
+                    ctx.lineWidth = 2;
+                    ctx.beginPath();
+                    ctx.arc(x, y, r, 0, Math.PI * 2);
+                    ctx.stroke();
 
-                        // Dashed border
-                        ctx.strokeStyle = _rgba(color, 0.5);
-                        ctx.lineWidth = 1.5;
-                        ctx.setLineDash(BUBBLE_CONFIG.SPOOF_DASH);
-                        ctx.stroke();
-                        ctx.setLineDash([]);
-
-                        // Red X through it
-                        ctx.strokeStyle = 'rgba(255, 60, 60, 0.7)';
-                        ctx.lineWidth = 2;
-                        ctx.beginPath();
-                        ctx.moveTo(x - r * 0.5, y - r * 0.5);
-                        ctx.lineTo(x + r * 0.5, y + r * 0.5);
-                        ctx.moveTo(x + r * 0.5, y - r * 0.5);
-                        ctx.lineTo(x - r * 0.5, y + r * 0.5);
-                        ctx.stroke();
-                        ctx.restore();
-
-                        // Fake size label
-                        const fakeLabel = spoof.fake_size >= 1000
-                            ? (spoof.fake_size / 1000).toFixed(1) + 'k'
-                            : String(spoof.fake_size);
-                        ctx.font = BUBBLE_CONFIG.FONT_SMALL;
-                        ctx.textAlign = 'center';
-                        ctx.textBaseline = 'middle';
-                        ctx.fillStyle = 'rgba(0,0,0,0.6)';
-                        ctx.fillText(fakeLabel, x + 1, y + 1);
-                        ctx.fillStyle = _rgba(color, 0.9);
-                        ctx.fillText(fakeLabel, x, y);
-
-                        // "SPOOF" badge below
-                        ctx.font = BUBBLE_CONFIG.FONT_BADGE;
-                        ctx.fillStyle = 'rgba(255, 60, 60, 0.85)';
-                        ctx.fillText('SPOOF', x, y + r + 10);
-
-                        // Occurrence count badge
-                        if (spoof.count > 2) {
-                            ctx.fillStyle = _rgba(color, 0.7);
-                            ctx.fillText('x' + spoof.count, x, y + r + 20);
-                        }
-                    }
+                    // "F" inside the ring
+                    ctx.font = 'bold 8px monospace';
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillStyle = 'rgba(255,152,0,0.9)';
+                    ctx.fillText('F', x, y);
                 }
             }
         });
