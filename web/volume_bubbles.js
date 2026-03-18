@@ -161,6 +161,9 @@ class VolumeBubbleRenderer {
         const d = this._data;
         if (!d || !d.bars || d.bars.length === 0) return;
 
+        // ═══ CLEAN SLATE: all overlays disabled — just candlesticks ═══
+        return;
+
         const barSpacing = d.barSpacing || 6;
 
         // ── Bird's eye: skip rendering entirely ──
