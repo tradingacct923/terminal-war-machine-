@@ -315,10 +315,10 @@ class VolumeBubbleRenderer {
                         : (totalVol > 0 ? 1 : 0);
 
                     // ═══ HARD CUTOFF: conviction-based filtering ═══
-                    // Absorption (both sides fighting) = most tradeable → lower bar at 1.0σ
+                    // Absorption (both sides fighting) = most tradeable → ratio is the signal, not size
                     // Aggressive (one-sided) = needs 1.5σ + 70% dominance
                     if (isAbsorb) {
-                        if (sigmaDistance < 1.0) continue;  // absorption at 1.0σ+
+                        if (sigmaDistance < 0.5) continue;  // absorption at 0.5σ+ (battle matters, not size)
                     } else {
                         if (sigmaDistance < 1.5) continue;  // hard cutoff: no noise
                         if (dominance < 0.70) continue;     // need conviction, not balanced flow
