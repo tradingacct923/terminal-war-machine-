@@ -32,9 +32,12 @@ const BUBBLE_CONFIG = {
     MIN_BUBBLE_VOL: 1,            // absolute floor (skip truly empty levels)
 
     // ── Gradient Display (The Eyes) ──
-    // Maps sigma distance → opacity (exponential curve, not linear)
+    // Visual tuning only — these affect HOW things look, not WHAT’s significant
     GRADIENT_BASE_OPACITY: 0.04,  // opacity for noise (barely visible)
+    GRADIENT_EXPONENT_SCALE: 0.05,// σ² multiplier for exponential curve
     GRADIENT_MAX_OPACITY: 0.92,   // cap
+    CLUSTER_OPACITY_BOOST: 0.15,  // extra opacity for clustered bubbles
+    DOMINANCE_OPACITY_SCALE: 0.10,// max opacity boost from dominance (90%+ → +0.04)
 
     // ── Cluster Detection ──
     CLUSTER_MIN_HITS: 3,          // minimum significant hits at same price
@@ -116,15 +119,7 @@ function _dominance(buyVol, sellVol) {
     return Math.max(buyVol, sellVol) / total;
 }
 
-/**
- * Map dominance (0.5 → 1.0) to opacity (0.25 → 0.85).
- * Balanced = faded, one-sided = strong.
- */
-function _opacityFromDominance(dominance) {
-    // dominance range: 0.5 → 1.0, output: 0.25 → 0.85
-    const t = (dominance - 0.5) / 0.5;  // normalize to 0..1
-    return 0.25 + t * 0.60;
-}
+
 
 /**
  * Detect absorption: both sides have significant volume at the same price.
@@ -279,11 +274,17 @@ class VolumeBubbleRenderer {
                     // Exponential opacity: σ² curve keeps noise dim, extremes POP
                     // 1σ=0.09, 2σ=0.24, 3σ=0.49, 4σ=0.84
                     let opacity = BUBBLE_CONFIG.GRADIENT_BASE_OPACITY
-                        + Math.pow(Math.max(sigmaDistance, 0), 2) * 0.05;
+                        + Math.pow(Math.max(sigmaDistance, 0), 2) * BUBBLE_CONFIG.GRADIENT_EXPONENT_SCALE;
+
+                    // Secondary signal: dominance nudge (one-sided prints slightly brighter)
+                    // 50% dominance → +0.00, 90% dominance → +0.04
+                    const domNudge = (dominance - 0.5) / 0.5 * BUBBLE_CONFIG.DOMINANCE_OPACITY_SCALE;
+                    opacity += domNudge;
+
                     opacity = Math.min(opacity, BUBBLE_CONFIG.GRADIENT_MAX_OPACITY);
 
-                    // Cluster boost: smooth +0.15 for repeated significant levels
-                    if (isInCluster) opacity = Math.min(opacity + 0.15, BUBBLE_CONFIG.GRADIENT_MAX_OPACITY);
+                    // Cluster boost: repeated significant levels
+                    if (isInCluster) opacity = Math.min(opacity + BUBBLE_CONFIG.CLUSTER_OPACITY_BOOST, BUBBLE_CONFIG.GRADIENT_MAX_OPACITY);
 
                     // Radius: exponential σ-based scaling
                     let radius;
