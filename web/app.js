@@ -4083,6 +4083,13 @@ function _l2InitSocketIO() {
                 time: et,
                 close: data.close,
                 bp: data.bp,
+                icebergs: data.icebergs || null,
+                sweeps: data.sweeps || null,
+                delta_div: data.delta_div || null,
+                ignition: data.ignition || null,
+                spoofs: data.spoofs || null,
+                drifting_iceberg: data.drifting_iceberg || null,
+                wall_gone: data.wall_gone || null,
             });
         }
         // Track newest candle time
@@ -4624,6 +4631,13 @@ function _l2FetchCandles(fullRedraw, _retryCount) {
                         time: _utcToET(c.time),
                         close: c.close,
                         bp: c.bp || null,
+                        icebergs: c.icebergs || null,
+                        sweeps: c.sweeps || null,
+                        delta_div: c.delta_div || null,
+                        ignition: c.ignition || null,
+                        spoofs: c.spoofs || null,
+                        drifting_iceberg: c.drifting_iceberg || null,
+                        wall_gone: c.wall_gone || null,
                     }));
                     _l2BubbleSeries.setData(bubbleData);
                 }
@@ -4671,6 +4685,13 @@ function _l2FetchCandles(fullRedraw, _retryCount) {
                             time: et,
                             close: c.close,
                             bp: c.bp || null,
+                            icebergs: c.icebergs || null,
+                            sweeps: c.sweeps || null,
+                            delta_div: c.delta_div || null,
+                            ignition: c.ignition || null,
+                            spoofs: c.spoofs || null,
+                            drifting_iceberg: c.drifting_iceberg || null,
+                            wall_gone: c.wall_gone || null,
                         });
                     }
                 }

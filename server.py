@@ -1692,6 +1692,12 @@ def api_l2_candles():
             bp = c.get("bp")
             if bp:
                 candle_out["bp"] = bp
+            # Include all orderflow detection data
+            for key in ("icebergs", "sweeps", "delta_div", "ignition",
+                        "spoofs", "drifting_iceberg", "wall_gone"):
+                val = c.get(key)
+                if val:
+                    candle_out[key] = val
             candles.append(candle_out)
 
         # Deduplicate by time (keep last occurrence)

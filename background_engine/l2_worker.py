@@ -148,7 +148,7 @@ _SWEEP_MIN_VOLUME     = 30      # total swept volume threshold
 
 # ── Detection State ──
 # _ICE_TRACKER: {symbol: {quantized_price_str: [(timestamp, volume, side), ...]}}
-_ICE_TRACKER: dict = defaultdict(lambda: defaultdict(list))
+_ICE_TRACKER: dict = defaultdict(lambda: defaultdict(lambda: deque(maxlen=200)))
 # _SWEEP_TRACKER: {symbol: [(timestamp, price, volume, side), ...]}
 _SWEEP_TRACKER: dict = defaultdict(list)
 # Detected results attached to current candle: {symbol: {tf: {icebergs: {}, sweeps: []}}}
@@ -489,7 +489,7 @@ def _detect_iceberg(symbol: str, price_str: str, volume: int,
     max_window = _ICE_WINDOWS[-1][0]  # 60s
     cutoff_prune = timestamp - max_window
     while tracker and tracker[0][0] < cutoff_prune:
-        tracker.pop(0)
+        tracker.popleft()
 
     # ── ZONE DETECTION: collect fills from adjacent ±N ticks ──
     tick_size = TICK_SIZES.get(symbol, DEFAULT_TICK_SIZE)
@@ -1018,6 +1018,13 @@ def _cleanup_detection_state():
         _ICE_PENDING[sym] = [p for p in _ICE_PENDING[sym]
                              if now - p["ts"] < 120]
 
+    # ── DOM_BAND_DEPTH: prune old entries ──
+    for sym in list(_DOM_BAND_DEPTH.keys()):
+        for s in ["b", "s"]:
+            dq = _DOM_BAND_DEPTH[sym][s]
+            while dq and dq[0][0] < now - _DRIFT_WINDOW_SEC * 2:
+                dq.popleft()
+
 
 # Dedicated lock for candle data — separate from _L2_LOCK to avoid
 # contention with DOM/trade state reads during high-volume periods.
@@ -1137,6 +1144,8 @@ def _feed_candle(symbol: str, price: float, volume: int, timestamp: float,
                             "delta_div": cur.get("delta_div"),
                             "ignition": cur.get("ignition"),
                             "spoofs": cur.get("spoofs"),
+                            "drifting_iceberg": cur.get("drifting_iceberg"),
+                            "wall_gone": cur.get("wall_gone"),
                         }
                         try:
                             _socketio.emit("candle_update", candle_data, namespace="/")
@@ -1177,6 +1186,12 @@ def _freeze_candle(candle: dict) -> dict:
     spoofs = candle.get("spoofs")
     if spoofs:
         snap["spoofs"] = spoofs
+    drifting_iceberg = candle.get("drifting_iceberg")
+    if drifting_iceberg:
+        snap["drifting_iceberg"] = drifting_iceberg
+    wall_gone = candle.get("wall_gone")
+    if wall_gone:
+        snap["wall_gone"] = wall_gone
     return snap
 
 
