@@ -76,9 +76,19 @@ def set_socketio(sio):
 
 # ── Iceberg Detection Constants ──
 _ICE_REFILL_COUNT     = 3       # min refills at same price to trigger
-_ICE_WINDOW_SEC       = 5.0     # time window for refill detection
-_ICE_SIZE_TOLERANCE   = 0.30    # clip sizes must be within ±30% of each other
-_ICE_MIN_CLIP         = 3       # minimum individual clip size to consider
+_ICE_CV_THRESHOLD     = 0.35    # max coefficient of variation (stddev/mean) for clip consistency
+_ICE_MIN_CLIP_FLOOR   = 1       # absolute minimum clip size (never go below 1)
+
+# Tiered detection windows: (window_seconds, confidence_label)
+_ICE_WINDOWS = [
+    (5.0,  "high"),    # fast refill = definitely iceberg
+    (15.0, "medium"),  # patient algo
+    (60.0, "low"),     # very patient, could be coincidence
+]
+
+# ── Rolling Trade Size Tracker (for adaptive min clip) ──
+# {symbol: deque of recent trade sizes, max 500}
+_TRADE_SIZE_HISTORY: dict = defaultdict(lambda: deque(maxlen=500))
 
 # ── Sweep Detection Constants ──
 _SWEEP_MIN_LEVELS     = 3       # min consecutive price levels swept
@@ -86,7 +96,7 @@ _SWEEP_WINDOW_SEC     = 0.200   # 200ms window for sweep
 _SWEEP_MIN_VOLUME     = 30      # total swept volume threshold
 
 # ── Detection State ──
-# _ICE_TRACKER: {symbol: {quantized_price_str: [(timestamp, volume), ...]}}
+# _ICE_TRACKER: {symbol: {quantized_price_str: [(timestamp, volume, side), ...]}}
 _ICE_TRACKER: dict = defaultdict(lambda: defaultdict(list))
 # _SWEEP_TRACKER: {symbol: [(timestamp, price, volume, side), ...]}
 _SWEEP_TRACKER: dict = defaultdict(list)
@@ -131,48 +141,91 @@ _SPOOF_TRACKER: dict = defaultdict(lambda: defaultdict(list))
 
 def _detect_iceberg(symbol: str, price_str: str, volume: int,
                     timestamp: float, side: str):
-    """Track fills at each price level. Detect iceberg when:
-    - 3+ fills at the same price within 5 seconds
-    - Each fill is similar size (within ±30% of each other)
-    - All fills are the same side (all buys or all sells)
+    """Improved iceberg detection with:
+    1. Adaptive min clip from rolling average trade size
+    2. Coefficient of Variation for clip consistency (catches alternating sizes)
+    3. Tiered confidence windows (5s=high, 15s=medium, 60s=low)
+    4. Estimated hidden remaining size based on fill rate
     Returns iceberg dict if detected, else None.
     """
-    if volume < _ICE_MIN_CLIP or side == "n":
+    if side == "n":
         return None
 
+    # Track trade size for adaptive min clip
+    _TRADE_SIZE_HISTORY[symbol].append(volume)
+
+    # Adaptive min clip: 50% of rolling average trade size
+    trade_hist = _TRADE_SIZE_HISTORY[symbol]
+    if len(trade_hist) > 10:
+        avg_trade = sum(trade_hist) / len(trade_hist)
+        min_clip = max(_ICE_MIN_CLIP_FLOOR, int(avg_trade * 0.5))
+    else:
+        min_clip = _ICE_MIN_CLIP_FLOOR
+
+    if volume < min_clip:
+        return None
+
+    # Track this fill
     tracker = _ICE_TRACKER[symbol][price_str]
     tracker.append((timestamp, volume, side))
 
-    # Prune old fills outside the window
-    cutoff = timestamp - _ICE_WINDOW_SEC
+    # Use the widest window for storage, prune oldest
+    max_window = _ICE_WINDOWS[-1][0]  # 60s
+    cutoff = timestamp - max_window
     while tracker and tracker[0][0] < cutoff:
         tracker.pop(0)
 
-    # Need at least N fills
-    if len(tracker) < _ICE_REFILL_COUNT:
-        return None
+    # Try each window tier from tightest (highest confidence) to widest
+    for window_sec, confidence in _ICE_WINDOWS:
+        window_cutoff = timestamp - window_sec
+        fills_in_window = [f for f in tracker if f[0] >= window_cutoff]
 
-    # Check: all same side
-    sides = [f[2] for f in tracker]
-    if len(set(sides)) != 1:
-        return None
+        # Need at least N fills in this window
+        if len(fills_in_window) < _ICE_REFILL_COUNT:
+            continue
 
-    # Check: similar clip sizes (each within ±tolerance of the median)
-    vols = [f[1] for f in tracker]
-    median_vol = sorted(vols)[len(vols) // 2]
-    if median_vol == 0:
-        return None
-    for v in vols:
-        if abs(v - median_vol) / median_vol > _ICE_SIZE_TOLERANCE:
-            return None
+        # Check: all same side
+        sides = [f[2] for f in fills_in_window]
+        if len(set(sides)) != 1:
+            continue
 
-    # Iceberg detected!
-    est_total = sum(vols)
-    return {
-        "clips": len(tracker),
-        "est_total": est_total,
-        "side": sides[0],
-    }
+        # Check: clip consistency via Coefficient of Variation
+        # CV = stddev / mean — low CV means consistent clip sizes
+        # Catches patterns like [10, 15, 10, 15] that rigid ±30% misses
+        vols = [f[1] for f in fills_in_window]
+        mean_vol = sum(vols) / len(vols)
+        if mean_vol == 0:
+            continue
+        variance = sum((v - mean_vol) ** 2 for v in vols) / len(vols)
+        stddev = variance ** 0.5
+        cv = stddev / mean_vol
+
+        if cv > _ICE_CV_THRESHOLD:
+            continue  # clips too varied, not an iceberg pattern
+
+        # Iceberg detected! Estimate hidden remaining size.
+        visible_total = sum(vols)
+        time_elapsed = fills_in_window[-1][0] - fills_in_window[0][0]
+        fill_rate = len(fills_in_window) / max(time_elapsed, 0.1)  # fills/sec
+
+        # Estimate: typical iceberg algo runs for ~60-120 seconds
+        # Extrapolate based on observed fill rate
+        avg_clip = mean_vol
+        est_duration = 90.0  # assume ~90 seconds total algo run
+        est_remaining_fills = max(0, fill_rate * (est_duration - max(time_elapsed, 0.1)))
+        est_hidden = int(visible_total + est_remaining_fills * avg_clip)
+
+        return {
+            "clips": len(fills_in_window),
+            "est_total": visible_total,
+            "est_hidden": est_hidden,
+            "avg_clip": round(avg_clip, 1),
+            "cv": round(cv, 3),
+            "confidence": confidence,
+            "side": sides[0],
+        }
+
+    return None
 
 
 def _detect_sweep(symbol: str, price: float, volume: int,
@@ -428,7 +481,7 @@ def _cleanup_detection_state():
         # ── ICE_TRACKER: remove price keys with no recent fills ──
         ice_sym = _ICE_TRACKER.get(sym, {})
         stale_prices = [p for p, fills in ice_sym.items()
-                        if not fills or (now - fills[-1][0]) > _ICE_WINDOW_SEC * 3]
+                        if not fills or (now - fills[-1][0]) > _ICE_WINDOWS[-1][0] * 3]
         for p in stale_prices:
             del ice_sym[p]
 

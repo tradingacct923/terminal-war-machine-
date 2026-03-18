@@ -619,17 +619,22 @@ class VolumeBubbleRenderer {
                         // Full zoom: diamond with glow + pulse + label
                         const ds = BUBBLE_CONFIG.ICE_DIAMOND_SIZE;
 
-                        // Pulse animation via timestamp
-                        const t = (performance.now() % BUBBLE_CONFIG.ICE_PULSE_SPEED) / BUBBLE_CONFIG.ICE_PULSE_SPEED;
+                        // Pulse speed varies by confidence: high=fast, low=slow
+                        const conf = ice.confidence || 'high';
+                        const pulseSpeed = conf === 'high' ? BUBBLE_CONFIG.ICE_PULSE_SPEED
+                            : conf === 'medium' ? BUBBLE_CONFIG.ICE_PULSE_SPEED * 1.5
+                            : BUBBLE_CONFIG.ICE_PULSE_SPEED * 2.5;
+                        const t = (performance.now() % pulseSpeed) / pulseSpeed;
                         const pulseAlpha = 0.6 + 0.4 * Math.sin(t * Math.PI * 2);
 
-                        // Glow
-                        const glowGrad = ctx.createRadialGradient(x, y, ds * 0.5, x, y, ds * 2);
+                        // Glow — wider for high confidence
+                        const glowMult = conf === 'high' ? 2.5 : conf === 'medium' ? 2.0 : 1.5;
+                        const glowGrad = ctx.createRadialGradient(x, y, ds * 0.5, x, y, ds * glowMult);
                         glowGrad.addColorStop(0, _rgba(color, 0.3 * pulseAlpha));
                         glowGrad.addColorStop(1, 'rgba(0,0,0,0)');
                         ctx.fillStyle = glowGrad;
                         ctx.beginPath();
-                        ctx.arc(x, y, ds * 2, 0, Math.PI * 2);
+                        ctx.arc(x, y, ds * glowMult, 0, Math.PI * 2);
                         ctx.fill();
 
                         // Diamond shape
@@ -647,10 +652,17 @@ class VolumeBubbleRenderer {
                         ctx.lineWidth = 1.5;
                         ctx.stroke();
 
-                        // Volume text inside diamond
-                        const volLabel = ice.est_total >= 1000
-                            ? '~' + (ice.est_total / 1000).toFixed(1) + 'k'
-                            : '~' + ice.est_total;
+                        // Volume label: visible / est hidden
+                        const visVol = ice.est_total >= 1000
+                            ? (ice.est_total / 1000).toFixed(1) + 'k'
+                            : String(ice.est_total);
+                        const estHidden = ice.est_hidden && ice.est_hidden > ice.est_total
+                            ? (ice.est_hidden >= 1000
+                                ? '~' + (ice.est_hidden / 1000).toFixed(1) + 'k'
+                                : '~' + ice.est_hidden)
+                            : null;
+                        const volLabel = estHidden ? `${visVol}/${estHidden}` : `~${visVol}`;
+
                         ctx.font = BUBBLE_CONFIG.FONT_SMALL;
                         ctx.textAlign = 'center';
                         ctx.textBaseline = 'middle';
@@ -659,10 +671,12 @@ class VolumeBubbleRenderer {
                         ctx.fillStyle = BUBBLE_CONFIG.TEXT_COLOR;
                         ctx.fillText(volLabel, x, y);
 
-                        // "ICE" badge below
+                        // Confidence badge: ICE·H / ICE·M / ICE·L
+                        const confBadge = conf === 'high' ? 'ICE·H'
+                            : conf === 'medium' ? 'ICE·M' : 'ICE·L';
                         ctx.font = BUBBLE_CONFIG.FONT_BADGE;
-                        ctx.fillStyle = _rgba(color, 0.9);
-                        ctx.fillText('ICE', x, y + ds + 8);
+                        ctx.fillStyle = _rgba(color, conf === 'high' ? 0.95 : conf === 'medium' ? 0.75 : 0.55);
+                        ctx.fillText(confBadge, x, y + ds + 8);
                     }
                 }
             }
