@@ -802,8 +802,11 @@ class VolumeBubbleRenderer {
                     if (!bar || !bar.originalData || !bar.originalData.drifting_iceberg) continue;
                     const drift = bar.originalData.drifting_iceberg;
 
-                    // Deduplicate: only render one band per side per price zone
-                    const driftKey = `${drift.side}_${Math.round(drift.band_high)}_${Math.round(drift.band_low)}`;
+                    // Only render confirmed or likely
+                    if (drift.drift_confidence === 'possible') continue;
+
+                    // Aggressive deduplication: round to nearest 5 ticks
+                    const driftKey = `${drift.side}_${Math.round(drift.band_high / 5) * 5}_${Math.round(drift.band_low / 5) * 5}`;
                     if (_driftRendered.has(driftKey)) continue;
                     _driftRendered.add(driftKey);
 
@@ -811,47 +814,34 @@ class VolumeBubbleRenderer {
                     const yBot = priceConverter(drift.band_low);
                     if (yTop == null || yBot == null || isNaN(yTop) || isNaN(yBot)) continue;
 
-                    // Cap band height to prevent oversized overlays
-                    const rawH = Math.abs(yBot - yTop);
-                    const bandH = Math.min(rawH, 80);
                     const isBuy = drift.side === 'b';
                     const baseRGB = isBuy ? '0,230,118' : '255,23,68';
-                    // Much lower opacity to prevent chart coverage
-                    const confAlpha = drift.drift_confidence === 'confirmed' ? 0.05
-                        : drift.drift_confidence === 'likely' ? 0.03 : 0.02;
+                    const lineAlpha = drift.drift_confidence === 'confirmed' ? 0.6 : 0.35;
 
-                    const halfW = Math.max(barSpacing * 0.4, 8);
-                    const bandTop = Math.min(yTop, yBot);
-
-                    // Semi-transparent band — thin, subtle
-                    ctx.fillStyle = `rgba(${baseRGB}, ${confAlpha})`;
-                    ctx.fillRect(bar.x - halfW, bandTop, halfW * 2, bandH);
-
-                    // Dashed border (top + bottom lines only)
-                    ctx.strokeStyle = `rgba(${baseRGB}, ${confAlpha * 4})`;
+                    // NO FILL — just two thin horizontal dashed lines at band edges
+                    ctx.strokeStyle = `rgba(${baseRGB}, ${lineAlpha})`;
                     ctx.lineWidth = 1;
-                    ctx.setLineDash([3, 3]);
+                    ctx.setLineDash([6, 4]);
                     ctx.beginPath();
-                    ctx.moveTo(bar.x - halfW, bandTop);
-                    ctx.lineTo(bar.x + halfW, bandTop);
-                    ctx.moveTo(bar.x - halfW, bandTop + bandH);
-                    ctx.lineTo(bar.x + halfW, bandTop + bandH);
+                    // Top line spans across visible range
+                    ctx.moveTo(bar.x - 40, yTop);
+                    ctx.lineTo(bar.x + 40, yTop);
+                    // Bottom line
+                    ctx.moveTo(bar.x - 40, yBot);
+                    ctx.lineTo(bar.x + 40, yBot);
                     ctx.stroke();
                     ctx.setLineDash([]);
 
-                    // Label — only for confirmed/likely
-                    if (drift.drift_confidence !== 'possible') {
-                        const sideLabel = isBuy ? 'STEALTH BUY' : 'STEALTH SELL';
-                        const confIcon = drift.drift_confidence === 'confirmed' ? '✓✓' : '✓';
-                        const leakStr = drift.dom_leak != null ? ` lk:${drift.dom_leak}` : '';
-                        ctx.font = '7px monospace';
-                        ctx.textAlign = 'center';
-                        ctx.fillStyle = `rgba(${baseRGB}, 0.8)`;
-                        ctx.fillText(
-                            `${sideLabel} ${confIcon} ${drift.fills}×${drift.avg_clip}${leakStr}`,
-                            bar.x, bandTop - 4
-                        );
-                    }
+                    // Label
+                    const sideLabel = isBuy ? 'STEALTH BUY' : 'STEALTH SELL';
+                    const confIcon = drift.drift_confidence === 'confirmed' ? '✓✓' : '✓';
+                    ctx.font = '7px monospace';
+                    ctx.textAlign = 'center';
+                    ctx.fillStyle = `rgba(${baseRGB}, 0.8)`;
+                    ctx.fillText(
+                        `${sideLabel} ${confIcon} ${drift.fills}×${drift.avg_clip}`,
+                        bar.x, Math.min(yTop, yBot) - 4
+                    );
                 }
             }
 
@@ -1144,33 +1134,22 @@ class VolumeBubbleRenderer {
                         ctx.lineWidth = 1.5;
                         ctx.beginPath();
                         ctx.moveTo(x, yTop);
-                        ctx.lineTo(x, Math.min(yBot, yTop + 100));
+                        ctx.lineTo(x, Math.min(yBot, yTop + 60));
                         ctx.stroke();
                     } else {
-                        // Full zoom: warning zone rectangle — narrow, subtle
-                        const zoneW = Math.min(barSpacing * 0.6, 20);
-
-                        // Lower opacity to prevent visual noise
-                        ctx.fillStyle = _rgba(color, BUBBLE_CONFIG.IGN_ZONE_ALPHA * 0.5);
-                        ctx.fillRect(x - zoneW / 2, yTop, zoneW, zoneH);
-
-                        // Border (pulsing if not reversed)
-                        if (!isReversed) {
-                            const t = (performance.now() % 1500) / 1500;
-                            const borderAlpha = 0.4 + 0.4 * Math.sin(t * Math.PI * 2);
-                            ctx.strokeStyle = _rgba(color, borderAlpha);
-                            ctx.lineWidth = 1.5;
-                            ctx.setLineDash([4, 3]);
-                        } else {
-                            ctx.strokeStyle = _rgba(color, 0.9);
-                            ctx.lineWidth = 2;
-                            ctx.setLineDash([]);
-                        }
-                        ctx.strokeRect(x - zoneW / 2, yTop, zoneW, zoneH);
+                        // Full zoom: NO FILL — just a thin vertical line + arrow + label
+                        ctx.strokeStyle = _rgba(color, 0.5);
+                        ctx.lineWidth = 1.5;
+                        ctx.setLineDash([3, 2]);
+                        ctx.beginPath();
+                        ctx.moveTo(x, yTop);
+                        ctx.lineTo(x, Math.min(yBot, yTop + 60));
+                        ctx.stroke();
                         ctx.setLineDash([]);
 
                         // Direction arrow
-                        const arrowY = ign.direction === 'up' ? yTop - 10 : yBot + 10;
+                        const capBot = Math.min(yBot, yTop + 60);
+                        const arrowY = ign.direction === 'up' ? yTop - 8 : capBot + 8;
                         const arrowChar = ign.direction === 'up' ? '↑' : '↓';
                         ctx.font = BUBBLE_CONFIG.FONT;
                         ctx.textAlign = 'center';
@@ -1181,16 +1160,15 @@ class VolumeBubbleRenderer {
                         // Label
                         const ignLabel = isReversed ? '⚠ TRAP' : 'IGN';
                         ctx.font = BUBBLE_CONFIG.FONT_BADGE;
-                        ctx.fillStyle = _rgba(color, 0.9);
 
                         const itm = ctx.measureText(ignLabel);
                         ctx.fillStyle = 'rgba(0,0,0,0.7)';
                         ctx.beginPath();
-                        ctx.roundRect(x - itm.width / 2 - 3, yBot + 14, itm.width + 6, 11, 3);
+                        ctx.roundRect(x - itm.width / 2 - 3, capBot + 12, itm.width + 6, 11, 3);
                         ctx.fill();
 
                         ctx.fillStyle = _rgba(color, 0.95);
-                        ctx.fillText(ignLabel, x, yBot + 19);
+                        ctx.fillText(ignLabel, x, capBot + 17);
                     }
                 }
             }
