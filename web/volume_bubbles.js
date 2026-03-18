@@ -595,14 +595,17 @@ class VolumeBubbleRenderer {
                 const x = bar.x;
 
                 // ── HEDGE FUND RULE: pick only the BEST iceberg per candle ──
+                // HIGH confidence only + minimum 2k volume to avoid false positives
                 let best = null;
                 let bestVol = 0;
                 for (const priceStr in icebergs) {
                     const ice = icebergs[priceStr];
                     const conf = ice.confidence || 'low';
-                    // Only render high confidence detections
-                    if (conf !== 'high' && conf !== 'medium') continue;
+                    // STRICT: only high confidence (refill within 5s)
+                    if (conf !== 'high') continue;
                     const vol = ice.est_total || 0;
+                    // Minimum volume: skip tiny icebergs
+                    if (vol < 2000) continue;
                     if (vol > bestVol) {
                         bestVol = vol;
                         best = { price: parseFloat(priceStr), ice };
