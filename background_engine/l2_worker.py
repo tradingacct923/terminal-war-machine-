@@ -136,6 +136,11 @@ _ICE_WALL_STATE: dict = defaultdict(lambda: defaultdict(lambda: {
     "last_refill_ts": 0, "was_active": False, "gone_announced": False
 }))
 
+# ── DOM Band Depth Tracking (Drifting Layer 2) ──
+# {symbol: {"b": deque of (ts, total_depth, fills_since_last), "s": deque}}
+_DOM_BAND_DEPTH: dict = defaultdict(lambda: {"b": deque(maxlen=50),
+                                              "s": deque(maxlen=50)})
+
 # ── Sweep Detection Constants ──
 _SWEEP_MIN_LEVELS     = 3       # min consecutive price levels swept
 _SWEEP_WINDOW_SEC     = 0.200   # 200ms window for sweep
@@ -266,8 +271,11 @@ def _analyze_fill_timing(fills_in_window):
 
 def _detect_drifting_iceberg(symbol: str, price_f: float, volume: int,
                               timestamp: float, side: str):
-    """Drifting iceberg detection — behavioral fingerprint layer.
-    Ignores price, tracks same-side clip consistency across ALL prices."""
+    """Drifting iceberg detection — 3-layer multi-level detection.
+    Layer 1: Behavioral fingerprint (clip CV across all prices)
+    Layer 2: DOM total depth anomaly (depth_leak_ratio)
+    Layer 3: Timing regularity (gap CV)
+    """
     if side == "n":
         return None
     tracker = _DRIFT_TRACKER[symbol][side]
@@ -287,32 +295,71 @@ def _detect_drifting_iceberg(symbol: str, price_f: float, volume: int,
     cv = (var ** 0.5) / mean_v
     if cv > _DRIFT_MAX_CV:
         return None
-    # Timing analysis (Layer 3)
+
+    # ── Layer 2: DOM Total Depth Anomaly ──
+    # Check if total bid/ask depth in the band barely dropped despite fills
+    band_low = min(p for _, p, _ in recent)
+    band_high = max(p for _, p, _ in recent)
+    dom_leak = None
+    dom_snap = _DOM_BID_SNAP[symbol] if side == "s" else _DOM_ASK_SNAP[symbol]
+    if dom_snap:
+        # Total current depth across the band
+        actual_depth = 0
+        for ps, sz in dom_snap.items():
+            try:
+                pf = float(ps)
+                if band_low <= pf <= band_high:
+                    actual_depth += sz
+            except (ValueError, TypeError):
+                pass
+        total_fills = sum(vols)
+        # Check depth history for this side
+        depth_history = _DOM_BAND_DEPTH[symbol][side]
+        if depth_history:
+            # Use the oldest depth snapshot in our window
+            oldest_depth = depth_history[0][1]
+            expected_depth = max(0, oldest_depth - total_fills)
+            if total_fills > 0:
+                dom_leak = round((actual_depth - expected_depth) / total_fills, 2)
+        # Record current depth for future comparisons
+        depth_history.append((timestamp, actual_depth, sum(vols)))
+
+    # ── Layer 3: Timing analysis ──
     gap_cv_val, timing = _analyze_fill_timing([(t, 0, "") for t, _, _ in recent])
-    # Composite confidence
+
+    # ── Composite confidence (all 3 layers) ──
     score = 0
+    # Layer 1: Clip consistency
     if cv < 0.25:
         score += 2
     elif cv < 0.40:
         score += 1
+    # Layer 2: DOM depth anomaly
+    if dom_leak is not None and dom_leak > 0.5:
+        score += 2  # hidden liquidity confirmed
+    elif dom_leak is not None and dom_leak > 0.2:
+        score += 1  # some hidden liquidity
+    # Layer 3: Timing regularity
     if timing in ("algo_confirmed",):
         score += 2
     elif timing in ("algo_likely",):
         score += 1
-    drift_conf = "confirmed" if score >= 3 else "likely" if score >= 2 else "possible"
+
+    drift_conf = "confirmed" if score >= 4 else "likely" if score >= 2 else "possible"
     return {
         "type": "drifting",
         "fills": len(recent),
         "prices_hit": len(prices),
-        "band_low": round(min(p for _, p, _ in recent), 2),
-        "band_high": round(max(p for _, p, _ in recent), 2),
-        "band_range": round(max(p for _, p, _ in recent) - min(p for _, p, _ in recent), 2),
+        "band_low": round(band_low, 2),
+        "band_high": round(band_high, 2),
+        "band_range": round(band_high - band_low, 2),
         "total_vol": sum(vols),
         "avg_clip": round(mean_v, 1),
         "cv": round(cv, 3),
         "side": side,
         "gap_cv": gap_cv_val,
         "timing": timing,
+        "dom_leak": dom_leak,
         "drift_confidence": drift_conf,
     }
 

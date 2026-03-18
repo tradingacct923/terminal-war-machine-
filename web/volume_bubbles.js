@@ -830,11 +830,12 @@ class VolumeBubbleRenderer {
                     const sideLabel = isBuy ? 'STEALTH BUY' : 'STEALTH SELL';
                     const confIcon = drift.drift_confidence === 'confirmed' ? '✓✓'
                         : drift.drift_confidence === 'likely' ? '✓' : '?';
+                    const leakStr = drift.dom_leak != null ? ` leak:${drift.dom_leak}` : '';
                     ctx.font = '7px monospace';
                     ctx.textAlign = 'center';
                     ctx.fillStyle = `rgba(${baseRGB}, 0.9)`;
                     ctx.fillText(
-                        `${sideLabel} ${confIcon} ${drift.fills}×${drift.avg_clip}`,
+                        `${sideLabel} ${confIcon} ${drift.fills}×${drift.avg_clip}${leakStr}`,
                         bar.x, Math.min(yTop, yBot) - 4
                     );
                 }
