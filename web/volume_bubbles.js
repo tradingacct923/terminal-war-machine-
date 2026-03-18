@@ -161,8 +161,6 @@ class VolumeBubbleRenderer {
         const d = this._data;
         if (!d || !d.bars || d.bars.length === 0) return;
 
-        // ═══ CLEAN SLATE: all overlays disabled — just candlesticks ═══
-        return;
 
         const barSpacing = d.barSpacing || 6;
 
@@ -304,18 +302,29 @@ class VolumeBubbleRenderer {
                     // Absolute floor: skip truly empty levels
                     if (totalVol < BUBBLE_CONFIG.MIN_BUBBLE_VOL) continue;
 
-                    // Convert price to Y coordinate
+                    // Convert price to Y coordinate (needed for sigma calc)
                     const price = parseFloat(priceStr);
                     if (isNaN(price)) continue;
                     const y = priceConverter(price);
                     if (y === null || y === undefined || isNaN(y)) continue;
 
-                    // ── Step 3: THE EYES — Exponential gradient from log-σ ──
-                    // Sigma distance in log-space (immune to outlier distortion)
+                    // ── σ distance in log-space ──
                     const logVol = Math.log(totalVol + 1);
                     const sigmaDistance = logStddev > 0
                         ? (logVol - logAvg) / logStddev
                         : (totalVol > 0 ? 1 : 0);
+
+                    // ═══ HARD CUTOFF: conviction-based filtering ═══
+                    // Absorption (both sides fighting) = most tradeable → lower bar at 1.0σ
+                    // Aggressive (one-sided) = needs 1.5σ + 70% dominance
+                    if (isAbsorb) {
+                        if (sigmaDistance < 1.0) continue;  // absorption at 1.0σ+
+                    } else {
+                        if (sigmaDistance < 1.5) continue;  // hard cutoff: no noise
+                        if (dominance < 0.70) continue;     // need conviction, not balanced flow
+                    }
+
+                    // ── Step 3: THE EYES — Exponential gradient from log-σ ──
 
                     // Exponential opacity: σ² curve keeps noise dim, extremes POP
                     // 1σ=0.09, 2σ=0.24, 3σ=0.49, 4σ=0.84
@@ -587,7 +596,14 @@ class VolumeBubbleRenderer {
                 }
             }
 
-            // ════════════════════════════════════════════════════════════════
+            // ═══ LAYERS 7+ DISABLED — adding one layer at a time ═══
+            // Icebergs, sweeps, divergence, ignition, spoofs disabled
+            // Will re-enable each layer after verifying previous looks clean
+            });  // close useMediaCoordinateSpace
+    }  // close draw()
+}  // close VolumeBubbleRenderer class
+
+    /* ════════════════════════════════════════════════════════════════
             // LAYER 7: ICEBERG DETECTION (◆ diamond markers)
             // ════════════════════════════════════════════════════════════════
             for (let i = from; i < to; i++) {
@@ -1264,6 +1280,7 @@ class VolumeBubbleRenderer {
         });
     }
 }
+*/
 
 
 // ═══════════════════════════════════════════════════════════════════════════
