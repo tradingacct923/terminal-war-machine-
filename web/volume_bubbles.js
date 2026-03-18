@@ -22,7 +22,6 @@
 const BUBBLE_CONFIG = {
     // ── Adaptive Thresholds (Approach 3: Dual Threshold) ──
     ADAPTIVE_MULTIPLIER: 2.0,     // threshold = rolling_avg × this (2x above average = significant)
-    ADAPTIVE_ABS_MIN: 3,          // never filter below this many contracts
     HIGH_DOMINANCE: 0.90,         // 90%+ one-sided = always show (bypass filter)
     HIGH_DOMINANCE_MIN_VOL: 10,   // min vol for high-dominance bypass
     MIN_BUBBLE_VOL: 1,            // absolute floor (safety net, should rarely trigger)
@@ -179,10 +178,7 @@ class VolumeBubbleRenderer {
             const avgVol = allLevelVols.length > 0
                 ? allLevelVols.reduce((a, b) => a + b, 0) / allLevelVols.length
                 : 0;
-            const adaptiveThreshold = Math.max(
-                avgVol * BUBBLE_CONFIG.ADAPTIVE_MULTIPLIER,
-                BUBBLE_CONFIG.ADAPTIVE_ABS_MIN
-            );
+            const adaptiveThreshold = avgVol * BUBBLE_CONFIG.ADAPTIVE_MULTIPLIER;
 
             // ── Classify all bubbles ──
             const glowBubbles = [];     // institutional prints (drawn first, behind)
