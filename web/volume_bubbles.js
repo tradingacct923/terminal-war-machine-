@@ -314,15 +314,13 @@ class VolumeBubbleRenderer {
                         ? (logVol - logAvg) / logStddev
                         : (totalVol > 0 ? 1 : 0);
 
-                    // ═══ HARD CUTOFF: conviction-based filtering ═══
-                    // Absorption (both sides fighting) = most tradeable → ratio is the signal, not size
-                    // Aggressive (one-sided) = needs 1.5σ + 70% dominance
-                    if (isAbsorb) {
-                        if (sigmaDistance < 0.5) continue;  // absorption at 0.5σ+ (battle matters, not size)
-                    } else {
-                        if (sigmaDistance < 1.5) continue;  // hard cutoff: no noise
-                        if (dominance < 0.70) continue;     // need conviction, not balanced flow
-                    }
+                    // ═══ FILTERING: dim context + conviction highlights ═══
+                    // Below 0.5σ = true noise (1-2 contracts), remove completely
+                    // 0.5σ to 1.5σ = dim context (σ² gradient = 4-15% opacity, market texture)
+                    // 1.5σ+ = pops — but needs 70% dominance (conviction, not balanced)
+                    // Absorption always shows at 0.5σ+ (battle matters, not size)
+                    if (sigmaDistance < 0.5) continue;  // true noise floor
+                    if (!isAbsorb && sigmaDistance >= 1.5 && dominance < 0.70) continue;  // big but no conviction
 
                     // ── Step 3: THE EYES — Exponential gradient from log-σ ──
 
