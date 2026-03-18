@@ -4069,10 +4069,10 @@ h3 {
 .terminal {
   display: grid;
   grid-template-rows: 42px 1fr;
-  grid-template-columns: 1fr 320px;
+  grid-template-columns: 1fr;
   grid-template-areas:
-    "toolbar toolbar"
-    "chart   options";
+    "toolbar"
+    "chart";
   height: 100vh;
   width: 100vw;
   overflow: hidden;
