@@ -41,18 +41,22 @@ const BUBBLE_CONFIG = {
 
     // ── Cluster Detection ──
     CLUSTER_MIN_HITS: 3,          // minimum significant hits at same price
-    CLUSTER_LINE_WIDTH: 1.5,      // connecting line width
-    CLUSTER_BADGE_FONT: '9px "JetBrains Mono", "SF Mono", monospace',
+    CLUSTER_LINE_WIDTH_MIN: 1.0,  // thinnest segment (low vol hit)
+    CLUSTER_LINE_WIDTH_MAX: 4.0,  // thickest segment (high vol hit)
+    CLUSTER_GLOW_BLUR: 6,        // glow effect blur radius
+    CLUSTER_DOT_RADIUS: 3.5,     // hit point dot size
+    CLUSTER_BADGE_FONT: '10px "JetBrains Mono", "SF Mono", monospace',
 
     // ── Cumulative Level Delta (sidebar bars) ──
     CUML_DELTA_ENABLED: true,          // toggle on/off
-    CUML_DELTA_BAR_MAX_WIDTH: 60,     // max horizontal bar width in px
-    CUML_DELTA_BAR_HEIGHT: 2,         // bar thickness in px
-    CUML_DELTA_BAR_ALPHA: 0.35,       // bar fill opacity
-    CUML_DELTA_LABEL_ALPHA: 0.75,     // text label opacity
+    CUML_DELTA_BAR_MAX_WIDTH: 70,     // max horizontal bar width in px
+    CUML_DELTA_BAR_HEIGHT: 3,         // bar thickness in px
+    CUML_DELTA_BAR_ALPHA: 0.45,       // bar fill opacity
+    CUML_DELTA_LABEL_ALPHA: 0.85,     // text label opacity
     CUML_DELTA_RIGHT_MARGIN: 8,       // px from right edge of chart
-    CUML_DELTA_FONT: '8px "JetBrains Mono", "SF Mono", monospace',
+    CUML_DELTA_FONT: '9px "JetBrains Mono", "SF Mono", monospace',
     CUML_DELTA_MIN_SIGMA: 0.5,        // only show levels above 0.5σ cumulative vol
+    CUML_DELTA_GLOW_THRESHOLD: 0.6,   // bars wider than 60% of max get a glow
 
     // ── Sizing ──
     MAX_RADIUS: 24,               // max bubble radius in px
@@ -482,8 +486,9 @@ class VolumeBubbleRenderer {
             }
 
             // ════════════════════════════════════════════════════════════════
-            // LAYER 6.5: CLUSTER + ACCELERATION GRADIENT
+            // LAYER 6.5: CLUSTER + VARIABLE-WIDTH ACCELERATION LINES
             // StdDev decided WHAT clusters matter. Gradient shows HOW MUCH.
+            // Line thickness varies per segment based on volume at each hit.
             // ════════════════════════════════════════════════════════════════
             if (!useDots) {
                 for (const priceStr of clusteredPrices) {
@@ -503,50 +508,74 @@ class VolumeBubbleRenderer {
                     const accelRatio = avgFirst > 0 ? avgSecond / avgFirst : 1;
 
                     // ── Gradient: ratio → smooth opacity (no cutoffs) ──
-                    // ratio 0.3 → 0.08, ratio 1.0 → 0.30, ratio 2.0 → 0.55, ratio 3.0+ → 0.80
-                    const lineAlpha = Math.min(0.05 + accelRatio * 0.25, 0.80);
+                    const lineAlpha = Math.min(0.10 + accelRatio * 0.25, 0.85);
 
-                    // ── Color: dominant side, saturation from ratio ──
+                    // ── Color: dominant side ──
                     const totalBuy = hits.reduce((a, h) => a + h.buy, 0);
                     const totalSell = hits.reduce((a, h) => a + h.sell, 0);
                     const lineColor = totalBuy >= totalSell
                         ? BUBBLE_CONFIG.BUY_COLOR : BUBBLE_CONFIG.SELL_COLOR;
 
-                    // ── Draw connecting line ──
-                    const xStart = hits[0].x;
-                    const xEnd = hits[hits.length - 1].x;
-                    ctx.strokeStyle = _rgba(lineColor, lineAlpha);
-                    ctx.lineWidth = BUBBLE_CONFIG.CLUSTER_LINE_WIDTH;
-                    ctx.setLineDash([]);
-                    ctx.beginPath();
-                    ctx.moveTo(xStart, y);
-                    ctx.lineTo(xEnd, y);
-                    ctx.stroke();
+                    // ── Variable-width line: thickness follows volume at each hit ──
+                    const maxHitVol = Math.max(...vols);
+                    const minHitVol = Math.min(...vols);
+                    const volRange = maxHitVol - minHitVol || 1;
 
-                    // Draw dots at each hit point (opacity follows gradient)
-                    for (const hit of hits) {
-                        ctx.fillStyle = _rgba(lineColor, Math.min(lineAlpha + 0.15, 0.90));
+                    // Glow effect on cluster lines
+                    ctx.save();
+                    ctx.shadowColor = _rgba(lineColor, lineAlpha * 0.5);
+                    ctx.shadowBlur = BUBBLE_CONFIG.CLUSTER_GLOW_BLUR;
+                    ctx.setLineDash([]);
+
+                    // Draw segments between consecutive hits with varying width
+                    for (let h = 0; h < hits.length - 1; h++) {
+                        const h1 = hits[h], h2 = hits[h + 1];
+                        // Width = average volume of the two endpoints, mapped to min/max width
+                        const segAvgVol = (h1.total + h2.total) / 2;
+                        const widthRatio = (segAvgVol - minHitVol) / volRange;
+                        const segWidth = BUBBLE_CONFIG.CLUSTER_LINE_WIDTH_MIN
+                            + widthRatio * (BUBBLE_CONFIG.CLUSTER_LINE_WIDTH_MAX - BUBBLE_CONFIG.CLUSTER_LINE_WIDTH_MIN);
+
+                        ctx.strokeStyle = _rgba(lineColor, lineAlpha);
+                        ctx.lineWidth = segWidth;
                         ctx.beginPath();
-                        ctx.arc(hit.x, y, 2.5, 0, Math.PI * 2);
+                        ctx.moveTo(h1.x, y);
+                        ctx.lineTo(h2.x, y);
+                        ctx.stroke();
+                    }
+                    ctx.restore();
+
+                    // Draw dots at each hit point (size follows volume)
+                    for (let h = 0; h < hits.length; h++) {
+                        const hit = hits[h];
+                        const dotRatio = (hit.total - minHitVol) / volRange;
+                        const dotRadius = BUBBLE_CONFIG.CLUSTER_DOT_RADIUS
+                            + dotRatio * 1.5;  // 3.5 → 5.0 based on vol
+                        ctx.fillStyle = _rgba(lineColor, Math.min(lineAlpha + 0.20, 0.92));
+                        ctx.beginPath();
+                        ctx.arc(hit.x, y, dotRadius, 0, Math.PI * 2);
                         ctx.fill();
                     }
 
                     // ── Badge: hit count + net delta (instantly readable) ──
-                    const badgeX = xEnd + 6;
+                    const xEnd = hits[hits.length - 1].x;
+                    const badgeX = xEnd + 8;
                     ctx.font = BUBBLE_CONFIG.CLUSTER_BADGE_FONT;
                     ctx.textAlign = 'left';
                     ctx.textBaseline = 'middle';
 
-                    const totalBuyBadge = hits.reduce((a, h) => a + h.buy, 0);
-                    const totalSellBadge = hits.reduce((a, h) => a + h.sell, 0);
-                    const netDelta = totalBuyBadge - totalSellBadge;
+                    const netDelta = totalBuy - totalSell;
                     const deltaSign = netDelta >= 0 ? '+' : '';
                     const badge = `${hits.length}× ${deltaSign}${netDelta}Δ`;
-                    const badgeAlpha = Math.min(lineAlpha + 0.20, 0.90);
+                    const badgeAlpha = Math.min(lineAlpha + 0.20, 0.92);
 
-                    // Badge shadow
-                    ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
-                    ctx.fillText(badge, badgeX + 1, y + 1);
+                    // Badge background pill for readability
+                    const bm = ctx.measureText(badge);
+                    ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+                    ctx.beginPath();
+                    ctx.roundRect(badgeX - 3, y - 7, bm.width + 6, 14, 3);
+                    ctx.fill();
+
                     // Badge text
                     ctx.fillStyle = _rgba(lineColor, badgeAlpha);
                     ctx.fillText(badge, badgeX, y);
@@ -764,8 +793,16 @@ class VolumeBubbleRenderer {
                     if (y === null || y === undefined || isNaN(y)) continue;
 
                     const net = level.net;
-                    const barWidth = (Math.abs(net) / maxAbsDelta) * BUBBLE_CONFIG.CUML_DELTA_BAR_MAX_WIDTH;
+                    const barRatio = Math.abs(net) / maxAbsDelta;
+                    const barWidth = barRatio * BUBBLE_CONFIG.CUML_DELTA_BAR_MAX_WIDTH;
                     const color = net >= 0 ? BUBBLE_CONFIG.BUY_COLOR : BUBBLE_CONFIG.SELL_COLOR;
+
+                    // Glow on major bars (>60% of max)
+                    if (barRatio >= BUBBLE_CONFIG.CUML_DELTA_GLOW_THRESHOLD) {
+                        ctx.save();
+                        ctx.shadowColor = _rgba(color, 0.4);
+                        ctx.shadowBlur = 6;
+                    }
 
                     // Horizontal bar: extends LEFT from right edge
                     ctx.fillStyle = _rgba(color, BUBBLE_CONFIG.CUML_DELTA_BAR_ALPHA);
@@ -776,12 +813,16 @@ class VolumeBubbleRenderer {
                         BUBBLE_CONFIG.CUML_DELTA_BAR_HEIGHT
                     );
 
+                    if (barRatio >= BUBBLE_CONFIG.CUML_DELTA_GLOW_THRESHOLD) {
+                        ctx.restore();
+                    }
+
                     // Delta label: right-aligned next to bar
                     const sign = net >= 0 ? '+' : '';
                     const label = `${sign}${net}Δ`;
                     ctx.textAlign = 'right';
                     ctx.fillStyle = _rgba(color, BUBBLE_CONFIG.CUML_DELTA_LABEL_ALPHA);
-                    ctx.fillText(label, rightEdge - barWidth - 3, y);
+                    ctx.fillText(label, rightEdge - barWidth - 4, y);
                 }
                 ctx.textAlign = 'center';  // reset
             }
