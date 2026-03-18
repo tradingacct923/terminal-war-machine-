@@ -795,49 +795,63 @@ class VolumeBubbleRenderer {
             // LAYER 7b: DRIFTING ICEBERG BAND OVERLAY
             // ════════════════════════════════════════════════════════════════
             if (!useDots) {
+                // Track rendered drift bands to avoid duplicating overlapping ones
+                const _driftRendered = new Set();
                 for (let i = from; i < to; i++) {
                     const bar = d.bars[i];
                     if (!bar || !bar.originalData || !bar.originalData.drifting_iceberg) continue;
                     const drift = bar.originalData.drifting_iceberg;
 
+                    // Deduplicate: only render one band per side per price zone
+                    const driftKey = `${drift.side}_${Math.round(drift.band_high)}_${Math.round(drift.band_low)}`;
+                    if (_driftRendered.has(driftKey)) continue;
+                    _driftRendered.add(driftKey);
+
                     const yTop = priceConverter(drift.band_high);
                     const yBot = priceConverter(drift.band_low);
                     if (yTop == null || yBot == null || isNaN(yTop) || isNaN(yBot)) continue;
 
-                    const bandH = Math.abs(yBot - yTop);
+                    // Cap band height to prevent oversized overlays
+                    const rawH = Math.abs(yBot - yTop);
+                    const bandH = Math.min(rawH, 80);
                     const isBuy = drift.side === 'b';
                     const baseRGB = isBuy ? '0,230,118' : '255,23,68';
-                    const confAlpha = drift.drift_confidence === 'confirmed' ? 0.12
-                        : drift.drift_confidence === 'likely' ? 0.08 : 0.04;
+                    // Much lower opacity to prevent chart coverage
+                    const confAlpha = drift.drift_confidence === 'confirmed' ? 0.05
+                        : drift.drift_confidence === 'likely' ? 0.03 : 0.02;
 
-                    // Semi-transparent band
+                    const halfW = Math.max(barSpacing * 0.4, 8);
+                    const bandTop = Math.min(yTop, yBot);
+
+                    // Semi-transparent band — thin, subtle
                     ctx.fillStyle = `rgba(${baseRGB}, ${confAlpha})`;
-                    ctx.fillRect(bar.x - 20, Math.min(yTop, yBot), 40, bandH);
+                    ctx.fillRect(bar.x - halfW, bandTop, halfW * 2, bandH);
 
-                    // Dashed border
-                    ctx.strokeStyle = `rgba(${baseRGB}, ${confAlpha * 3})`;
+                    // Dashed border (top + bottom lines only)
+                    ctx.strokeStyle = `rgba(${baseRGB}, ${confAlpha * 4})`;
                     ctx.lineWidth = 1;
-                    ctx.setLineDash([4, 2]);
+                    ctx.setLineDash([3, 3]);
                     ctx.beginPath();
-                    ctx.moveTo(bar.x - 20, yTop);
-                    ctx.lineTo(bar.x + 20, yTop);
-                    ctx.moveTo(bar.x - 20, yBot);
-                    ctx.lineTo(bar.x + 20, yBot);
+                    ctx.moveTo(bar.x - halfW, bandTop);
+                    ctx.lineTo(bar.x + halfW, bandTop);
+                    ctx.moveTo(bar.x - halfW, bandTop + bandH);
+                    ctx.lineTo(bar.x + halfW, bandTop + bandH);
                     ctx.stroke();
                     ctx.setLineDash([]);
 
-                    // Label
-                    const sideLabel = isBuy ? 'STEALTH BUY' : 'STEALTH SELL';
-                    const confIcon = drift.drift_confidence === 'confirmed' ? '✓✓'
-                        : drift.drift_confidence === 'likely' ? '✓' : '?';
-                    const leakStr = drift.dom_leak != null ? ` leak:${drift.dom_leak}` : '';
-                    ctx.font = '7px monospace';
-                    ctx.textAlign = 'center';
-                    ctx.fillStyle = `rgba(${baseRGB}, 0.9)`;
-                    ctx.fillText(
-                        `${sideLabel} ${confIcon} ${drift.fills}×${drift.avg_clip}${leakStr}`,
-                        bar.x, Math.min(yTop, yBot) - 4
-                    );
+                    // Label — only for confirmed/likely
+                    if (drift.drift_confidence !== 'possible') {
+                        const sideLabel = isBuy ? 'STEALTH BUY' : 'STEALTH SELL';
+                        const confIcon = drift.drift_confidence === 'confirmed' ? '✓✓' : '✓';
+                        const leakStr = drift.dom_leak != null ? ` lk:${drift.dom_leak}` : '';
+                        ctx.font = '7px monospace';
+                        ctx.textAlign = 'center';
+                        ctx.fillStyle = `rgba(${baseRGB}, 0.8)`;
+                        ctx.fillText(
+                            `${sideLabel} ${confIcon} ${drift.fills}×${drift.avg_clip}${leakStr}`,
+                            bar.x, bandTop - 4
+                        );
+                    }
                 }
             }
 
@@ -848,22 +862,26 @@ class VolumeBubbleRenderer {
                 const bar = d.bars[i];
                 if (!bar || !bar.originalData || !bar.originalData.wall_gone) continue;
 
-                for (const wg of bar.originalData.wall_gone) {
+                // Limit to max 2 wall_gone markers per candle to prevent label stacking
+                const wgList = bar.originalData.wall_gone;
+                const wgMax = Math.min(wgList.length, 2);
+                for (let wi = 0; wi < wgMax; wi++) {
+                    const wg = wgList[wi];
                     const price = parseFloat(wg.price);
                     if (isNaN(price)) continue;
                     const yWg = priceConverter(price);
                     if (yWg == null || isNaN(yWg)) continue;
 
-                    // Green flash pulse
-                    ctx.fillStyle = 'rgba(0,230,118,0.3)';
+                    // Small subtle flash
+                    ctx.fillStyle = 'rgba(0,230,118,0.15)';
                     ctx.beginPath();
-                    ctx.arc(bar.x, yWg, 12, 0, Math.PI * 2);
+                    ctx.arc(bar.x, yWg, 8, 0, Math.PI * 2);
                     ctx.fill();
 
                     ctx.font = BUBBLE_CONFIG.FONT_BADGE;
                     ctx.fillStyle = '#00e676';
                     ctx.textAlign = 'center';
-                    ctx.fillText('WALL GONE ✅', bar.x, yWg - 14);
+                    ctx.fillText('WG ✅', bar.x, yWg - 10);
                 }
             }
 
@@ -1117,22 +1135,23 @@ class VolumeBubbleRenderer {
                     const color = isReversed ? BUBBLE_CONFIG.IGN_TRAP_COLOR : BUBBLE_CONFIG.IGN_COLOR;
                     const yTop = Math.min(yMin, yMax);
                     const yBot = Math.max(yMin, yMax);
-                    const zoneH = Math.max(yBot - yTop, 4);
+                    // Cap zone height to prevent chart-covering rectangles
+                    const zoneH = Math.min(Math.max(yBot - yTop, 4), 100);
 
                     if (useDots) {
                         // Macro zoom: thin vertical line
-                        ctx.strokeStyle = _rgba(color, 0.5);
-                        ctx.lineWidth = 2;
+                        ctx.strokeStyle = _rgba(color, 0.4);
+                        ctx.lineWidth = 1.5;
                         ctx.beginPath();
                         ctx.moveTo(x, yTop);
-                        ctx.lineTo(x, yBot);
+                        ctx.lineTo(x, Math.min(yBot, yTop + 100));
                         ctx.stroke();
                     } else {
-                        // Full zoom: warning zone rectangle
-                        const zoneW = 24;
+                        // Full zoom: warning zone rectangle — narrow, subtle
+                        const zoneW = Math.min(barSpacing * 0.6, 20);
 
-                        // Semi-transparent fill
-                        ctx.fillStyle = _rgba(color, BUBBLE_CONFIG.IGN_ZONE_ALPHA);
+                        // Lower opacity to prevent visual noise
+                        ctx.fillStyle = _rgba(color, BUBBLE_CONFIG.IGN_ZONE_ALPHA * 0.5);
                         ctx.fillRect(x - zoneW / 2, yTop, zoneW, zoneH);
 
                         // Border (pulsing if not reversed)
