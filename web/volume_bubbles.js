@@ -20,26 +20,27 @@
 // CONFIG
 // ═══════════════════════════════════════════════════════════════════════════
 const BUBBLE_CONFIG = {
-    // ── Adaptive Thresholds (Approach 3: Dual Threshold) ──
-    ADAPTIVE_MULTIPLIER: 2.0,     // threshold = rolling_avg × this (2x above average = significant)
-    HIGH_DOMINANCE: 0.90,         // 90%+ one-sided = always show (bypass filter)
-    HIGH_DOMINANCE_MIN_VOL: 10,   // min vol for high-dominance bypass
-    MIN_BUBBLE_VOL: 1,            // absolute floor (safety net, should rarely trigger)
-    INSTITUTIONAL_THRESHOLD: 100, // 100+ contracts = institutional print (always shows)
-    ABSORPTION_MIN: 50,           // both buy AND sell must exceed this for absorption
-    ABSORPTION_RATIO: 0.35,       // minor side must be at least 35% of total (no 95/5 splits)
+    // ── StdDev Significance Levels (The Brain) ──
+    // These define how many σ above average = "significant"
+    // No fixed contract counts. Everything adapts to market regime.
+    SIGMA_SIGNIFICANT: 1.5,       // 1.5σ = unusual (top ~7% of prints)
+    SIGMA_INSTITUTIONAL: 3.0,     // 3.0σ = extreme outlier (top ~0.1%)
+    SIGMA_ABSORPTION: 1.0,        // 1.0σ = absorption context level
+    SIGMA_HIGH_DOM: 0.5,          // 0.5σ = min vol for high-dominance bypass
+    HIGH_DOMINANCE: 0.90,         // 90%+ one-sided = directional aggression
+    ABSORPTION_RATIO: 0.35,       // minor side must be ≥35% of total for absorption
+    MIN_BUBBLE_VOL: 1,            // absolute floor (skip truly empty levels)
 
-    // ── Cluster + Acceleration Detection ──
-    CLUSTER_MIN_HITS: 3,          // minimum significant hits at same price to form a cluster
+    // ── Gradient Display (The Eyes) ──
+    // Maps sigma distance → opacity (smooth, no binary jumps)
+    GRADIENT_BASE_OPACITY: 0.04,  // opacity for noise (barely visible)
+    GRADIENT_SCALE: 0.20,         // opacity gain per 1σ above average
+    GRADIENT_MAX_OPACITY: 0.92,   // cap
+
+    // ── Cluster Detection ──
+    CLUSTER_MIN_HITS: 3,          // minimum significant hits at same price
     CLUSTER_LINE_WIDTH: 1.5,      // connecting line width
-    CLUSTER_LINE_ALPHA: 0.45,     // connecting line base opacity
-    CLUSTER_OPACITY_BOOST: 0.20,  // extra opacity for bubbles in a cluster
     CLUSTER_BADGE_FONT: '9px "JetBrains Mono", "SF Mono", monospace',
-    ACCEL_UP_THRESHOLD: 1.3,      // secondHalf/firstHalf > 1.3 = accelerating
-    ACCEL_DOWN_THRESHOLD: 0.7,    // secondHalf/firstHalf < 0.7 = decelerating
-    EXHAUST_SPIKE: 3.0,           // single candle 3x+ average of others = exhaustion
-    EXHAUST_COLOR: [255, 180, 0], // orange for exhaustion warning
-    ACCEL_COLOR: [100, 255, 160], // bright green for acceleration
 
     // ── Sizing ──
     MAX_RADIUS: 24,               // max bubble radius in px
@@ -129,9 +130,9 @@ function _opacityFromDominance(dominance) {
 /**
  * Detect absorption: both sides have significant volume at the same price.
  */
-function _isAbsorption(buyVol, sellVol) {
+function _isAbsorption(buyVol, sellVol, minVol) {
     const total = buyVol + sellVol;
-    if (total < BUBBLE_CONFIG.ABSORPTION_MIN * 2) return false;
+    if (total < minVol * 2) return false;
     const minSide = Math.min(buyVol, sellVol);
     return (minSide / total) >= BUBBLE_CONFIG.ABSORPTION_RATIO;
 }
@@ -187,10 +188,22 @@ class VolumeBubbleRenderer {
                     if (tv > 0) allLevelVols.push(tv);
                 }
             }
-            const avgVol = allLevelVols.length > 0
-                ? allLevelVols.reduce((a, b) => a + b, 0) / allLevelVols.length
+            // ── Step 1: THE BRAIN — Compute StdDev ──
+            const n = allLevelVols.length;
+            const avg = n > 0 ? allLevelVols.reduce((a, b) => a + b, 0) / n : 0;
+            const variance = n > 0
+                ? allLevelVols.reduce((sum, v) => {
+                    const diff = v - avg;
+                    return sum + diff * diff;
+                }, 0) / n
                 : 0;
-            const adaptiveThreshold = avgVol * BUBBLE_CONFIG.ADAPTIVE_MULTIPLIER;
+            const stddev = Math.sqrt(variance);
+
+            // Adaptive significance levels (all σ-based, zero fixed numbers)
+            const sigThreshold  = avg + BUBBLE_CONFIG.SIGMA_SIGNIFICANT * stddev;
+            const instThreshold = avg + BUBBLE_CONFIG.SIGMA_INSTITUTIONAL * stddev;
+            const absorbMinVol  = avg + BUBBLE_CONFIG.SIGMA_ABSORPTION * stddev;
+            const highDomMinVol = avg + BUBBLE_CONFIG.SIGMA_HIGH_DOM * stddev;
 
             // ── Cluster map: find significant-volume price levels hit 3+ times ──
             const clusterMap = {};  // {priceStr → [{idx, x, buy, sell, total}, ...]}
@@ -201,7 +214,7 @@ class VolumeBubbleRenderer {
                 for (const priceStr in bp) {
                     const bv = bp[priceStr][0], sv = bp[priceStr][1];
                     const tv = bv + sv;
-                    if (tv >= adaptiveThreshold) {  // only significant prints
+                    if (tv >= sigThreshold) {  // only σ-significant prints
                         if (!clusterMap[priceStr]) clusterMap[priceStr] = [];
                         clusterMap[priceStr].push({ idx: i, x: bar.x, buy: bv, sell: sv, total: tv });
                     }
@@ -235,15 +248,16 @@ class VolumeBubbleRenderer {
                     const sellVol = entry[1];
                     const totalVol = buyVol + sellVol;
 
-                    // ── Classify ──
+                    // ── Step 2: THE BRAIN — Classify via σ (no fixed thresholds) ──
                     const isBuy = buyVol >= sellVol;
                     const dominance = _dominance(buyVol, sellVol);
-                    const isAbsorb = _isAbsorption(buyVol, sellVol);
-                    const isInstitutional = totalVol >= BUBBLE_CONFIG.INSTITUTIONAL_THRESHOLD;
+                    const isAbsorb = _isAbsorption(buyVol, sellVol, absorbMinVol);
+                    const isInstitutional = totalVol >= instThreshold;
                     const highDominance = dominance >= BUBBLE_CONFIG.HIGH_DOMINANCE
-                        && totalVol >= BUBBLE_CONFIG.HIGH_DOMINANCE_MIN_VOL;
+                        && totalVol >= highDomMinVol;
+                    const isInCluster = clusteredPrices.has(priceStr);
 
-                    // ── Absolute floor: skip truly empty levels ──
+                    // Absolute floor: skip truly empty levels
                     if (totalVol < BUBBLE_CONFIG.MIN_BUBBLE_VOL) continue;
 
                     // Convert price to Y coordinate
@@ -252,43 +266,31 @@ class VolumeBubbleRenderer {
                     const y = priceConverter(price);
                     if (y === null || y === undefined || isNaN(y)) continue;
 
-                    // ── Adaptive dim-not-hide (nothing hidden, noise faded) ──
-                    // Determine if this bubble is "significant"
-                    const isInCluster = clusteredPrices.has(priceStr);
-                    const isSignificant = isAbsorb || isInstitutional || highDominance
-                        || totalVol >= adaptiveThreshold;
+                    // ── Step 3: THE EYES — Gradient from σ distance ──
+                    // How many σ above average is this bubble?
+                    const sigmaDistance = stddev > 0
+                        ? (totalVol - avg) / stddev
+                        : (totalVol > avg ? 1 : 0);
 
-                    let opacity, radius;
-                    if (isSignificant) {
-                        // Above threshold → full visibility + boost
-                        opacity = _opacityFromDominance(dominance);
-                        // Extra brightness for special events
-                        if (isAbsorb || isInstitutional || highDominance) {
-                            opacity = Math.min(opacity + 0.15, 0.95);
-                        }
-                        // Cluster boost: repeated significant volume at same price
-                        if (isInCluster) {
-                            opacity = Math.min(opacity + BUBBLE_CONFIG.CLUSTER_OPACITY_BOOST, 0.95);
-                        }
-                    } else {
-                        // Below threshold → faded background dot
-                        opacity = 0.08;
-                    }
+                    // Opacity: smooth gradient based on sigma distance
+                    // 0σ → base (0.04), each σ adds 0.20, capped at 0.92
+                    let opacity = BUBBLE_CONFIG.GRADIENT_BASE_OPACITY
+                        + Math.max(sigmaDistance, 0) * BUBBLE_CONFIG.GRADIENT_SCALE;
+                    opacity = Math.min(opacity, BUBBLE_CONFIG.GRADIENT_MAX_OPACITY);
 
-                    // ── Radius ──
+                    // Cluster boost: smooth +0.15 for repeated significant levels
+                    if (isInCluster) opacity = Math.min(opacity + 0.15, BUBBLE_CONFIG.GRADIENT_MAX_OPACITY);
+
+                    // Radius: smooth gradient based on sigma distance
+                    let radius;
                     if (useDots) {
-                        radius = isSignificant ? BUBBLE_CONFIG.DOT_RADIUS : 1.5;
-                        if (isInstitutional) radius = 4;
+                        // Dots: scale 1.0 → 4.0 based on sigma
+                        radius = Math.min(1.0 + Math.max(sigmaDistance, 0) * 0.8, 4.0);
                     } else {
-                        if (isSignificant) {
-                            const ratio = totalVol / maxVol;
-                            radius = BUBBLE_CONFIG.MIN_RADIUS +
-                                ratio * (BUBBLE_CONFIG.MAX_RADIUS - BUBBLE_CONFIG.MIN_RADIUS);
-                            radius = Math.min(radius, BUBBLE_CONFIG.MAX_RADIUS);
-                        } else {
-                            // Noise → tiny dot
-                            radius = 1.5;
-                        }
+                        // Full bubbles: scale MIN_RADIUS → MAX_RADIUS based on sigma
+                        const sigmaRatio = Math.min(Math.max(sigmaDistance, 0) / 4, 1);
+                        radius = BUBBLE_CONFIG.MIN_RADIUS
+                            + sigmaRatio * (BUBBLE_CONFIG.MAX_RADIUS - BUBBLE_CONFIG.MIN_RADIUS);
                     }
 
                     const bubble = { x, y, radius, totalVol, buyVol, sellVol, opacity, isAbsorb, isInstitutional };
@@ -438,7 +440,8 @@ class VolumeBubbleRenderer {
             }
 
             // ════════════════════════════════════════════════════════════════
-            // LAYER 6.5: CLUSTER DETECTION + VOLUME ACCELERATION
+            // LAYER 6.5: CLUSTER + ACCELERATION GRADIENT
+            // StdDev decided WHAT clusters matter. Gradient shows HOW MUCH.
             // ════════════════════════════════════════════════════════════════
             if (!useDots) {
                 for (const priceStr of clusteredPrices) {
@@ -448,7 +451,7 @@ class VolumeBubbleRenderer {
                     const y = priceConverter(price);
                     if (y === null || y === undefined || isNaN(y)) continue;
 
-                    // ── Acceleration analysis ──
+                    // ── Acceleration: smooth ratio, no thresholds ──
                     const vols = hits.map(h => h.total);
                     const halfLen = Math.floor(vols.length / 2);
                     const firstHalf = vols.slice(0, halfLen);
@@ -457,48 +460,19 @@ class VolumeBubbleRenderer {
                     const avgSecond = secondHalf.reduce((a, b) => a + b, 0) / (secondHalf.length || 1);
                     const accelRatio = avgFirst > 0 ? avgSecond / avgFirst : 1;
 
-                    // Exhaustion check: one candle 3x+ the rest
-                    const maxV = Math.max(...vols);
-                    const othersAvg = vols.filter(v => v !== maxV);
-                    const avgOthers = othersAvg.length > 0
-                        ? othersAvg.reduce((a, b) => a + b, 0) / othersAvg.length : maxV;
-                    const isExhaustion = maxV >= avgOthers * BUBBLE_CONFIG.EXHAUST_SPIKE;
+                    // ── Gradient: ratio → smooth opacity (no cutoffs) ──
+                    // ratio 0.3 → 0.08, ratio 1.0 → 0.30, ratio 2.0 → 0.55, ratio 3.0+ → 0.80
+                    const lineAlpha = Math.min(0.05 + accelRatio * 0.25, 0.80);
 
-                    // Classify acceleration state
-                    let accelState = 'stable';  // default
-                    if (isExhaustion) accelState = 'exhaustion';
-                    else if (accelRatio > BUBBLE_CONFIG.ACCEL_UP_THRESHOLD) accelState = 'accelerating';
-                    else if (accelRatio < BUBBLE_CONFIG.ACCEL_DOWN_THRESHOLD) accelState = 'decelerating';
+                    // ── Color: dominant side, saturation from ratio ──
+                    const totalBuy = hits.reduce((a, h) => a + h.buy, 0);
+                    const totalSell = hits.reduce((a, h) => a + h.sell, 0);
+                    const lineColor = totalBuy >= totalSell
+                        ? BUBBLE_CONFIG.BUY_COLOR : BUBBLE_CONFIG.SELL_COLOR;
 
-                    // ── Draw connecting line across all cluster hits ──
+                    // ── Draw connecting line ──
                     const xStart = hits[0].x;
                     const xEnd = hits[hits.length - 1].x;
-
-                    // Line color based on acceleration state
-                    let lineColor, lineAlpha;
-                    if (accelState === 'exhaustion') {
-                        lineColor = BUBBLE_CONFIG.EXHAUST_COLOR;
-                        lineAlpha = 0.7;
-                    } else if (accelState === 'accelerating') {
-                        lineColor = BUBBLE_CONFIG.ACCEL_COLOR;
-                        lineAlpha = 0.6;
-                    } else if (accelState === 'decelerating') {
-                        // Dominant side color but faded
-                        const totalBuy = hits.reduce((a, h) => a + h.buy, 0);
-                        const totalSell = hits.reduce((a, h) => a + h.sell, 0);
-                        lineColor = totalBuy >= totalSell
-                            ? BUBBLE_CONFIG.BUY_COLOR : BUBBLE_CONFIG.SELL_COLOR;
-                        lineAlpha = 0.15;  // very faded = dying
-                    } else {
-                        // Stable: dominant side color
-                        const totalBuy = hits.reduce((a, h) => a + h.buy, 0);
-                        const totalSell = hits.reduce((a, h) => a + h.sell, 0);
-                        lineColor = totalBuy >= totalSell
-                            ? BUBBLE_CONFIG.BUY_COLOR : BUBBLE_CONFIG.SELL_COLOR;
-                        lineAlpha = BUBBLE_CONFIG.CLUSTER_LINE_ALPHA;
-                    }
-
-                    // Draw the connecting line
                     ctx.strokeStyle = _rgba(lineColor, lineAlpha);
                     ctx.lineWidth = BUBBLE_CONFIG.CLUSTER_LINE_WIDTH;
                     ctx.setLineDash([]);
@@ -507,40 +481,28 @@ class VolumeBubbleRenderer {
                     ctx.lineTo(xEnd, y);
                     ctx.stroke();
 
-                    // Draw dots at each hit point
+                    // Draw dots at each hit point (opacity follows gradient)
                     for (const hit of hits) {
-                        ctx.fillStyle = _rgba(lineColor, lineAlpha + 0.15);
+                        ctx.fillStyle = _rgba(lineColor, Math.min(lineAlpha + 0.15, 0.90));
                         ctx.beginPath();
                         ctx.arc(hit.x, y, 2.5, 0, Math.PI * 2);
                         ctx.fill();
                     }
 
-                    // ── Badge: hit count + acceleration state ──
+                    // ── Badge: hit count + raw ratio (no labels, just data) ──
                     const badgeX = xEnd + 6;
                     ctx.font = BUBBLE_CONFIG.CLUSTER_BADGE_FONT;
                     ctx.textAlign = 'left';
                     ctx.textBaseline = 'middle';
 
-                    let badge = `${hits.length}×`;
-                    let badgeColor;
-                    if (accelState === 'exhaustion') {
-                        badge += ' ⚠';
-                        badgeColor = _rgba(BUBBLE_CONFIG.EXHAUST_COLOR, 0.9);
-                    } else if (accelState === 'accelerating') {
-                        badge += ' ↑';
-                        badgeColor = _rgba(BUBBLE_CONFIG.ACCEL_COLOR, 0.9);
-                    } else if (accelState === 'decelerating') {
-                        badge += ' ↓';
-                        badgeColor = _rgba(lineColor, 0.4);
-                    } else {
-                        badgeColor = _rgba(lineColor, 0.7);
-                    }
+                    const badge = `${hits.length}× ${accelRatio.toFixed(1)}r`;
+                    const badgeAlpha = Math.min(lineAlpha + 0.20, 0.90);
 
                     // Badge shadow
                     ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
                     ctx.fillText(badge, badgeX + 1, y + 1);
                     // Badge text
-                    ctx.fillStyle = badgeColor;
+                    ctx.fillStyle = _rgba(lineColor, badgeAlpha);
                     ctx.fillText(badge, badgeX, y);
 
                     ctx.textAlign = 'center';  // reset
