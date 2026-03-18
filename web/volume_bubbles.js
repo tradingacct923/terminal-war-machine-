@@ -594,200 +594,87 @@ class VolumeBubbleRenderer {
                 const icebergs = bar.originalData.icebergs;
                 const x = bar.x;
 
+                // ── HEDGE FUND RULE: pick only the BEST iceberg per candle ──
+                let best = null;
+                let bestVol = 0;
                 for (const priceStr in icebergs) {
                     const ice = icebergs[priceStr];
-                    const price = parseFloat(priceStr);
-                    if (isNaN(price)) continue;
-                    const y = priceConverter(price);
-                    if (y === null || y === undefined || isNaN(y)) continue;
-
-                    const isBuy = ice.side === 'b';
-                    const color = isBuy ? BUBBLE_CONFIG.ICE_BUY_COLOR : BUBBLE_CONFIG.ICE_SELL_COLOR;
-
-                    if (useDots) {
-                        // Macro zoom: small diamond dot
-                        ctx.fillStyle = _rgba(color, 0.8);
-                        ctx.beginPath();
-                        const ds = BUBBLE_CONFIG.ICE_DOT_SIZE;
-                        ctx.moveTo(x, y - ds);
-                        ctx.lineTo(x + ds, y);
-                        ctx.lineTo(x, y + ds);
-                        ctx.lineTo(x - ds, y);
-                        ctx.closePath();
-                        ctx.fill();
-                    } else {
-                        // Full zoom: diamond with glow + pulse + label
-                        const ds = BUBBLE_CONFIG.ICE_DIAMOND_SIZE;
-
-                        // Pulse speed varies by confidence: high=fast, low=slow
-                        const conf = ice.confidence || 'high';
-                        const pulseSpeed = conf === 'high' ? BUBBLE_CONFIG.ICE_PULSE_SPEED
-                            : conf === 'medium' ? BUBBLE_CONFIG.ICE_PULSE_SPEED * 1.5
-                            : BUBBLE_CONFIG.ICE_PULSE_SPEED * 2.5;
-                        const t = (performance.now() % pulseSpeed) / pulseSpeed;
-                        const pulseAlpha = 0.6 + 0.4 * Math.sin(t * Math.PI * 2);
-
-                        // Glow — wider for high confidence
-                        const glowMult = conf === 'high' ? 2.5 : conf === 'medium' ? 2.0 : 1.5;
-                        const glowGrad = ctx.createRadialGradient(x, y, ds * 0.5, x, y, ds * glowMult);
-                        glowGrad.addColorStop(0, _rgba(color, 0.3 * pulseAlpha));
-                        glowGrad.addColorStop(1, 'rgba(0,0,0,0)');
-                        ctx.fillStyle = glowGrad;
-                        ctx.beginPath();
-                        ctx.arc(x, y, ds * glowMult, 0, Math.PI * 2);
-                        ctx.fill();
-
-                        // Diamond shape
-                        ctx.fillStyle = _rgba(color, 0.85 * pulseAlpha);
-                        ctx.beginPath();
-                        ctx.moveTo(x, y - ds);
-                        ctx.lineTo(x + ds * 0.7, y);
-                        ctx.lineTo(x, y + ds);
-                        ctx.lineTo(x - ds * 0.7, y);
-                        ctx.closePath();
-                        ctx.fill();
-
-                        // Diamond border
-                        ctx.strokeStyle = _rgba(color, 0.9);
-                        ctx.lineWidth = 1.5;
-                        ctx.stroke();
-
-                        // Volume label: visible / est hidden
-                        const visVol = ice.est_total >= 1000
-                            ? (ice.est_total / 1000).toFixed(1) + 'k'
-                            : String(ice.est_total);
-                        const estHidden = ice.est_hidden && ice.est_hidden > ice.est_total
-                            ? (ice.est_hidden >= 1000
-                                ? '~' + (ice.est_hidden / 1000).toFixed(1) + 'k'
-                                : '~' + ice.est_hidden)
-                            : null;
-                        const volLabel = estHidden ? `${visVol}/${estHidden}` : `~${visVol}`;
-
-                        ctx.font = BUBBLE_CONFIG.FONT_SMALL;
-                        ctx.textAlign = 'center';
-                        ctx.textBaseline = 'middle';
-                        ctx.fillStyle = 'rgba(0,0,0,0.5)';
-                        ctx.fillText(volLabel, x + 1, y + 1);
-                        ctx.fillStyle = BUBBLE_CONFIG.TEXT_COLOR;
-                        ctx.fillText(volLabel, x, y);
-
-                        // ── PRESSURE + DECAY BADGE ──
-                        const pressure = ice.pressure || 'wall_active';
-                        const decay = ice.decay || 'holding';
-                        const isZone = ice.zone || false;
-
-                        // Decay arrow: ⬇ exhausting, ⬆ strengthening, ─ holding
-                        const decayArrow = decay === 'exhausting' ? '⬇'
-                            : decay === 'strengthening' ? '⬆' : '─';
-
-                        // Pressure label
-                        let pressureLabel = '';
-                        let pressureColor = color;
-                        if (pressure === 'bullish_wall') {
-                            pressureLabel = 'BUY WALL';
-                            pressureColor = '#00e676';
-                        } else if (pressure === 'bearish_wall') {
-                            pressureLabel = 'SELL WALL';
-                            pressureColor = '#ff1744';
-                        } else if (pressure === 'wall_breaking') {
-                            pressureLabel = 'BREAKING';
-                            pressureColor = '#ffab00';
-                        } else if (pressure === 'wall_exhausted') {
-                            pressureLabel = 'EMPTY';
-                            pressureColor = '#ff6d00';
-                        } else if (pressure === 'wall_fresh') {
-                            pressureLabel = 'FRESH';
-                            pressureColor = '#00b0ff';
-                        } else {
-                            pressureLabel = conf === 'high' ? 'ICE·H'
-                                : conf === 'medium' ? 'ICE·M' : 'ICE·L';
-                        }
-
-                        // Zone prefix
-                        const zonePrefix = isZone ? 'Z:' : '';
-                        const badgeText = `${zonePrefix}${pressureLabel}${decayArrow}`;
-
-                        ctx.font = BUBBLE_CONFIG.FONT_BADGE;
-                        ctx.fillStyle = pressureColor;
-                        ctx.fillText(badgeText, x, y + ds + 8);
-
-                        // Fill % micro-bar below badge (tiny progress indicator)
-                        const fillPct = ice.fill_pct || 0;
-                        if (fillPct > 0 && fillPct < 1) {
-                            const barW = ds * 1.4;
-                            const barH = 2;
-                            const barY = y + ds + 14;
-                            ctx.fillStyle = 'rgba(255,255,255,0.15)';
-                            ctx.fillRect(x - barW / 2, barY, barW, barH);
-                            ctx.fillStyle = pressureColor;
-                            ctx.fillRect(x - barW / 2, barY, barW * fillPct, barH);
-                        }
-
-                        // ── ELITE LINE 2: DOM + Timing + Size Rank ──
-                        let eliteLine2 = '';
-                        // DOM confirmation
-                        const domConf = ice.dom_confirmed || '';
-                        if (domConf === 'confirmed') eliteLine2 += '✓DOM ';
-                        else if (domConf === 'likely') eliteLine2 += '~DOM ';
-                        else if (domConf === 'possible') eliteLine2 += '?DOM ';
-
-                        // Timing badge
-                        const timing = ice.timing || '';
-                        if (timing === 'algo_confirmed') eliteLine2 += '⏱algo ';
-                        else if (timing === 'algo_likely') eliteLine2 += '⏱~algo ';
-                        else if (timing === 'random') eliteLine2 += '⏱rand ';
-
-                        // Size rank icon
-                        const rank = ice.size_rank || 'retail';
-                        if (rank === 'whale') eliteLine2 += '🐋';
-                        else if (rank === 'institutional') eliteLine2 += '🏛';
-                        else if (rank === 'professional') eliteLine2 += '👔';
-
-                        if (eliteLine2.trim()) {
-                            ctx.font = '7px monospace';
-                            ctx.fillStyle = 'rgba(180,220,255,0.85)';
-                            ctx.fillText(eliteLine2.trim(), x, y + ds + 22);
-                        }
-
-                        // ── ELITE LINE 3: Countdown + Level Memory ──
-                        let eliteLine3 = '';
-                        const iceState = ice.state || '';
-                        const depletesIn = ice.depletes_in_sec || 0;
-
-                        if (iceState === 'critical') {
-                            eliteLine3 += `⚠️CRITICAL ${depletesIn.toFixed(0)}s `;
-                        } else if (iceState === 'depleting') {
-                            eliteLine3 += `↘${depletesIn.toFixed(0)}s `;
-                        } else if (iceState === 'active') {
-                            eliteLine3 += `⏳${depletesIn.toFixed(0)}s `;
-                        }
-
-                        // Level memory
-                        const lvlCount = ice.level_ice_count || 0;
-                        if (lvlCount > 1) {
-                            eliteLine3 += `📍×${lvlCount}`;
-                        }
-
-                        if (eliteLine3.trim()) {
-                            ctx.font = '7px monospace';
-                            ctx.fillStyle = iceState === 'critical' ? '#ff1744' : 'rgba(180,220,255,0.75)';
-                            ctx.fillText(eliteLine3.trim(), x, y + ds + 30);
-                        }
-
-                        // ── ELITE LINE 4: Prediction ──
-                        if (ice.prediction) {
-                            const pred = ice.prediction;
-                            const sign = pred.avg_move_30s >= 0 ? '+' : '';
-                            let predText = `${sign}${pred.avg_move_30s} / ${pred.win_rate}% (n=${pred.sample_size})`;
-                            if (pred.pred_confidence === 'high') predText += ' ✓';
-                            else if (pred.pred_confidence === 'low') predText += ' ⚠️';
-
-                            ctx.font = '7px monospace';
-                            ctx.fillStyle = pred.win_rate > 65 ? '#00e676'
-                                : pred.win_rate > 50 ? '#ffab00' : '#ff1744';
-                            ctx.fillText(predText, x, y + ds + 38);
-                        }
+                    const conf = ice.confidence || 'low';
+                    // Only render high confidence detections
+                    if (conf !== 'high' && conf !== 'medium') continue;
+                    const vol = ice.est_total || 0;
+                    if (vol > bestVol) {
+                        bestVol = vol;
+                        best = { price: parseFloat(priceStr), ice };
                     }
+                }
+                if (!best || isNaN(best.price)) continue;
+
+                const ice = best.ice;
+                const price = best.price;
+                const y = priceConverter(price);
+                if (y === null || y === undefined || isNaN(y)) continue;
+
+                const isBuy = ice.side === 'b';
+                const color = isBuy ? BUBBLE_CONFIG.ICE_BUY_COLOR : BUBBLE_CONFIG.ICE_SELL_COLOR;
+                const conf = ice.confidence || 'high';
+
+                if (useDots) {
+                    // Macro zoom: small diamond dot
+                    ctx.fillStyle = _rgba(color, 0.8);
+                    ctx.beginPath();
+                    const ds = BUBBLE_CONFIG.ICE_DOT_SIZE;
+                    ctx.moveTo(x, y - ds);
+                    ctx.lineTo(x + ds, y);
+                    ctx.lineTo(x, y + ds);
+                    ctx.lineTo(x - ds, y);
+                    ctx.closePath();
+                    ctx.fill();
+                } else {
+                    // Full zoom: clean diamond + ONE short label
+                    const ds = BUBBLE_CONFIG.ICE_DIAMOND_SIZE * 0.7;  // smaller
+
+                    // Subtle glow
+                    const glowGrad = ctx.createRadialGradient(x, y, ds * 0.3, x, y, ds * 1.8);
+                    glowGrad.addColorStop(0, _rgba(color, 0.2));
+                    glowGrad.addColorStop(1, 'rgba(0,0,0,0)');
+                    ctx.fillStyle = glowGrad;
+                    ctx.beginPath();
+                    ctx.arc(x, y, ds * 1.8, 0, Math.PI * 2);
+                    ctx.fill();
+
+                    // Diamond shape
+                    ctx.fillStyle = _rgba(color, 0.85);
+                    ctx.beginPath();
+                    ctx.moveTo(x, y - ds);
+                    ctx.lineTo(x + ds * 0.7, y);
+                    ctx.lineTo(x, y + ds);
+                    ctx.lineTo(x - ds * 0.7, y);
+                    ctx.closePath();
+                    ctx.fill();
+                    ctx.strokeStyle = _rgba(color, 0.9);
+                    ctx.lineWidth = 1;
+                    ctx.stroke();
+
+                    // Volume label inside diamond
+                    const volK = bestVol >= 1000
+                        ? (bestVol / 1000).toFixed(0) + 'k'
+                        : String(bestVol);
+                    ctx.font = '7px monospace';
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillStyle = '#fff';
+                    ctx.fillText(volK, x, y);
+
+                    // ONE short badge below — that's it, no walls of text
+                    const rank = ice.size_rank || '';
+                    const icon = rank === 'whale' ? '🐋'
+                        : rank === 'institutional' ? '🏛' : '';
+                    const badge = icon || (conf === 'high' ? '◆' : '◇');
+
+                    ctx.font = '8px sans-serif';
+                    ctx.fillStyle = _rgba(color, 0.9);
+                    ctx.fillText(badge, x, y + ds + 8);
                 }
             }
 
