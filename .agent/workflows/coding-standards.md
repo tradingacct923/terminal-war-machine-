@@ -4,78 +4,87 @@ description: Coding standards and rules for the War Machine trading terminal
 
 # War Machine Trading Terminal — Coding Standards
 
-## Design Philosophy
-Hedge fund-grade terminal. Clean, institutional, premium. No noise.
+## RULE #1: ZERO GUESSING. PROVEN DATA ONLY.
+
+This is a $300M NQ market maker terminal competing against other market makers.
+**Every single number on screen must be traceable to raw exchange data or computed via proven math.**
+If it cannot be proven, it does not go on screen. Period.
+
+### BANNED — Do not even bring to the table:
+
+| Category | Examples | Why |
+|---|---|---|
+| Hardcoded thresholds | `MIN_VOLUME = 100`, `MIN_TRADES = 15` | Made-up numbers. Use σ-adaptive. |
+| Extrapolated values | `est_hidden`, `fill_pct`, `depletes_in_sec` | Guesses dressed as data. |
+| Arbitrary labels | "whale", "institutional", "professional" | Arbitrary size buckets. |
+| Retail cosmetics | Emojis (🐋🏛👔), vague words ("STEALTH", "TRAP", "FRESH") | Not professional. |
+| Unvalidated detections | Any signal that hasn't been backtested or validated | Noise, not signal. |
+
+### ALLOWED — Only these types of values:
+
+| Grade | Type | Example | Status |
+|---|---|---|---|
+| A | Raw exchange data | Trade price, volume, CME aggressor side, timestamp | ✅ Always show |
+| B | Computed from A-grade | CV, delta, notional $, VWAP, absorption ratio | ✅ Always show |
+| C | σ-adaptive threshold | `threshold = rolling_mean + 2σ` from live data | ✅ Show with confidence |
+| D | Hardcoded threshold | `MIN_TRADES = 15` | ❌ BANNED |
+| F | Guess/extrapolation | `est_hidden`, `depletes_in_sec` | ❌ BANNED |
+
+### Before writing ANY code, ask:
+1. Where does every number come from? Trace to raw data or remove.
+2. Is any threshold hardcoded? Make it σ-adaptive or remove.
+3. Would a quant at Citadel trust this? If not, don't show it.
+4. Can this be backtested? If not, it's not ready.
 
 ## Volume Bubble Logic (volume_bubbles.js)
 
 ### How Bubbles Work
 - Backend sends `bp` (bubble profile) per candle: `{price: [buyVol, sellVol]}`
 - ALL thresholds are σ-adaptive using **log-transform StdDev** — ZERO fixed contract numbers
-- Log-transform prevents one whale print from breaking the scale
 - Thresholds recalculate every frame based on visible candles
 
 ### σ Thresholds (from code — no fixed numbers)
-- `1.0σ` = absorption context level
-- `1.5σ` = unusual (top ~7% of prints) — minimum to render a bubble
+- `1.5σ` = minimum to render (top ~7% of prints)
 - `3.0σ` = extreme outlier / institutional (top ~0.1%)
-- `0.5σ` = minimum volume for high-dominance bypass (90%+ one-sided)
-
-### What Makes a Bubble Appear (conviction × consistency × one-sidedness)
-- **NOT just big prints** — a 20-lot at 95% buy dominance clustered at a defended price is more tradeable than a random 300-lot
-- Bubbles show **conviction patterns**, not raw size:
-  1. 🟣 **Absorption** (purple) — both sides 35%+ at same price, 1σ+ vol. Battle happening.
-  2. 🟢🔴 **Aggression** (green/red) — 80%+ one-sided dominance, 1.5σ+ vol. Conviction showing.
-  3. 🔵 **Cluster lines** — same price hit 3+ candles, volume accelerating. Defended level.
-  4. **Institutional glow** — 3σ+ prints get a glow ring (adaptive, not fixed contracts)
-
-### Opacity = σ² Exponential Curve
-- Below 1.5σ → don't render at all (hard cutoff, not dim)
-- 1.5σ → visible
-- 2σ → stands out
-- 3σ → pops
-- 4σ → maximum presence
-
-### Radius = σ-Based Scaling
-- `sigmaRatio = (sigmaDistance / 4)^1.5`
-- 3px minimum → 24px maximum
-- Size tells the story — no text labels needed on chart
+- Opacity = σ² exponential curve. Below 1.5σ → don't render.
+- Radius = `(sigmaDistance / 4)^1.5`, 3px min → 24px max
 
 ## Detection Logic (l2_worker.py)
 
-### Iceberg v4 — 30+ fields, 6 elite features
-- Zone detection (±2 ticks), adaptive clip floor (50% rolling average)
-- Tiered windows: 5s=high, 15s=medium, 60s=low
-- CV < 0.35 for clip consistency
-- Elite: DOM cross-validation, inter-fill timing, completion countdown
-- Fill exhaustion (linear regression slope), absorption, size rank (σ distance)
-- Level memory, post-iceberg predictions (+10/30/60s outcome tracking)
+### ALL detection thresholds MUST be σ-adaptive
+- Iceberg: clip consistency via CV, detection window tiered (5s/15s/60s)
+- Sweep: σ-adaptive volume threshold from rolling trade distribution
+- Spoof: σ-adaptive size threshold from rolling DOM depth distribution
+- Ignition: σ-adaptive trade count from rolling arrival rate distribution
+- Divergence: σ-adaptive price move from rolling ATR
 
-### Drifting Iceberg — 3-Layer Detection
-- **Layer 1 (Behavioral):** Same-side fills across ALL prices, clip CV < 0.40, 5+ fills, 3+ prices, 30s window
-- **Layer 2 (DOM Depth):** Total depth barely drops despite fills. depth_leak_ratio > 0.5 = confirmed
-- **Layer 3 (Timing):** Inter-fill gap CV < 0.3 = algo regularity
-- Composite score 0-6. ≥4=confirmed, ≥2=likely, <2=possible
+### What IS proven (keep):
+- CV (coefficient of variation) — pure math
+- DOM cross-validation — checks real book
+- Linear regression slope on fill sizes — pure math
+- Absorption ratio — real opposing volume
+- Notional $ — `volume × price × $20` (exact)
+- Cumulative delta — sum of real trades
+- Level memory — count of events at same price
 
-### Other Detections
-- **Sweep:** 200ms window, 3+ levels, 30+ vol
-- **Spoof:** DOM diff, 100+ size, vanishes within 3s, 2+ occurrences
-- **Ignition:** 8 trades/2s, small clips, reversal check at 30s
-- **Delta Divergence:** 20-candle lookback, price vs cumulative delta
-- **Wall Gone:** 3s without iceberg refill
+### What is NOT proven (remove or make σ-adaptive):
+- Any `MIN_*` or `MAX_*` constant with a hardcoded number
+- Any `est_*` field
+- Any countdown or depletion timer
+- Any label that categorizes by arbitrary size buckets
 
 ## Coding Rules
-- ALL thresholds use σ (standard deviation) — NEVER fixed contract numbers
-- Fix completely in one shot — check actual backend data before writing frontend filters
-- When user raises an issue or improvement, IMPLEMENT IT — don't ask permission
-- Always question your own thresholds: "does this cutoff make sense for the signal type?"
-- Answer with CLARITY — read the actual code before answering, never guess or make up numbers
+- **NEVER ship hardcoded thresholds** — σ-adaptive or remove
+- Fix completely in one shot — check actual backend data before writing frontend
+- Answer with CLARITY — read actual code, never guess or make up numbers
 - When in doubt, make it cleaner and more minimal
+- **Deploy: changes stay in files. Do NOT restart server or load to localhost without explicit user approval**
+- **Production site (kaaliweb.uk) is NEVER modified without explicit instruction**
 
 ## Architecture
 - Backend: `l2_worker.py` (Python) — all detection logic
 - Frontend: `volume_bubbles.js` (JavaScript) — Canvas 2D rendering
 - Server: `server.py` (Python) — WebSocket pipeline
-- Process manager: PM2 (`pm2 restart war-machine`)
+- Dev port: 3001, Production port: 3000
 
 // turbo-all

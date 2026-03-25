@@ -51,7 +51,6 @@
         <!-- L2 Symbol buttons -->
         <div class="t-btn-group" id="t-symbols">
           <button class="t-btn active" data-sym="NQ">NQ</button>
-          <button class="t-btn" data-sym="GC">GC</button>
         </div>
         <span class="t-divider"></span>
         <!-- Timeframes -->
@@ -80,13 +79,235 @@
       <div class="t-tb-right">
         <span class="t-timestamp" id="t-timestamp">—</span>
         <span class="t-badge live" id="t-badge">LIVE</span>
-        <button class="t-settings-btn" id="t-settings-btn">⚙</button>
+        <button class="t-settings-btn" id="t-heatmap-settings-btn" title="Heatmap Settings">⚙</button>
+      </div>
+    </div>
+
+    <!-- ── Heatmap Settings Dropdown Panel ── -->
+    <div class="hm-settings-panel" id="hm-settings-panel" style="display:none">
+      <div class="hm-settings-header">
+        <span>🎨 HEATMAP SETTINGS</span>
+        <button class="hm-settings-close" id="hm-settings-close">✕</button>
+      </div>
+      <div class="hm-settings-body">
+
+        <!-- ═══ GROUP 1: VISUAL ═══ -->
+        <div class="hm-group" data-open="true">
+          <div class="hm-group-header" onclick="this.parentElement.dataset.open = this.parentElement.dataset.open === 'true' ? 'false' : 'true'">
+            <span class="hm-group-arrow">▸</span> Visual
+          </div>
+          <div class="hm-group-body">
+
+            <!-- Imbalance Cells -->
+            <div class="hm-row">
+              <label class="hm-toggle"><input type="checkbox" id="hms-imbalance" checked><span class="hm-slider"></span></label>
+              <span class="hm-label">Imbalance Cells</span>
+              <div class="hm-controls">
+                <label title="Bid color"><input type="color" id="hms-bid-color" value="#00ff96"></label>
+                <label title="Ask color"><input type="color" id="hms-ask-color" value="#ff4030"></label>
+                <input type="range" min="10" max="100" value="75" id="hms-imbalance-opacity" title="Opacity">
+              </div>
+            </div>
+            <!-- Depth Max -->
+            <div class="hm-row">
+              <span class="hm-label" style="padding-left:28px;font-size:9px;color:rgba(160,170,200,.6)">Depth Max</span>
+              <div class="hm-controls" style="flex:1">
+                <input type="range" min="0" max="500" value="0" id="hms-depthmax" title="0 = Auto (EWMA), >0 = manual max contracts">
+                <span id="hms-depthmax-val" style="font-size:8px;color:rgba(160,170,200,.5);min-width:28px;text-align:right">auto</span>
+              </div>
+            </div>
+            <!-- Mid-Price Line -->
+            <div class="hm-row">
+              <label class="hm-toggle"><input type="checkbox" id="hms-midprice" checked><span class="hm-slider"></span></label>
+              <span class="hm-label">Mid-Price Line</span>
+              <div class="hm-controls">
+                <label><input type="color" id="hms-midprice-color" value="#ffdc00"></label>
+                <input type="range" min="1" max="5" value="2" id="hms-midprice-width" title="Thickness">
+              </div>
+            </div>
+            <!-- Micro-Price Line -->
+            <div class="hm-row">
+              <label class="hm-toggle"><input type="checkbox" id="hms-microprice" checked><span class="hm-slider"></span></label>
+              <span class="hm-label">Micro-Price Line</span>
+              <div class="hm-controls">
+                <label><input type="color" id="hms-microprice-color" value="#00dcff"></label>
+                <input type="range" min="1" max="5" value="3" id="hms-microprice-width" title="Thickness">
+              </div>
+            </div>
+
+
+
+          </div>
+        </div>
+
+        <!-- ═══ GROUP 2: SIGNALS ═══ -->
+        <div class="hm-group" data-open="true">
+          <div class="hm-group-header" onclick="this.parentElement.dataset.open = this.parentElement.dataset.open === 'true' ? 'false' : 'true'">
+            <span class="hm-group-arrow">▸</span> Signals
+          </div>
+          <div class="hm-group-body">
+
+            <!-- Cumulative Delta -->
+            <div class="hm-row">
+              <label class="hm-toggle"><input type="checkbox" id="hms-delta" checked><span class="hm-slider"></span></label>
+              <span class="hm-label">Cumulative Delta (Δ)</span>
+              <div class="hm-controls">
+                <input type="range" min="20" max="80" value="40" id="hms-delta-height" title="Strip Height">
+              </div>
+            </div>
+            <!-- Depth Persistence -->
+            <div class="hm-row">
+              <label class="hm-toggle"><input type="checkbox" id="hms-persistence" checked><span class="hm-slider"></span></label>
+              <span class="hm-label">Depth Persistence</span>
+              <div class="hm-controls">
+                <span style="font-size:8px;color:rgba(160,170,200,.5)">spoof filter</span>
+              </div>
+            </div>
+            <!-- Depth Velocity -->
+            <div class="hm-row">
+              <label class="hm-toggle"><input type="checkbox" id="hms-velocity" checked><span class="hm-slider"></span></label>
+              <span class="hm-label">Depth Velocity</span>
+              <div class="hm-controls">
+                <span style="font-size:8px;color:rgba(160,170,200,.5)">loading pulses</span>
+              </div>
+            </div>
+
+
+          </div>
+        </div>
+
+        <!-- ═══ GROUP 3: TUNING ═══ -->
+        <div class="hm-group" data-open="false">
+          <div class="hm-group-header" onclick="this.parentElement.dataset.open = this.parentElement.dataset.open === 'true' ? 'false' : 'true'">
+            <span class="hm-group-arrow">▸</span> Tuning
+          </div>
+          <div class="hm-group-body">
+
+            <!-- OTR Real -->
+            <div class="hm-row">
+              <span class="hm-label" style="padding-left:8px;font-size:9px;color:rgba(160,170,200,.6)">OTR Real ≤</span>
+              <div class="hm-controls" style="flex:1">
+                <input type="range" min="1" max="20" value="3" id="hms-otr-low" title="OTR below this = real (green)">
+                <span id="hms-otr-low-val" style="font-size:8px;color:rgba(0,255,120,.7);min-width:16px;text-align:right">3</span>
+              </div>
+            </div>
+            <!-- OTR Fake -->
+            <div class="hm-row">
+              <span class="hm-label" style="padding-left:8px;font-size:9px;color:rgba(160,170,200,.6)">OTR Fake ≥</span>
+              <div class="hm-controls" style="flex:1">
+                <input type="range" min="3" max="50" value="10" id="hms-otr-high" title="OTR above this = fake (red)">
+                <span id="hms-otr-high-val" style="font-size:8px;color:rgba(255,60,60,.7);min-width:16px;text-align:right">10</span>
+              </div>
+            </div>
+            <!-- Persist Est -->
+            <div class="hm-row">
+              <span class="hm-label" style="padding-left:8px;font-size:9px;color:rgba(160,170,200,.6)">Persist Est.</span>
+              <div class="hm-controls" style="flex:1">
+                <input type="range" min="2" max="30" value="5" id="hms-persist-mid" title="Snapshots for established tier">
+                <span id="hms-persist-mid-val" style="font-size:8px;color:rgba(0,255,120,.7);min-width:16px;text-align:right">5</span>
+              </div>
+            </div>
+            <!-- Persist Battle -->
+            <div class="hm-row">
+              <span class="hm-label" style="padding-left:8px;font-size:9px;color:rgba(160,170,200,.6)">Persist Battle</span>
+              <div class="hm-controls" style="flex:1">
+                <input type="range" min="5" max="100" value="20" id="hms-persist-high" title="Snapshots for battle-tested tier">
+                <span id="hms-persist-high-val" style="font-size:8px;color:rgba(255,255,255,.7);min-width:16px;text-align:right">20</span>
+              </div>
+            </div>
+            <!-- Vel σ -->
+            <div class="hm-row">
+              <span class="hm-label" style="padding-left:8px;font-size:9px;color:rgba(160,170,200,.6)">Vel. σ</span>
+              <div class="hm-controls" style="flex:1">
+                <input type="range" min="5" max="30" value="10" id="hms-vel-sigma" title="Velocity σ threshold (÷10). 10 = 1.0σ">
+                <span id="hms-vel-sigma-val" style="font-size:8px;color:rgba(0,220,255,.7);min-width:20px;text-align:right">1.0</span>
+              </div>
+            </div>
+            <!-- Wall Glow % -->
+            <div class="hm-row">
+              <span class="hm-label" style="padding-left:8px;font-size:9px;color:rgba(160,170,200,.6)">Wall Glow %</span>
+              <div class="hm-controls" style="flex:1">
+                <input type="range" min="70" max="99" value="90" id="hms-wallglow-pct" title="Percentile for wall glow. 90 = P90">
+                <span id="hms-wallglow-pct-val" style="font-size:8px;color:rgba(255,200,50,.7);min-width:20px;text-align:right">90</span>
+              </div>
+            </div>
+            <!-- EWMA α -->
+            <div class="hm-row">
+              <span class="hm-label" style="padding-left:8px;font-size:9px;color:rgba(160,170,200,.6)">EWMA α</span>
+              <div class="hm-controls" style="flex:1">
+                <input type="range" min="1" max="20" value="5" id="hms-ewma-alpha" title="EWMA decay (÷100). 5 = 0.05">
+                <span id="hms-ewma-alpha-val" style="font-size:8px;color:rgba(160,170,200,.5);min-width:24px;text-align:right">0.05</span>
+              </div>
+            </div>
+            <!-- Flicker Filter -->
+            <div class="hm-row">
+              <span class="hm-label" style="padding-left:8px;font-size:9px;color:rgba(160,170,200,.6)">Flicker Filter</span>
+              <div class="hm-controls" style="flex:1">
+                <input type="range" min="0" max="15" value="0" id="hms-flicker-filter" title="Min persistence (snapshots) to display. 0=off, 3-10=typical">
+                <span id="hms-flicker-filter-val" style="font-size:8px;color:rgba(160,170,200,.5);min-width:20px;text-align:right">off</span>
+              </div>
+            </div>
+            <!-- BBO Bar -->
+            <div class="hm-row">
+              <label class="hm-label"><input type="checkbox" id="hms-bbo-bar" checked> BBO Bar</label>
+            </div>
+            <!-- Cluster Tape -->
+            <div class="hm-row">
+              <label class="hm-label"><input type="checkbox" id="hms-cluster-tape" checked> Cluster Tape</label>
+            </div>
+
+          </div>
+        </div>
+
+        <div class="hm-row hm-actions">
+          <button class="hm-reset-btn" id="hms-reset">Reset Defaults</button>
+        </div>
       </div>
     </div>
 
     <!-- ── Row 2 Left: L2 Chart Panel ── -->
     <div class="t-chart" id="t-chart">
       <div id="t-l2-candle-chart" style="width:100%;height:100%"></div>
+    </div>
+
+    <!-- ── Row 2 Right: Options Chain Panel (Fusion) — HIDDEN ── -->
+    <div class="t-options" id="t-options" style="display:none">
+      <div class="oc-header">
+        <span class="oc-title">OPTIONS CHAIN</span>
+        <div class="oc-controls">
+          <select class="oc-select" id="oc-symbol">
+            <option value="QQQ">QQQ</option>
+            <option value="SPY">SPY</option>
+            <option value="GLD">GLD</option>
+          </select>
+          <select class="oc-select" id="oc-expiry"></select>
+          <span class="oc-select" id="oc-exp-label" style="border:none;color:rgba(140,160,200,.5);font-size:.5rem">—</span>
+        </div>
+      </div>
+      <div id="oc-fusion-alert" style="display:none;padding:0 8px 4px"></div>
+      <div class="oc-table-wrap">
+        <table class="oc-table">
+          <thead>
+            <tr>
+              <th colspan="4" class="oc-call-header">── CALLS ──</th>
+              <th colspan="2" class="oc-strike-header" style="color:rgba(124,90,247,.7);font-size:.5rem">FUSION</th>
+              <th class="oc-strike-header">STRIKE</th>
+              <th colspan="2" class="oc-strike-header" style="color:rgba(0,212,255,.6);font-size:.5rem">GEX · ICE</th>
+              <th colspan="4" class="oc-put-header">── PUTS ──</th>
+            </tr>
+            <tr class="oc-sub-header">
+              <th>Bid</th><th>Ask</th><th>Vol</th><th>IV</th>
+              <th style="color:rgba(124,90,247,.6)">NQ$</th>
+              <th style="color:rgba(140,160,200,.5)">P/C</th>
+              <th></th>
+              <th style="color:rgba(0,212,255,.5)">GEX</th>
+              <th style="color:rgba(0,212,255,.5)">🧊</th>
+              <th>Bid</th><th>Ask</th><th>Vol</th><th>IV</th>
+            </tr>
+          </thead>
+          <tbody id="oc-tbody"></tbody>
+        </table>
+      </div>
     </div>
 
 

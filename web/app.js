@@ -85,8 +85,8 @@ function doLogout() {
         }, 400);
     };
 
-    // Fallback: auto-dismiss after 30s in case data never comes
-    setTimeout(() => { if (window._dismissWelcome) window._dismissWelcome(); }, 30000);
+    // Fallback: auto-dismiss after 8s in case data never comes
+    setTimeout(() => { if (window._dismissWelcome) window._dismissWelcome(); }, 8000);
 })();
 
 // ── Sidebar navigation REMOVED — terminal mode only ─────────────────────────
@@ -1211,15 +1211,16 @@ async function buildIVDiagram() {
 function render(data) {
     // Header
     try {
-        document.getElementById("ticker").textContent = data.ticker;
+        const _h = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+        _h("ticker", data.ticker);
         _updateActivePreset(data.ticker);
-        document.getElementById("spot").textContent = "$" + data.spot.toFixed(2);
-        document.getElementById("timestamp").textContent = fmtTime(data.timestamp);
-        document.getElementById("callWall").textContent = "$" + data.call_wall.toFixed(0);
-        document.getElementById("putWall").textContent = "$" + data.put_wall.toFixed(0);
-        document.getElementById("majorWall").textContent = "$" + data.major_wall.toFixed(0);
-        document.getElementById("maxPain").textContent = "$" + data.max_pain.toFixed(0);
-    } catch (e) { console.error("Header render:", e); }
+        _h("spot", "$" + data.spot.toFixed(2));
+        _h("timestamp", fmtTime(data.timestamp));
+        _h("callWall", "$" + data.call_wall.toFixed(0));
+        _h("putWall", "$" + data.put_wall.toFixed(0));
+        _h("majorWall", "$" + data.major_wall.toFixed(0));
+        _h("maxPain", "$" + data.max_pain.toFixed(0));
+    } catch (e) { /* silenced — header elements may not exist in all views */ }
 
     const spot = data.spot;
     window._lastHmData = { oi_hm: data.oi_hm, dex_hm: data.dex_hm, gex_hm: data.gex_hm, spot };
@@ -1487,6 +1488,11 @@ async function update() {
         badge.style.background = "rgba(255,68,102,.15)";
         badge.style.borderColor = "rgba(255,68,102,.3)";
         console.error("Fetch error:", e);
+        // Dismiss welcome screen even on error — don't leave user stuck on loading
+        if (window._dismissWelcome && !window._preloadDone) {
+            window._preloadDone = true;
+            setTimeout(() => { if (window._dismissWelcome) window._dismissWelcome(); }, 1000);
+        }
         // Show user-friendly status — ERR means the data endpoint is unreachable
         // (market closed / API key missing / server restarting). Auto-retries each interval.
         const statusEl = document.getElementById("last-update");
@@ -4066,31 +4072,35 @@ function _l2InitSocketIO() {
         if (data.symbol !== _l2ChartSymbol || data.tf !== _l2ChartTF) return;
 
         const et = _utcToET(data.time);
-        _l2CandleSeries.update({
-            time: et,
-            open: data.open,
-            high: data.high,
-            low: data.low,
-            close: data.close,
-        });
-        _l2VolumeSeries.update({
-            time: et,
-            value: data.volume || 0,
-            color: data.close >= data.open ? 'rgba(31,209,122,.25)' : 'rgba(224,48,96,.25)',
-        });
-        if (_l2BubbleSeries && data.bp) {
-            _l2BubbleSeries.update({
+        try {
+            _l2CandleSeries.update({
                 time: et,
+                open: data.open,
+                high: data.high,
+                low: data.low,
                 close: data.close,
-                bp: data.bp,
-                icebergs: data.icebergs || null,
-                sweeps: data.sweeps || null,
-                delta_div: data.delta_div || null,
-                ignition: data.ignition || null,
-                spoofs: data.spoofs || null,
-                drifting_iceberg: data.drifting_iceberg || null,
-                wall_gone: data.wall_gone || null,
             });
+            _l2VolumeSeries.update({
+                time: et,
+                value: data.volume || 0,
+                color: data.close >= data.open ? 'rgba(31,209,122,.25)' : 'rgba(224,48,96,.25)',
+            });
+            if (_l2BubbleSeries && data.bp) {
+                _l2BubbleSeries.update({
+                    time: et,
+                    close: data.close,
+                    bp: data.bp,
+                    icebergs: data.icebergs || null,
+                    sweeps: data.sweeps || null,
+                    delta_div: data.delta_div || null,
+                    ignition: data.ignition || null,
+                    spoofs: data.spoofs || null,
+                    drifting_iceberg: data.drifting_iceberg || null,
+                    wall_gone: data.wall_gone || null,
+                });
+            }
+        } catch (e) {
+            // "Cannot update oldest data" — benign: stale candle from reconnect
         }
         // Track newest candle time
         _l2LastCandleTime = data.time;
@@ -4108,6 +4118,40 @@ function _l2InitSocketIO() {
         if (data.symbol === _l2ChartSymbol) {
             const spotEl = document.getElementById('t-spot');
             if (spotEl) spotEl.textContent = data.price.toFixed(2);
+        }
+    });
+
+    // ── Real-time GEX zone updates from Schwab WebSocket bridge ──
+    _sio.on('zone_update', (data) => {
+        if (!_l2CandleSeries || !_l2ShowWalls) return;
+        if (!data || data.error) return;
+
+        console.log(`[GEX-LIVE] zone_update: put=${data.put_wall} call=${data.call_wall} flip=${data.gamma_flip} src=${data.source}`);
+
+        // Remove old wall lines
+        for (const line of _l2WallLines) {
+            try { _l2CandleSeries.removePriceLine(line); } catch(e) {}
+        }
+        _l2WallLines = [];
+
+        const lines = [
+            { price: data.put_wall, title: `🔴 PUT WALL (LIVE)`, color: 'rgba(224, 48, 96, 0.8)' },
+            { price: data.call_wall, title: `🟢 CALL WALL (LIVE)`, color: 'rgba(31, 209, 122, 0.8)' },
+            { price: data.max_pain, title: `💰 MAX PAIN (LIVE)`, color: 'rgba(255, 200, 50, 0.85)' },
+            { price: data.gamma_flip, title: `🔀 GAMMA FLIP (LIVE)`, color: 'rgba(0, 220, 255, 0.8)' },
+        ];
+
+        for (const cfg of lines) {
+            if (!cfg.price || cfg.price <= 0) continue;
+            const pl = _l2CandleSeries.createPriceLine({
+                price: cfg.price,
+                color: cfg.color,
+                lineWidth: 1,
+                lineStyle: LightweightCharts.LineStyle.Dashed,
+                axisLabelVisible: true,
+                title: cfg.title,
+            });
+            _l2WallLines.push(pl);
         }
     });
 }
@@ -4388,13 +4432,16 @@ function _l2InitCandleChart() {
         priceFormat: { type: 'price', precision: 2, minMove: L2_TICK_SIZES[_l2ChartSymbol] || 0.25 },
     });
 
+    // Volume bars REMOVED — heatmap provides all depth info
     _l2VolumeSeries = _l2CandleChart.addHistogramSeries({
         priceFormat: { type: 'volume' },
         priceScaleId: 'vol',
+        visible: false,
     });
     _l2CandleChart.priceScale('vol').applyOptions({
         scaleMargins: { top: 0.85, bottom: 0 },
         drawTicks: false,
+        visible: false,
     });
 
     // Volume Bubble custom series (renders bp data as circles on the chart)
@@ -4407,16 +4454,34 @@ function _l2InitCandleChart() {
         });
     }
 
-    // ResizeObserver for responsive chart
+    // ── DOM Heatmap overlay canvas (transparent, on top of chart) ──
+    const heatmapCanvas = document.createElement('canvas');
+    heatmapCanvas.id = 'dom-heatmap-canvas';
+    heatmapCanvas.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:10;';
+    container.style.position = 'relative';
+    container.appendChild(heatmapCanvas);
+    window._domHeatmapCanvas = heatmapCanvas;
+
+    // ResizeObserver for responsive chart (heatmap canvas sizing is handled by renderDomHeatmap)
     const ro = new ResizeObserver(entries => {
         for (const entry of entries) {
             const { width, height } = entry.contentRect;
             if (_l2CandleChart && width > 0) {
                 _l2CandleChart.applyOptions({ width, height: height || chartH });
+                // NOTE: heatmap canvas sizing is DPR-aware and handled in renderDomHeatmap()
             }
         }
     });
     ro.observe(container);
+
+    // Initial canvas sizing (CSS pixels)
+    heatmapCanvas.width = container.clientWidth || 900;
+    heatmapCanvas.height = container.clientHeight || chartH;
+
+    // ── Start 2D DOM history polling for the scrolling heatmap ──
+    if (typeof startDomHistory === 'function') {
+        startDomHistory(_l2ChartSymbol);
+    }
 
     // ── Symbol buttons (old tab layout) — delegate to unified handler ──
     document.querySelectorAll('#l2-chart-symbols .l2-tf-btn').forEach(btn => {
@@ -4535,6 +4600,11 @@ function _l2SwitchSymbol(sym) {
     document.querySelectorAll('#t-symbols .t-btn, #l2-chart-symbols .l2-tf-btn').forEach(b => {
         b.classList.toggle('active', b.dataset.sym === sym);
     });
+
+    // 10. Restart 2D DOM history for new symbol
+    if (typeof startDomHistory === 'function') {
+        startDomHistory(sym);
+    }
 }
 
 function _l2SwitchTimeframe(tf) {
@@ -4605,7 +4675,26 @@ function _l2FetchCandles(fullRedraw, _retryCount) {
             if (myVersion !== _l2FetchVersion) return;
 
             const candles = resp.candles;
-            if (!Array.isArray(candles) || candles.length === 0) return;
+            if (!Array.isArray(candles) || candles.length === 0) {
+                // Show "no data" watermark on the chart container
+                const container = document.getElementById('t-l2-candle-chart')
+                                || document.getElementById('l2-candle-chart');
+                if (container && !container.querySelector('.l2-no-data')) {
+                    const msg = document.createElement('div');
+                    msg.className = 'l2-no-data';
+                    msg.style.cssText = 'position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);'
+                        + 'color:rgba(140,160,200,.45);font-size:1.1rem;font-family:JetBrains Mono,monospace;'
+                        + 'text-align:center;pointer-events:none;z-index:10;letter-spacing:.05em;';
+                    msg.innerHTML = '⏸ NO CANDLE DATA<br><span style="font-size:.7rem;opacity:.6">Waiting for L2 feed or market may be closed</span>';
+                    container.style.position = 'relative';
+                    container.appendChild(msg);
+                }
+                return;
+            }
+            // Remove "no data" message if candles arrive
+            const _ndEl = (document.getElementById('t-l2-candle-chart')
+                        || document.getElementById('l2-candle-chart'));
+            if (_ndEl) { const _nd = _ndEl.querySelector('.l2-no-data'); if (_nd) _nd.remove(); }
 
             if (fullRedraw) {
                 // ── FULL HISTORY: setData() once ──
@@ -4741,6 +4830,27 @@ function _l2Render(data) {
     _l2RenderDOM(data.dom);
     _l2RenderTape(data.trades || {});
     _l2RenderSignals(data.signals);
+
+    // ── DOM Heatmap rendering (independent of side panel state) ──
+    if (typeof renderDomHeatmap === 'function' && window._domHeatmapCanvas && _l2CandleSeries) {
+        const hCanvas = window._domHeatmapCanvas;
+        const hCtx = hCanvas.getContext('2d');
+        if (hCtx) hCtx.clearRect(0, 0, hCanvas.width, hCanvas.height);
+        const domData = (data.dom || {})[_l2ChartSymbol] || {};
+        if (domData.bids || domData.asks) {
+            const priceToY = (price) => _l2CandleSeries.priceToCoordinate(price);
+            // Attach absorption scores to domData for heatmap rendering
+            domData._absorption = (data.absorption || {})[_l2ChartSymbol] || {};
+
+            // ── 2D scrolling DOM history heatmap (drawn FIRST, behind 1D strip) ──
+            if (typeof renderDomHeatmap2D === 'function') {
+                renderDomHeatmap2D(hCanvas, priceToY, domData.mid_price || 0);
+            }
+
+            // ── 1D strip REMOVED — all signals now in 2D heatmap ──
+            // renderDomHeatmap(hCanvas, priceToY, domData);
+        }
+    }
     // BUG 3 FIX: removed redundant _l2InitCandleChart() — it's already called once in DOMContentLoaded
 }
 
@@ -4838,9 +4948,28 @@ function _ocPopulateChain(selectedExp) {
                 const isATM = strike === atm;
                 const isITMCall = strike < spot;
 
+                // Fusion fields from backend
+                const nqPrice = c.nq_price || p.nq_price || (strike * (data.ratio || 40));
+                const pcRatio = c.pc_ratio ?? p.pc_ratio ?? 0;
+                const cGex = c.gex || 0;
+                const pGex = p.gex || 0;
+                const netGex = cGex + pGex;
+                const iceActive = (c.iceberg || p.iceberg) ? true : false;
+
+                // P/C color: < 0.7 = bullish (green), > 1.3 = bearish (red)
+                const pcColor = pcRatio < 0.7 ? '#1fd17a' : pcRatio > 1.3 ? '#e03060' : 'rgba(140,160,200,.65)';
+
+                // GEX formatting: show as $M with sign
+                const gexAbs = Math.abs(netGex);
+                const gexStr = gexAbs >= 1e6 ? (netGex / 1e6).toFixed(1) + 'M'
+                             : gexAbs >= 1e3 ? (netGex / 1e3).toFixed(0) + 'K'
+                             : netGex.toFixed(0);
+                const gexColor = netGex > 0 ? '#1fd17a' : netGex < 0 ? '#e03060' : 'rgba(140,160,200,.45)';
+
                 const classes = [
                     isATM ? 'oc-atm' : '',
                     isITMCall ? 'oc-itm' : '',
+                    iceActive ? 'oc-ice-active' : '',
                 ].filter(Boolean).join(' ');
 
                 return `<tr class="${classes}" data-strike="${strike}">
@@ -4848,7 +4977,11 @@ function _ocPopulateChain(selectedExp) {
                     <td class="oc-call-cell">${(c.ask || 0).toFixed(2)}</td>
                     <td class="oc-call-cell">${(c.volume || 0).toLocaleString()}</td>
                     <td class="oc-call-cell">${c.iv != null ? c.iv + '%' : '—'}</td>
+                    <td class="oc-fusion-cell" style="color:rgba(124,90,247,.85);font-size:.7rem">${nqPrice.toFixed(0)}</td>
+                    <td class="oc-fusion-cell" style="color:${pcColor}">${pcRatio.toFixed(2)}</td>
                     <td class="oc-strike-cell">${strike}</td>
+                    <td class="oc-fusion-cell" style="color:${gexColor};font-size:.7rem">${gexStr}</td>
+                    <td class="oc-fusion-cell">${iceActive ? '<span style="color:#00d4ff;text-shadow:0 0 8px rgba(0,212,255,.6);font-size:1rem">🧊</span>' : ''}</td>
                     <td class="oc-put-cell">${(p.bid || 0).toFixed(2)}</td>
                     <td class="oc-put-cell">${(p.ask || 0).toFixed(2)}</td>
                     <td class="oc-put-cell">${(p.volume || 0).toLocaleString()}</td>
@@ -4857,6 +4990,59 @@ function _ocPopulateChain(selectedExp) {
             }).join('');
 
             tbody.innerHTML = rows;
+
+            // ── Gamma Wall Lines on Chart ──
+            if (data.top_gex && _l2CandleSeries && typeof _l2GexLines === 'undefined') {
+                window._l2GexLines = [];
+            }
+            if (data.top_gex && _l2CandleSeries) {
+                // Remove old GEX lines
+                for (const gl of (window._l2GexLines || [])) {
+                    try { _l2CandleSeries.removePriceLine(gl); } catch(e) {}
+                }
+                window._l2GexLines = [];
+                for (const gex of data.top_gex) {
+                    if (!gex.nq_price || gex.nq_price <= 0) continue;
+                    const isCallSide = gex.type === 'call_wall';
+                    const gexColor = isCallSide ? 'rgba(31,209,122,.45)' : 'rgba(224,48,96,.45)';
+                    const gexTag = isCallSide ? 'γ RESIST' : 'γ SUPPORT';
+                    const gexLabel = gex.iceberg
+                        ? `🛡️ ${gexTag} ${(gex.gex/1e6).toFixed(1)}M 🧊`
+                        : `${gexTag} ${(gex.gex/1e6).toFixed(1)}M`;
+                    const pl = _l2CandleSeries.createPriceLine({
+                        price: gex.nq_price,
+                        color: gexColor,
+                        lineWidth: 1,
+                        lineStyle: LightweightCharts.LineStyle.Dotted,
+                        axisLabelVisible: false,
+                        title: gexLabel,
+                    });
+                    window._l2GexLines.push(pl);
+                }
+            }
+
+            // ── Fusion Signal Alert (gamma-backed iceberg) ──
+            const fusionBox = document.getElementById('oc-fusion-alert');
+            if (data.top_gex && data.active_icebergs && data.active_icebergs.length > 0) {
+                const gammaIces = data.top_gex.filter(g => g.iceberg);
+                if (gammaIces.length > 0 && fusionBox) {
+                    const gi = gammaIces[0];
+                    const gexM = (gi.gex / 1e6).toFixed(1);
+                    const verdict = gi.gex > 0 ? 'Wall will HOLD (MM support)' : 'Wall will BREAK (MM pressure)';
+                    const verdictColor = gi.gex > 0 ? '#1fd17a' : '#e03060';
+                    fusionBox.innerHTML = `
+                        <div style="padding:8px 12px;background:rgba(0,212,255,.08);border:1px solid rgba(0,212,255,.25);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:.7rem;line-height:1.5">
+                            <div style="color:#00d4ff;font-weight:700;margin-bottom:4px">🛡️ GAMMA-BACKED ICEBERG at ${gi.nq_price.toFixed(0)}</div>
+                            <div style="color:rgba(140,160,200,.8)">GEX: <span style="color:${gi.gex > 0 ? '#1fd17a' : '#e03060'}">${gi.gex > 0 ? '+' : ''}$${gexM}M</span> ${gi.type === 'call_wall' ? 'positive' : 'negative'} gamma</div>
+                            <div style="color:${verdictColor};font-weight:600;margin-top:4px">⚡ VERDICT: ${verdict}</div>
+                        </div>`;
+                    fusionBox.style.display = 'block';
+                } else if (fusionBox) {
+                    fusionBox.style.display = 'none';
+                }
+            } else if (fusionBox) {
+                fusionBox.style.display = 'none';
+            }
 
             // Update expiry label if present
             const expLabel = document.getElementById('oc-exp-label');
@@ -4949,6 +5135,50 @@ function _l2UpdateWallLines() {
                 _l2WallLines.push(pl);
             }
 
+            // Freshness tag from API
+            const freshTag = data.freshness || '⚡';
+
+            // ── ELITE QUANT LEVELS ──────────────────────────────────────
+            // 🌊 Vanna Wall — teal dashed line
+            if (data.vanna_wall && data.vanna_wall > 0) {
+                const vannaLine = _l2CandleSeries.createPriceLine({
+                    price: data.vanna_wall,
+                    color: 'rgba(0, 210, 190, 0.85)',
+                    lineWidth: 1,
+                    lineStyle: LightweightCharts.LineStyle.Dashed,
+                    axisLabelVisible: true,
+                    title: `${freshTag} 🌊 VANNA WALL (${underlying} ${data.underlying_vanna_wall || '?'})`,
+                });
+                _l2WallLines.push(vannaLine);
+            }
+
+            // 📌 0DTE Pin — gold solid line (with charm flow arrow in label)
+            if (data.zero_dte_pin && data.zero_dte_pin > 0) {
+                const charmArrow = data.charm_direction === 'UP' ? '↑' : '↓';
+                const pinLine = _l2CandleSeries.createPriceLine({
+                    price: data.zero_dte_pin,
+                    color: 'rgba(255, 200, 50, 0.9)',
+                    lineWidth: 2,
+                    lineStyle: LightweightCharts.LineStyle.Solid,
+                    axisLabelVisible: true,
+                    title: `${freshTag} 📌 0DTE PIN ${charmArrow} (${underlying} ${data.underlying_zero_dte_pin || '?'})`,
+                });
+                _l2WallLines.push(pinLine);
+            }
+
+            // ⚡ Gamma Flip — cyan dashed line (where dealer GEX crosses zero)
+            if (data.gamma_flip && data.gamma_flip > 0) {
+                const flipLine = _l2CandleSeries.createPriceLine({
+                    price: data.gamma_flip,
+                    color: 'rgba(0, 200, 255, 0.85)',
+                    lineWidth: 1,
+                    lineStyle: LightweightCharts.LineStyle.Dashed,
+                    axisLabelVisible: true,
+                    title: `${freshTag} ⚡ GAMMA FLIP (${underlying} ${data.underlying_gamma_flip || '?'})`,
+                });
+                _l2WallLines.push(flipLine);
+            }
+
             // Update toolbar metrics with underlying values
             const setCW = document.getElementById('t-cw');
             const setPW = document.getElementById('t-pw');
@@ -4958,6 +5188,7 @@ function _l2UpdateWallLines() {
             if (setMP) setMP.textContent = data.underlying_max_pain || '—';
 
             console.log(`[Walls] ${sym}: PW=${data.put_wall} CW=${data.call_wall} MP=${data.max_pain} | ${underlying}: PW=${data.underlying_put_wall} CW=${data.underlying_call_wall} MP=${data.underlying_max_pain}`);
+            console.log(`[ELITE] 🌊 Vanna Wall: ${data.vanna_wall} (${underlying} ${data.underlying_vanna_wall}) | 📌 0DTE Pin: ${data.zero_dte_pin} (${underlying} ${data.underlying_zero_dte_pin}) | Charm: ${data.charm_direction} (${data.charm_magnitude})`);
         })
         .catch(() => {});
 }

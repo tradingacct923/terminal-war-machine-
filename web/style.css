@@ -4079,6 +4079,14 @@ h3 {
   background: var(--bg, #06080f);
 }
 
+/* When options panel is visible, add the 320px column */
+.terminal.with-options {
+  grid-template-columns: 1fr 320px;
+  grid-template-areas:
+    "toolbar toolbar"
+    "chart   options";
+}
+
 /* ── Toolbar ── */
 .t-toolbar {
   grid-area: toolbar;
@@ -4396,6 +4404,25 @@ h3 {
 
 /* ITM shading */
 .oc-itm { background: rgba(255,255,255,.015); }
+
+/* Iceberg-active row (glowing cyan border) */
+.oc-ice-active {
+  background: rgba(0, 212, 255, .06) !important;
+  border-left: 2px solid rgba(0, 212, 255, .5);
+  animation: ice-row-pulse 2s ease-in-out infinite alternate;
+}
+
+@keyframes ice-row-pulse {
+  0% { background: rgba(0, 212, 255, .04); }
+  100% { background: rgba(0, 212, 255, .08); }
+}
+
+/* Fusion cells */
+.oc-fusion-cell {
+  color: rgba(140, 160, 200, .5) !important;
+  font-size: .55rem !important;
+  white-space: nowrap;
+}
 
 
 /* Old sidebar + main-content CSS DELETED — terminal layout only */
@@ -4883,4 +4910,187 @@ h3 {
   z-index: 10;
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
+}
+
+/* ── Heatmap Settings Panel ── */
+.hm-settings-panel {
+  position: absolute;
+  top: 38px;
+  right: 10px;
+  width: 340px;
+  background: rgba(8, 10, 20, 0.96);
+  border: 1px solid rgba(100, 120, 180, 0.2);
+  border-radius: 8px;
+  z-index: 9999;
+  backdrop-filter: blur(20px);
+  box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+  font-family: 'JetBrains Mono', 'SF Mono', monospace;
+  overflow: hidden;
+}
+.hm-settings-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 14px;
+  border-bottom: 1px solid rgba(100, 120, 180, 0.15);
+  font-size: 11px;
+  font-weight: 600;
+  color: rgba(200, 210, 240, 0.85);
+  letter-spacing: 1px;
+}
+.hm-settings-close {
+  background: none;
+  border: none;
+  color: rgba(200, 210, 240, 0.5);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.hm-settings-close:hover {
+  color: #fff;
+  background: rgba(255, 60, 60, 0.3);
+}
+.hm-settings-body {
+  padding: 8px 12px 12px;
+  max-height: 480px;
+  overflow-y: auto;
+}
+/* ── Collapsible Groups ── */
+.hm-group {
+  border-bottom: 1px solid rgba(60, 70, 100, 0.2);
+}
+.hm-group:last-of-type { border-bottom: none; }
+.hm-group-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 2px;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: rgba(140, 160, 220, 0.7);
+  cursor: pointer;
+  user-select: none;
+}
+.hm-group-header:hover { color: rgba(180, 200, 255, 0.9); }
+.hm-group-arrow {
+  display: inline-block;
+  transition: transform 0.2s ease;
+  font-size: 8px;
+}
+.hm-group[data-open="true"] > .hm-group-header .hm-group-arrow {
+  transform: rotate(90deg);
+}
+.hm-group-body {
+  overflow: hidden;
+  max-height: 0;
+  opacity: 0;
+  transition: max-height 0.25s ease, opacity 0.2s ease;
+}
+.hm-group[data-open="true"] > .hm-group-body {
+  max-height: 500px;
+  opacity: 1;
+}
+.hm-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid rgba(60, 70, 100, 0.12);
+}
+.hm-row:last-child { border-bottom: none; }
+.hm-label {
+  flex: 1;
+  font-size: 10px;
+  color: rgba(180, 190, 220, 0.8);
+  white-space: nowrap;
+}
+.hm-controls {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.hm-controls input[type="color"] {
+  width: 20px;
+  height: 20px;
+  border: 1px solid rgba(100, 120, 180, 0.3);
+  border-radius: 4px;
+  cursor: pointer;
+  padding: 0;
+  background: none;
+  -webkit-appearance: none;
+}
+.hm-controls input[type="color"]::-webkit-color-swatch-wrapper { padding: 1px; }
+.hm-controls input[type="color"]::-webkit-color-swatch { border: none; border-radius: 2px; }
+.hm-controls input[type="range"] {
+  width: 60px;
+  height: 4px;
+  -webkit-appearance: none;
+  background: rgba(60, 80, 130, 0.4);
+  border-radius: 2px;
+  outline: none;
+}
+.hm-controls input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: rgba(0, 200, 255, 0.8);
+  cursor: pointer;
+}
+/* Toggle switch */
+.hm-toggle {
+  position: relative;
+  display: inline-block;
+  width: 28px;
+  height: 14px;
+  flex-shrink: 0;
+}
+.hm-toggle input { opacity: 0; width: 0; height: 0; }
+.hm-slider {
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(60, 70, 100, 0.5);
+  border-radius: 14px;
+  cursor: pointer;
+  transition: .2s;
+}
+.hm-slider::before {
+  content: '';
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  left: 2px;
+  bottom: 2px;
+  background: rgba(200, 210, 230, 0.7);
+  border-radius: 50%;
+  transition: .2s;
+}
+.hm-toggle input:checked + .hm-slider {
+  background: rgba(0, 200, 120, 0.5);
+}
+.hm-toggle input:checked + .hm-slider::before {
+  transform: translateX(14px);
+  background: rgba(0, 255, 120, 0.9);
+}
+.hm-actions {
+  justify-content: center;
+  padding-top: 8px;
+}
+.hm-reset-btn {
+  background: rgba(80, 90, 120, 0.3);
+  border: 1px solid rgba(100, 120, 180, 0.25);
+  color: rgba(180, 190, 220, 0.7);
+  padding: 5px 16px;
+  border-radius: 4px;
+  font-size: 9px;
+  font-family: inherit;
+  cursor: pointer;
+  letter-spacing: 0.5px;
+}
+.hm-reset-btn:hover {
+  background: rgba(100, 120, 180, 0.3);
+  color: #fff;
 }

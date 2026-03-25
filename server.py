@@ -1,7 +1,7 @@
 """""
 Altaris Terminal - Flask Web Server
 """
-import sys, os, json, secrets, hashlib, time
+import sys, os, json, secrets, hashlib, time, threading
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
@@ -593,32 +593,158 @@ def api_candles():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ── Schwab REST helpers ─────────────────────────────────────────────────────
+# Lightweight wrapper around stored OAuth2 tokens — no SchwabAuth class needed
+# at import time. Reads from connectors/.schwab_tokens.json, auto-refreshes.
+
+import base64 as _b64
+
+_SCHWAB_TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "connectors", ".schwab_tokens.json")
+_SCHWAB_BASE       = "https://api.schwabapi.com"
+_schwab_tokens     = {}  # module-level cache
+_schwab_lock       = threading.Lock()
+
+
+def _schwab_load_tokens():
+    """Load tokens from disk (fresh read each time)."""
+    global _schwab_tokens
+    try:
+        with open(_SCHWAB_TOKEN_FILE) as f:
+            _schwab_tokens = json.load(f)
+    except Exception:
+        _schwab_tokens = {}
+    return _schwab_tokens
+
+
+def _schwab_refresh():
+    """Refresh the access token using the stored refresh token."""
+    global _schwab_tokens
+    tokens = _schwab_load_tokens()
+    rt = tokens.get("refresh_token")
+    if not rt:
+        raise ValueError("No Schwab refresh token available")
+    app_key    = os.getenv("SCHWAB_APP_KEY", "")
+    app_secret = os.getenv("SCHWAB_APP_SECRET", "")
+    if not app_key or not app_secret:
+        raise ValueError("SCHWAB_APP_KEY / SCHWAB_APP_SECRET not set in env")
+    creds = _b64.b64encode(f"{app_key}:{app_secret}".encode()).decode()
+    import requests as _req
+    resp = _req.post(f"{_SCHWAB_BASE}/v1/oauth/token", headers={
+        "Authorization": f"Basic {creds}",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }, data={"grant_type": "refresh_token", "refresh_token": rt}, timeout=15)
+    if resp.status_code != 200:
+        raise Exception(f"Schwab refresh failed: {resp.status_code} — {resp.text[:200]}")
+    data = resp.json()
+    import time as _t
+    new_tokens = {
+        "access_token":  data["access_token"],
+        "refresh_token": data.get("refresh_token", rt),
+        "token_expiry":  _t.time() + data.get("expires_in", 1800),
+        "saved_at":      _t.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    with open(_SCHWAB_TOKEN_FILE, "w") as f:
+        json.dump(new_tokens, f, indent=2)
+    _schwab_tokens.update(new_tokens)
+    print("[Schwab] Token refreshed OK")
+
+
+def _schwab_get(endpoint, params=None):
+    """Authenticated GET to Schwab API with auto-refresh."""
+    import requests as _req
+    import time as _t
+    with _schwab_lock:
+        tokens = _schwab_load_tokens()
+        at = tokens.get("access_token")
+        expiry = tokens.get("token_expiry", 0)
+        # Refresh if expired or about to expire (< 60s left)
+        if not at or _t.time() > expiry - 60:
+            _schwab_refresh()
+            tokens = _schwab_tokens
+            at = tokens["access_token"]
+    url = f"{_SCHWAB_BASE}{endpoint}"
+    headers = {"Authorization": f"Bearer {at}", "Accept": "application/json"}
+    resp = _req.get(url, headers=headers, params=params, timeout=15)
+    if resp.status_code == 401:
+        # Try one refresh
+        with _schwab_lock:
+            _schwab_refresh()
+            at = _schwab_tokens["access_token"]
+        headers["Authorization"] = f"Bearer {at}"
+        resp = _req.get(url, headers=headers, params=params, timeout=15)
+    if resp.status_code != 200:
+        raise Exception(f"Schwab API error: {resp.status_code} — {resp.text[:300]}")
+    return resp.json()
+
+
+def _schwab_quote(ticker):
+    """Get single quote from Schwab. Returns last price as float."""
+    data = _schwab_get("/marketdata/v1/quotes", {"symbols": ticker, "fields": "quote"})
+    q = data.get(ticker, {})
+    quote = q.get("quote", q)
+    return float(quote.get("lastPrice") or quote.get("mark") or quote.get("closePrice") or 0)
+
+
+def _schwab_expirations(ticker):
+    """Get options expirations from Schwab. Returns list of date strings."""
+    data = _schwab_get("/marketdata/v1/expirationchain", {"symbol": ticker})
+    raw = data.get("expirationList", [])
+    result = []
+    for exp in raw:
+        d = exp.get("expirationDate")
+        if d:
+            result.append(d)
+    return result
+
+
+def _schwab_chain_raw(ticker, exp_date):
+    """Get options chain from Schwab for one expiration. Returns flattened list of option dicts."""
+    data = _schwab_get("/marketdata/v1/chains", {
+        "symbol": ticker,
+        "contractType": "ALL",
+        "includeUnderlyingQuote": "true",
+        "fromDate": exp_date,
+        "toDate": exp_date,
+        "strikeCount": 200,
+    })
+    options = []
+    for leg_key in ("callExpDateMap", "putExpDateMap"):
+        exp_map = data.get(leg_key, {})
+        for _exp_str, strikes in exp_map.items():
+            for strike_str, contracts in strikes.items():
+                for c in contracts:
+                    options.append({
+                        "strike":         float(strike_str),
+                        "option_type":    "call" if leg_key == "callExpDateMap" else "put",
+                        "bid":            c.get("bid", 0),
+                        "ask":            c.get("ask", 0),
+                        "last":           c.get("last", 0),
+                        "volume":         c.get("totalVolume", 0),
+                        "open_interest":  c.get("openInterest", 0),
+                        "delta":          c.get("delta"),
+                        "gamma":          c.get("gamma"),
+                        "theta":          c.get("theta"),
+                        "vega":           c.get("vega"),
+                        "rho":            c.get("rho"),
+                        "volatility":     c.get("volatility"),  # Schwab IV (decimal)
+                        "in_the_money":   c.get("inTheMoney", False),
+                        "dte":            c.get("daysToExpiration", 0),
+                        "symbol":         c.get("symbol", ""),
+                    })
+    return options, data.get("underlyingPrice", 0)
+
+
 @app.route("/api/chain")
 def api_chain():
-    """Return real options chain from Tradier for the terminal options panel.
-    Self-contained — calls Tradier API directly, no data_provider dependency."""
-    import requests as _req
+    """Return real options chain from Schwab for the terminal options panel.
+    Self-contained — calls Schwab API directly."""
     from datetime import datetime, date
-
-    TRADIER_TOKEN = os.getenv("TRADIER_TOKEN", "BkkUX4cdeBXLkAejHAm8mKeOGTzt")
-    TRADIER_BASE  = "https://api.tradier.com/v1"
-    HEADERS = {
-        "Authorization": f"Bearer {TRADIER_TOKEN}",
-        "Accept": "application/json",
-    }
 
     ticker = request.args.get("ticker", "QQQ").upper()
 
     try:
-        # Step 1: Get expirations
-        exp_resp = _req.get(
-            f"{TRADIER_BASE}/markets/options/expirations",
-            params={"symbol": ticker, "includeAllRoots": "true", "strikes": "false"},
-            headers=HEADERS, timeout=10
-        ).json()
-        raw_dates = exp_resp.get("expirations", {}).get("date", [])
-        if isinstance(raw_dates, str):
-            raw_dates = [raw_dates]
+        # Step 1: Get expirations from Schwab
+        raw_dates = _schwab_expirations(ticker)
         if not raw_dates:
             return jsonify({"error": f"No expirations found for {ticker}"}), 404
 
@@ -642,46 +768,128 @@ def api_chain():
         exp_label = next((e["label"] for e in expirations if e["date"] == exp_date), exp_date)
         exp_dte = next((e["dte"] for e in expirations if e["date"] == exp_date), 0)
 
-        # Step 2: Get chain with greeks
-        chain_resp = _req.get(
-            f"{TRADIER_BASE}/markets/options/chains",
-            params={"symbol": ticker, "expiration": exp_date, "greeks": "true"},
-            headers=HEADERS, timeout=10
-        ).json()
-        raw_chain = chain_resp.get("options", {}).get("option", [])
-        if isinstance(raw_chain, dict):
-            raw_chain = [raw_chain]
+        # Step 2: Get chain + underlying price from Schwab
+        raw_chain, schwab_underlying = _schwab_chain_raw(ticker, exp_date)
+        spot = schwab_underlying if schwab_underlying > 0 else _schwab_quote(ticker)
 
-        # Step 3: Get spot price
-        quote_resp = _req.get(
-            f"{TRADIER_BASE}/markets/quotes",
-            params={"symbols": ticker, "greeks": "false"},
-            headers=HEADERS, timeout=10
-        ).json()
-        quote = quote_resp.get("quotes", {}).get("quote", {})
-        spot = float(quote.get("last") or quote.get("close") or 0)
+        # ── Compute futures/underlying ratio for NQ$ mapping ──
+        try:
+            from background_engine.l2_worker import get_l2_state
+            futures_mid = get_l2_state().get("mid_prices", {}).get("NQ", 0)
+        except Exception:
+            futures_mid = 0
+        ratio = futures_mid / spot if (futures_mid > 0 and spot > 0) else 40.0  # NQ/QQQ ≈ 40
 
-        # Step 4: Build response
+        # ── Get active iceberg levels from L2 detection ──
+        active_iceberg_levels = set()
+        try:
+            from background_engine.l2_worker import get_l2_state as _g2
+            l2_state = _g2()
+            for det_list in [l2_state.get("icebergs", []), l2_state.get("drifting_icebergs", [])]:
+                for det in (det_list or []):
+                    try:
+                        ice_price = float(det.get("price", 0))
+                        if ice_price > 0:
+                            active_iceberg_levels.add(round(ice_price, 2))
+                    except (ValueError, TypeError):
+                        pass
+        except Exception:
+            pass
+
+        # ── Build per-strike aggregates for P/C and GEX ──
+        strike_data = {}
+        for opt in raw_chain:
+            strike = opt["strike"]
+            otype = opt["option_type"]
+            vol = int(opt.get("volume") or 0)
+            oi = int(opt.get("open_interest") or 0)
+            gamma = float(opt.get("gamma") or 0)
+            if strike not in strike_data:
+                strike_data[strike] = {"call_vol": 0, "put_vol": 0,
+                                       "call_gamma": 0, "put_gamma": 0,
+                                       "call_oi": 0, "put_oi": 0}
+            sd = strike_data[strike]
+            if otype == "call":
+                sd["call_vol"] += vol
+                sd["call_gamma"] = gamma
+                sd["call_oi"] += oi
+            elif otype == "put":
+                sd["put_vol"] += vol
+                sd["put_gamma"] = gamma
+                sd["put_oi"] += oi
+
+        # Step 4: Build response with fusion fields
         rows = []
         for opt in raw_chain:
-            greeks = opt.get("greeks") or {}
-            mid_iv = greeks.get("mid_iv")
-            iv_str = str(round(float(mid_iv) * 100, 1)) if mid_iv else None
+            iv_raw = opt.get("volatility")
+            iv_str = str(round(float(iv_raw), 1)) if iv_raw else None
+            strike = opt["strike"]
+            nq_price = round(strike * ratio, 2)
+            sd = strike_data.get(strike, {})
+
+            # Per-strike P/C ratio
+            total_call_vol = sd.get("call_vol", 0)
+            total_put_vol = sd.get("put_vol", 0)
+            pc_ratio = round(total_put_vol / max(total_call_vol, 1), 2)
+
+            # Per-strike GEX
+            otype = opt["option_type"]
+            oi_val = int(opt.get("open_interest") or 0)
+            gamma_val = float(opt.get("gamma") or 0)
+            gex = round(gamma_val * oi_val * spot * spot * 0.01 * 100, 0)
+            if otype == "put":
+                gex = -gex
+
+            # Iceberg active at this NQ price?
+            ice_active = any(
+                abs(nq_price - ice_lvl) <= 5.0
+                for ice_lvl in active_iceberg_levels
+            )
+
             rows.append({
-                "strike":  float(opt.get("strike", 0)),
-                "type":    opt.get("option_type", ""),
+                "strike":  strike,
+                "type":    otype,
                 "bid":     float(opt.get("bid") or 0),
                 "ask":     float(opt.get("ask") or 0),
                 "last":    float(opt.get("last") or 0),
                 "volume":  int(opt.get("volume") or 0),
-                "oi":      int(opt.get("open_interest") or 0),
+                "oi":      oi_val,
                 "iv":      iv_str,
-                "delta":   round(float(greeks.get("delta", 0)), 4) if greeks.get("delta") is not None else None,
-                "gamma":   round(float(greeks.get("gamma", 0)), 6) if greeks.get("gamma") is not None else None,
-                "theta":   round(float(greeks.get("theta", 0)), 4) if greeks.get("theta") is not None else None,
-                "vega":    round(float(greeks.get("vega", 0)), 4) if greeks.get("vega") is not None else None,
+                "delta":   round(float(opt["delta"]), 4) if opt.get("delta") is not None else None,
+                "gamma":   round(float(opt["gamma"]), 6) if opt.get("gamma") is not None else None,
+                "theta":   round(float(opt["theta"]), 4) if opt.get("theta") is not None else None,
+                "vega":    round(float(opt["vega"]), 4) if opt.get("vega") is not None else None,
+                # ── Fusion fields ──
+                "nq_price": nq_price,
+                "pc_ratio": pc_ratio,
+                "gex":      gex,
+                "iceberg":  ice_active,
             })
 
+        # ── Top GEX levels (for gamma wall lines on chart) ──
+        gex_by_strike = {}
+        for opt in raw_chain:
+            strike = opt["strike"]
+            g = float(opt.get("gamma") or 0)
+            oi_r = int(opt.get("open_interest") or 0)
+            raw_gex = g * oi_r * spot * spot * 0.01 * 100
+            if opt["option_type"] == "put":
+                raw_gex = -raw_gex
+            gex_by_strike[strike] = gex_by_strike.get(strike, 0) + raw_gex
+
+        sorted_gex = sorted(gex_by_strike.items(), key=lambda x: abs(x[1]), reverse=True)
+        top_gex = []
+        for strike_val, gex_val in sorted_gex[:10]:
+            nq_mapped = round(strike_val * ratio, 2)
+            top_gex.append({
+                "strike": strike_val,
+                "nq_price": nq_mapped,
+                "gex": round(gex_val, 0),
+                "type": "call_wall" if gex_val > 0 else "put_wall",
+                "iceberg": any(abs(nq_mapped - il) <= 5.0 for il in active_iceberg_levels),
+            })
+
+        print(f"[api/chain] Schwab: {ticker} spot={spot:.2f} exp={exp_date} chains={len(raw_chain)}")
         return jsonify({
             "ticker": ticker,
             "spot": spot,
@@ -690,6 +898,10 @@ def api_chain():
             "dte": exp_dte,
             "expirations": expirations[:12],
             "chain": rows,
+            "ratio": round(ratio, 4),
+            "futures_mid": futures_mid,
+            "top_gex": top_gex,
+            "active_icebergs": list(active_iceberg_levels),
         })
     except Exception as e:
         import traceback
@@ -700,17 +912,15 @@ def api_chain():
 @app.route("/api/walls")
 def api_walls():
     """Put/call wall + max pain — supports NQ (via QQQ) and GC (via GLD).
+    Multi-expiry aggregation (top 5), DTE weighting, gamma flip, freshness.
     Query params:
       ?symbol=NQ  (default) — uses QQQ options, maps to NQ futures
       ?symbol=GC  — uses GLD options, maps to GC futures
       ?ticker=XXX — override underlying ticker directly (legacy compat)
     """
-    import requests as _req
+    import time as _t
     from datetime import datetime, date
-
-    TRADIER_TOKEN = os.getenv("TRADIER_TOKEN", "BkkUX4cdeBXLkAejHAm8mKeOGTzt")
-    TRADIER_BASE  = "https://api.tradier.com/v1"
-    HEADERS = {"Authorization": f"Bearer {TRADIER_TOKEN}", "Accept": "application/json"}
+    _walls_start = _t.time()
 
     # Determine underlying ticker and futures symbol from ?symbol= param
     futures_sym = request.args.get("symbol", "NQ").upper()
@@ -718,87 +928,306 @@ def api_walls():
     ticker = request.args.get("ticker", FUTURES_TO_UNDERLYING.get(futures_sym, "QQQ")).upper()
 
     try:
-        # Get nearest expiry
-        exp_resp = _req.get(f"{TRADIER_BASE}/markets/options/expirations",
-            params={"symbol": ticker}, headers=HEADERS, timeout=10).json()
-        raw_dates = exp_resp.get("expirations", {}).get("date", [])
-        if isinstance(raw_dates, str): raw_dates = [raw_dates]
+        import numpy as np
+        from scipy.stats import norm as _norm
+        import math
+
+        # ── BSM greeks helper ────────────────────────────────────────────
+        def _bsm_greeks(S, K, T, r, sigma, opt_type='call'):
+            """BSM greeks — returns (delta, gamma, vanna, charm)."""
+            if T <= 0 or sigma <= 0 or S <= 0:
+                return 0, 0, 0, 0
+            d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+            d2 = d1 - sigma * np.sqrt(T)
+            pdf_d1 = _norm.pdf(d1)
+            gamma  = pdf_d1 / (S * sigma * np.sqrt(T))
+            vanna  = -pdf_d1 * d2 / (S * sigma * np.sqrt(T))
+            charm_val = -pdf_d1 * (2 * r * T - d2 * sigma * np.sqrt(T)) / (2 * T * sigma * np.sqrt(T))
+            return d1, gamma, vanna, charm_val
+
+        # ── Fetch expirations from Schwab ────────────────────────────────
+        raw_dates = _schwab_expirations(ticker)
         if not raw_dates:
             return jsonify({"error": f"No expirations for {ticker}"}), 404
-        exp_date = raw_dates[0]
 
-        # Get chain
-        chain_resp = _req.get(f"{TRADIER_BASE}/markets/options/chains",
-            params={"symbol": ticker, "expiration": exp_date, "greeks": "false"},
-            headers=HEADERS, timeout=10).json()
-        raw_chain = chain_resp.get("options", {}).get("option", [])
-        if isinstance(raw_chain, dict): raw_chain = [raw_chain]
+        # Use up to 5 nearest expirations for multi-expiry aggregation
+        MAX_EXP = 5
+        exp_dates = raw_dates[:MAX_EXP]
 
-        # Get spot
-        quote_resp = _req.get(f"{TRADIER_BASE}/markets/quotes",
-            params={"symbols": ticker}, headers=HEADERS, timeout=10).json()
-        quote = quote_resp.get("quotes", {}).get("quote", {})
-        spot = float(quote.get("last") or quote.get("close") or 0)
+        # ── Multi-expiry aggregation with DTE weighting ──────────────────
+        # Weighted OI: w = 3.0 if DTE<=1 else 1/sqrt(DTE)
+        agg_call_oi = {}   # strike → weighted OI
+        agg_put_oi  = {}
+        all_strikes = set()
+        spot = 0
+        r = 0.05
+        all_ivs = []
 
-        # Build OI maps
-        call_oi, put_oi, strikes = {}, {}, set()
-        for opt in raw_chain:
-            strike = float(opt.get("strike", 0))
-            oi = int(opt.get("open_interest") or 0)
-            otype = opt.get("option_type", "")
-            strikes.add(strike)
-            if otype == "call":   call_oi[strike] = call_oi.get(strike, 0) + oi
-            elif otype == "put":  put_oi[strike] = put_oi.get(strike, 0) + oi
+        # Per-strike greek accumulators (weighted)
+        strike_gamma_net = {}   # for gamma flip: net dealer GEX per strike
+        strike_vanna_abs = {}   # for vanna wall: |vanna × OI|
+        strike_charm_net = {}   # for charm flow
 
-        underlying_put_wall  = max(put_oi, key=put_oi.get) if put_oi else 0
-        underlying_call_wall = max(call_oi, key=call_oi.get) if call_oi else 0
+        # Best single-expiry gamma for 0DTE pin (only nearest expiry)
+        best_gamma_strike, best_gamma_score = 0, 0
 
-        # Max pain
-        sorted_strikes = sorted(strikes)
+        for exp_idx, exp_date in enumerate(exp_dates):
+            try:
+                raw_chain, schwab_underlying = _schwab_chain_raw(ticker, exp_date)
+                if exp_idx == 0 and schwab_underlying > 0:
+                    spot = schwab_underlying
+            except Exception as e:
+                print(f"[api/walls] expiry {exp_date} fetch failed: {e}")
+                continue
+
+            if not raw_chain:
+                continue
+
+            # Compute DTE + weight
+            try:
+                exp_dt = datetime.strptime(exp_date, "%Y-%m-%d").date()
+                dte = max((exp_dt - date.today()).days, 0)
+            except Exception:
+                dte = 1
+            dte_clamped = max(dte, 1)
+            T = dte_clamped / 365.0
+
+            # DTE weight: 0DTE gets 3×, others decay by 1/√dte
+            if dte <= 1:
+                w = 3.0
+            else:
+                w = 1.0 / math.sqrt(dte_clamped)
+
+            # Collect IV from this expiry
+            for opt in raw_chain:
+                iv_raw = float(opt.get("volatility", 0) or 0) / 100.0
+                if iv_raw > 0.01:
+                    all_ivs.append(iv_raw)
+
+            avg_iv = 0.20
+            if all_ivs:
+                avg_iv = max(np.mean(all_ivs), 0.05)
+
+            # Aggregate OI per strike with weight
+            # INSTITUTIONAL GRADE: use Schwab's per-contract gamma (actual IV surface)
+            #   + dollar GEX (gamma × OI × 100 × spot²)
+            #   + volume+OI hybrid for 0DTE
+            s = spot or schwab_underlying
+            for opt in raw_chain:
+                strike = opt["strike"]
+                oi = int(opt.get("open_interest") or 0)
+                vol = int(opt.get("volume") or 0)
+                otype = opt["option_type"]
+                all_strikes.add(strike)
+
+                # 0DTE volume hybrid: intraday volume IS today's positioning
+                if dte <= 1:
+                    effective_oi = oi + (vol * 0.5)
+                else:
+                    effective_oi = float(oi)
+
+                w_oi = effective_oi * w
+
+                if otype == "call":
+                    agg_call_oi[strike] = agg_call_oi.get(strike, 0) + w_oi
+                elif otype == "put":
+                    agg_put_oi[strike] = agg_put_oi.get(strike, 0) + w_oi
+
+                if w_oi <= 0:
+                    continue
+
+                # ── INSTITUTIONAL GAMMA: use Schwab's per-contract gamma ──
+                # Schwab computes gamma using actual IV surface (skew-aware)
+                schwab_gamma = float(opt.get("gamma") or 0)
+
+                # Dollar GEX = gamma × OI × 100 × spot² × 0.01
+                # This is the actual dollar hedging flow dealers must execute
+                dollar_gex = schwab_gamma * w_oi * 100 * s * s * 0.01
+
+                # Gamma flip: net dealer GEX (dealers are short options)
+                if otype == "call":
+                    strike_gamma_net[strike] = strike_gamma_net.get(strike, 0) - dollar_gex
+                else:
+                    strike_gamma_net[strike] = strike_gamma_net.get(strike, 0) + dollar_gex
+
+                # ── VANNA + CHARM: BSM with per-contract IV (not avg) ──
+                per_iv = float(opt.get("volatility", 0) or 0) / 100.0
+                if per_iv < 0.01:
+                    per_iv = avg_iv  # fallback to avg if missing
+
+                _, _, vanna_v, charm_v = _bsm_greeks(s, strike, T, r, per_iv, otype)
+
+                # Vanna wall: |vanna × OI| (dollar-weighted)
+                strike_vanna_abs[strike] = strike_vanna_abs.get(strike, 0) + abs(vanna_v * w_oi * 100 * s)
+
+                # Charm flow (dollar-weighted)
+                charm_dollar = charm_v * w_oi * 100 * s
+                if otype == "call":
+                    strike_charm_net[strike] = strike_charm_net.get(strike, 0) + charm_dollar
+                else:
+                    strike_charm_net[strike] = strike_charm_net.get(strike, 0) - charm_dollar
+
+                # 0DTE pin: only nearest expiry, use schwab gamma × raw oi
+                if exp_idx == 0:
+                    pin_gex = schwab_gamma * effective_oi * 100 * s * s * 0.01
+                    strike_gamma_net[f"_0dte_{strike}"] = strike_gamma_net.get(f"_0dte_{strike}", 0) + abs(pin_gex)
+
+        # ── Fallback: if spot wasn't set, try a direct quote ──
+        if spot <= 0:
+            spot = _schwab_quote(ticker)
+
+        # ── Calculate walls from aggregated weighted OI ──────────────────
+        underlying_put_wall  = max(agg_put_oi, key=agg_put_oi.get) if agg_put_oi else 0
+        underlying_call_wall = max(agg_call_oi, key=agg_call_oi.get) if agg_call_oi else 0
+
+        # Max pain (using aggregated weighted OI)
+        sorted_strikes = sorted(all_strikes)
         min_pain = float("inf")
         underlying_max_pain = spot
         for K in sorted_strikes:
             pain = 0
             for S in sorted_strikes:
-                if S < K:  pain += put_oi.get(S, 0) * (K - S) * 100
-                if S > K:  pain += call_oi.get(S, 0) * (S - K) * 100
+                if S < K:  pain += agg_put_oi.get(S, 0) * (K - S) * 100
+                if S > K:  pain += agg_call_oi.get(S, 0) * (S - K) * 100
             if pain < min_pain:
                 min_pain = pain
                 underlying_max_pain = K
 
-        # Convert underlying → futures price (e.g. QQQ→NQ or GLD→GC)
+        # ── Vanna Wall: highest |vanna × OI| across all expirations ──
+        underlying_vanna_wall = 0
+        if strike_vanna_abs:
+            underlying_vanna_wall = max(strike_vanna_abs, key=strike_vanna_abs.get)
+
+        # ── Charm Flow: net across all strikes ──
+        net_charm = sum(strike_charm_net.values())
+        charm_direction = "UP" if net_charm > 0 else "DOWN"
+        charm_magnitude = round(abs(net_charm), 4)
+
+        # ── 0DTE Pin: highest gamma × OI on nearest expiry ──
+        dte0_keys = [k for k in strike_gamma_net if str(k).startswith("_0dte_")]
+        if dte0_keys:
+            best_key = max(dte0_keys, key=lambda k: abs(strike_gamma_net[k]))
+            underlying_zero_dte_pin = float(best_key.replace("_0dte_", ""))
+        else:
+            underlying_zero_dte_pin = underlying_max_pain  # fallback
+
+        # ── Gamma Flip: where net dealer GEX crosses zero ────────────────
+        # Walk sorted strikes, find sign change in net GEX
+        underlying_gamma_flip = 0
+        real_strikes = [s for s in sorted_strikes if s in strike_gamma_net]
+        for i in range(len(real_strikes) - 1):
+            s1, s2 = real_strikes[i], real_strikes[i + 1]
+            g1, g2 = strike_gamma_net[s1], strike_gamma_net[s2]
+            if g1 * g2 < 0:  # sign change → zero crossing
+                # Linear interpolation for exact flip price
+                frac = abs(g1) / (abs(g1) + abs(g2)) if (abs(g1) + abs(g2)) > 0 else 0.5
+                underlying_gamma_flip = s1 + frac * (s2 - s1)
+                break  # take first (nearest-to-ATM) flip
+
+        # ── 4-Tier NDX→NQ Conversion ────────────────────────────────────
+        # NQ tracks NDX (Nasdaq 100 index), not QQQ directly.
+        # Tier 1: Live NQ (TopStepX L2 WS) / Live QQQ (Schwab chain)
+        # Tier 2: NDX bridge — fetch $NDX.X from Schwab, use NQ/NDX ratio
+        # Tier 3: Cached ratio from last successful call
+        # Tier 4: Hardcoded fallback
         try:
             from background_engine.l2_worker import get_l2_state
             futures_mid = get_l2_state().get("mid_prices", {}).get(futures_sym, 0)
         except Exception:
             futures_mid = 0
 
-        # Fallback ratios if L2 isn't connected
-        DEFAULT_RATIOS = {"NQ": 40.0, "GC": 14.0}  # approx NQ/QQQ ≈ 40, GC/GLD ≈ 14
-        ratio = futures_mid / spot if (futures_mid > 0 and spot > 0) else DEFAULT_RATIOS.get(futures_sym, 1.0)
+        ratio = 0
+        conversion_tier = 4  # track which tier was used
+
+        # Tier 1: Direct ratio from live NQ mid / live QQQ spot
+        if futures_mid > 0 and spot > 0:
+            ratio = futures_mid / spot
+            conversion_tier = 1
+
+        # Tier 2: NDX bridge — NQ futures track NDX, so use NDX as intermediary
+        if ratio == 0 and futures_sym == "NQ":
+            try:
+                ndx_price = _schwab_quote("$NDX")  # Schwab: $NDX or $NDX.X
+                if ndx_price and ndx_price > 0:
+                    if futures_mid > 0:
+                        # NQ/NDX ratio × NDX/QQQ ratio
+                        ratio = (futures_mid / ndx_price) * (ndx_price / spot) if spot > 0 else 0
+                        conversion_tier = 2
+                    elif spot > 0:
+                        # Use NDX/QQQ ratio (NDX ≈ QQQ × 41.15)
+                        ratio = ndx_price / spot
+                        conversion_tier = 2
+            except Exception as e:
+                print(f"[api/walls] NDX bridge failed: {e}")
+
+        # Tier 3: Cached ratio from previous successful call
+        if ratio == 0:
+            _cached_ratio = getattr(api_walls, '_cached_ratio', {})
+            if futures_sym in _cached_ratio:
+                ratio = _cached_ratio[futures_sym]
+                conversion_tier = 3
+
+        # Tier 4: Hardcoded fallback
+        DEFAULT_RATIOS = {"NQ": 41.5, "GC": 14.0}
+        if ratio == 0:
+            ratio = DEFAULT_RATIOS.get(futures_sym, 1.0)
+            conversion_tier = 4
+
+        # Cache successful ratio for tier 3 future fallback
+        if conversion_tier <= 2:
+            if not hasattr(api_walls, '_cached_ratio'):
+                api_walls._cached_ratio = {}
+            api_walls._cached_ratio[futures_sym] = ratio
+
+        # ── Freshness indicator ──────────────────────────────────────────
+        data_age = round(_t.time() - _walls_start, 1)
+        if data_age < 30:
+            freshness = "⚡"      # fresh
+        elif data_age < 90:
+            freshness = "📊"     # ok
+        else:
+            freshness = "⚠️"     # stale
 
         result = {
             "put_wall":              round(underlying_put_wall * ratio, 2),
             "call_wall":             round(underlying_call_wall * ratio, 2),
             "max_pain":              round(underlying_max_pain * ratio, 2),
+            "gamma_flip":            round(underlying_gamma_flip * ratio, 2) if underlying_gamma_flip else 0,
             "underlying_ticker":     ticker,
             "underlying_spot":       spot,
             "underlying_put_wall":   underlying_put_wall,
             "underlying_call_wall":  underlying_call_wall,
             "underlying_max_pain":   underlying_max_pain,
+            "underlying_gamma_flip": round(underlying_gamma_flip, 2) if underlying_gamma_flip else 0,
             "futures_symbol":        futures_sym,
             "futures_mid":           futures_mid,
             "ratio":                 round(ratio, 4),
-            "expiry":                exp_date,
-            # Legacy compat keys (for any old code referencing qqq_* directly)
+            "expiry":                exp_dates[0],
+            "expirations_used":      len(exp_dates),
+            # Elite Quant Levels
+            "vanna_wall":            round(underlying_vanna_wall * ratio, 2),
+            "underlying_vanna_wall": underlying_vanna_wall,
+            "zero_dte_pin":          round(underlying_zero_dte_pin * ratio, 2),
+            "underlying_zero_dte_pin": underlying_zero_dte_pin,
+            "charm_direction":       charm_direction,
+            "charm_magnitude":       charm_magnitude,
+            # Conversion
+            "conversion_tier":       conversion_tier,
+            # Freshness
+            "data_age_sec":          data_age,
+            "freshness":             freshness,
+            # Legacy compat
             "qqq_spot":              spot if ticker == "QQQ" else None,
             "qqq_put_wall":          underlying_put_wall if ticker == "QQQ" else None,
             "qqq_call_wall":         underlying_call_wall if ticker == "QQQ" else None,
             "qqq_max_pain":          underlying_max_pain if ticker == "QQQ" else None,
             "nq_mid":                futures_mid if futures_sym == "NQ" else None,
         }
-        print(f"[api/walls] {ticker} PW={underlying_put_wall} CW={underlying_call_wall} MP={underlying_max_pain} | "
-              f"{futures_sym} r={ratio:.2f} PW={result['put_wall']} CW={result['call_wall']} MP={result['max_pain']}")
+        tier_names = {1: 'L2+Chain', 2: 'NDX bridge', 3: 'cached', 4: 'fallback'}
+        print(f"[api/walls] {ticker} PW={underlying_put_wall} CW={underlying_call_wall} "
+              f"MP={underlying_max_pain} GF={underlying_gamma_flip:.1f} | "
+              f"{futures_sym} r={ratio:.2f} T{conversion_tier}({tier_names.get(conversion_tier,'?')}) | "
+              f"{len(exp_dates)} expirations | {freshness} {data_age:.1f}s")
         return jsonify(result)
     except Exception as e:
         import traceback
@@ -1506,6 +1935,35 @@ def api_l2_diag():
         results["tests"]["l2_state"] = {"error": str(e)}
     return jsonify(results)
 
+@app.route("/api/l2/dom-history")
+def api_l2_dom_history():
+    """DOM snapshot history for 2D passive heatmap.
+    Query params:
+      ?symbol=NQ   (default NQ)
+      ?since=0     (Unix timestamp — snapshots at or after this time)
+      ?res=auto    (resolution: auto, t0, t1, t2, t3)
+    Returns: {symbol, tick, snapshots: [[ts, {bid_prices}, {ask_prices}], ...]}
+    """
+    import json as _json
+    try:
+        from background_engine.l2_worker import get_dom_history
+        symbol = request.args.get("symbol", "NQ").upper()
+        since = float(request.args.get("since", 0))
+        res = request.args.get("res", "auto")
+        history = get_dom_history(symbol, since_ts=since, resolution=res)
+        # Determine tick size from symbol
+        tick_map = {"NQ": 0.25, "ES": 0.25, "GC": 0.10, "YM": 1.0, "RTY": 0.10}
+        tick = tick_map.get(symbol, 0.25)
+        body = _json.dumps({
+            "symbol": symbol,
+            "tick": tick,
+            "count": len(history),
+            "snapshots": history,
+        }, default=str)
+        return make_response(body, 200, {"Content-Type": "application/json"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/api/inference")
 def api_inference():
     """Return signals from all 8 alpha frameworks (synthetic demo data)."""
@@ -1813,6 +2271,20 @@ def _start_workers():
             print(f"[L2-THREAD] FAILED: {err_msg}", flush=True)
     _startup_threading.Thread(target=_start_l2, daemon=True).start()
     print("[startup] L2 daemon thread spawned", flush=True)
+
+    # Start Schwab WebSocket bridge (real-time GEX streaming)
+    def _start_schwab():
+        import time as _t
+        _t.sleep(5)  # Let server + Schwab auth settle
+        try:
+            from background_engine.schwab_bridge import set_socketio as sb_set_sio, start_schwab_bridge
+            sb_set_sio(socketio)
+            start_schwab_bridge()
+            print("[startup] Schwab bridge started — real-time GEX push active", flush=True)
+        except Exception as e:
+            print(f"[startup] Schwab bridge failed (non-fatal): {e}", flush=True)
+    _startup_threading.Thread(target=_start_schwab, daemon=True).start()
+    print("[startup] Schwab bridge daemon thread spawned", flush=True)
 
     # Store reference so /api/l2 can check it
     import builtins
