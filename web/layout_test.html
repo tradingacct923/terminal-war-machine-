@@ -1,0 +1,1361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Altaris Layout Engine — Feature Panes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100vw;height:100vh;overflow:hidden;background:#050810;color:#c8d2e6;font-family:'Inter',-apple-system,sans-serif;-webkit-font-smoothing:antialiased}
+
+/* ── App Root ── */
+#app-root{display:flex;flex-direction:column;width:100%;height:100%;overflow:hidden}
+
+/* ── Toolbar ── */
+#toolbar{height:38px;flex-shrink:0;display:flex;align-items:center;padding:0 12px;background:rgba(8,10,22,.95);border-bottom:1px solid rgba(124,90,247,.12);backdrop-filter:blur(16px);gap:6px;z-index:100}
+.tb-logo{font-weight:800;font-size:.82rem;background:linear-gradient(135deg,#e0e8f0,#7c5af7);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-right:6px}
+.tb-div{width:1px;height:16px;background:rgba(255,255,255,.06);margin:0 3px}
+.tb-spacer{flex:1}
+.tb-lbl{font-size:.55rem;color:rgba(140,160,200,.4);font-family:'JetBrains Mono',monospace;letter-spacing:.08em}
+.tb-btn{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08);color:rgba(140,160,200,.65);font-family:'JetBrains Mono',monospace;font-size:.58rem;font-weight:600;padding:2px 8px;border-radius:4px;cursor:pointer;transition:all .12s}
+.tb-btn:hover{background:rgba(124,90,247,.12);border-color:rgba(124,90,247,.3);color:#c4b5fd}
+.tb-btn.active{background:rgba(124,90,247,.2);border-color:rgba(124,90,247,.45);color:#c4b5fd}
+
+/* ── Layout Selector ── */
+.layout-sel{position:relative}
+.layout-dropdown{display:none;position:absolute;top:32px;right:0;background:rgba(10,12,24,.97);border:1px solid rgba(124,90,247,.2);border-radius:8px;padding:10px;box-shadow:0 8px 32px rgba(0,0,0,.7);z-index:999;min-width:240px}
+.layout-dropdown.open{display:block}
+.layout-dropdown-title{font-size:.5rem;font-weight:600;letter-spacing:.12em;color:rgba(140,160,200,.3);padding:0 2px 6px;text-transform:uppercase}
+.ld-row{display:flex;gap:4px;margin-bottom:4px}
+.ld-row:last-child{margin-bottom:0}
+.ld-opt{width:52px;height:32px;background:rgba(255,255,255,.03);border:1.5px solid rgba(255,255,255,.08);border-radius:4px;cursor:pointer;display:flex;flex-direction:column;align-items:center;justify-content:center;transition:all .12s;gap:1px}
+.ld-opt:hover{border-color:rgba(124,90,247,.5);background:rgba(124,90,247,.06)}
+.ld-opt.active{border-color:rgba(124,90,247,.7);background:rgba(124,90,247,.12);box-shadow:0 0 8px rgba(124,90,247,.15)}
+.ld-opt svg{width:30px;height:18px}
+.ld-opt svg rect{stroke:rgba(200,210,230,.4);fill:none;stroke-width:.8}
+.ld-opt.active svg rect{stroke:#c4b5fd}
+.ld-opt-lbl{font-size:6px;font-family:'JetBrains Mono',monospace;color:rgba(140,160,200,.35);letter-spacing:.05em;line-height:1}
+
+/* ═══ Pane Grid ═══ */
+#pane-grid{flex:1;display:grid;overflow:hidden;min-height:0;min-width:0;position:relative;will-change:grid-template-columns,grid-template-rows}
+#pane-grid[data-layout="single"]{grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,1fr)}
+/* ── Futures Workflows ── */
+#pane-grid[data-layout="exec"]{grid-template-columns:minmax(0,1.5fr) minmax(0,1fr);grid-template-rows:minmax(0,1fr)}
+#pane-grid[data-layout="scalp"]{grid-template-columns:minmax(0,2.3fr) minmax(0,1fr);grid-template-rows:minmax(0,1fr)}
+#pane-grid[data-layout="flow"]{grid-template-columns:minmax(0,2fr) minmax(0,1fr) minmax(0,1fr);grid-template-rows:minmax(0,1fr)}
+#pane-grid[data-layout="dom"]{grid-template-columns:minmax(0,2.4fr) minmax(0,1fr) minmax(0,.6fr);grid-template-rows:minmax(0,1fr)}
+#pane-grid[data-layout="intel"]{grid-template-columns:minmax(0,2fr) minmax(0,1fr);grid-template-rows:minmax(0,1fr) minmax(0,1fr)}
+/* ── Options Workflows ── */
+#pane-grid[data-layout="oc-desk"]{grid-template-columns:minmax(0,1fr) minmax(0,1fr);grid-template-rows:minmax(0,1.2fr) minmax(0,1fr)}
+#pane-grid[data-layout="hedge"]{grid-template-columns:minmax(0,1.3fr) minmax(0,1fr) minmax(0,1fr);grid-template-rows:minmax(0,1fr)}
+#pane-grid[data-layout="oc-scan"]{grid-template-columns:minmax(0,1fr) minmax(0,1fr);grid-template-rows:minmax(0,1fr)}
+/* ── Full Station ── */
+#pane-grid[data-layout="recon"]{grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(0,1fr);grid-template-rows:minmax(0,1fr) minmax(0,1fr)}
+
+/* Spanning rules */
+#pane-grid[data-layout="intel"] .pane[data-slot="0"]{grid-row:1/3}
+
+/* ═══ Pane ═══ */
+.pane{position:relative;overflow:hidden;min-width:0;min-height:0;background:#070a14;border:1px solid rgba(255,255,255,.03);transition:border-color .1s}
+.pane.active{border-color:rgba(124,90,247,.28)}
+.pane.hidden{display:none!important}
+
+/* Pane header — always visible, compact */
+.pane-hdr{position:absolute;top:0;left:0;right:0;height:20px;display:flex;align-items:center;justify-content:space-between;padding:0 5px;background:linear-gradient(180deg,rgba(6,8,18,.92) 0%,transparent 100%);z-index:10;pointer-events:auto}
+.pane-hdr-tag{display:flex;align-items:center;gap:4px}
+.pane-hdr-icon{font-size:8px;opacity:.5}
+.pane-hdr-label{font-family:'JetBrains Mono',monospace;font-size:8px;font-weight:600;letter-spacing:.08em;color:rgba(140,160,200,.5)}
+.pane-hdr-ctrls{display:flex;gap:2px;opacity:0;transition:opacity .1s}
+.pane:hover .pane-hdr-ctrls{opacity:1}
+.pane-ctrl{width:15px;height:15px;display:flex;align-items:center;justify-content:center;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.05);border-radius:2px;color:rgba(140,160,200,.4);cursor:pointer;font-size:7px;transition:all .1s}
+.pane-ctrl:hover{background:rgba(124,90,247,.15);border-color:rgba(124,90,247,.3);color:#c4b5fd}
+
+/* Feature selector dropdown in pane header */
+.feat-sel{position:relative}
+.feat-sel-drop{display:none;position:absolute;top:18px;left:0;background:rgba(10,12,24,.97);border:1px solid rgba(124,90,247,.25);border-radius:6px;padding:3px;box-shadow:0 6px 20px rgba(0,0,0,.6);z-index:999;min-width:120px}
+.feat-sel-drop.open{display:block}
+.feat-sel-item{padding:3px 8px;font-family:'JetBrains Mono',monospace;font-size:8px;color:rgba(140,160,200,.6);cursor:pointer;border-radius:3px;display:flex;align-items:center;gap:5px;transition:all .1s}
+.feat-sel-item:hover{background:rgba(124,90,247,.1);color:#c4b5fd}
+.feat-sel-item.current{color:#c4b5fd;background:rgba(124,90,247,.08)}
+
+.pane-canvas{width:100%;height:100%;display:block}
+.pane-dims{position:absolute;bottom:3px;right:5px;font-family:'JetBrains Mono',monospace;font-size:7px;color:rgba(140,160,200,.2);pointer-events:none;z-index:5}
+
+/* Crosshairs */
+.ch-v{position:absolute;top:0;bottom:0;width:1px;background:rgba(124,90,247,.2);pointer-events:none;z-index:8;display:none}
+
+/* ═══ Resizer ═══ */
+.resizer{position:absolute;z-index:50;background:transparent}
+.resizer.r-col{top:0;bottom:0;width:7px;cursor:col-resize;transform:translateX(-3px)}
+.resizer.r-row{left:0;right:0;height:7px;cursor:row-resize;transform:translateY(-3px)}
+.resizer::after{content:'';position:absolute;background:rgba(124,90,247,.1);transition:background .12s}
+.resizer.r-col::after{top:0;bottom:0;left:3px;width:1px}
+.resizer.r-row::after{left:0;right:0;top:3px;height:1px}
+.resizer:hover::after,.resizer.dragging::after{background:rgba(124,90,247,.55)}
+#drag-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;z-index:9999}
+
+/* ═══ Status Bar ═══ */
+#status-bar{height:18px;flex-shrink:0;display:flex;align-items:center;padding:0 12px;gap:10px;background:rgba(8,10,22,.92);border-top:1px solid rgba(255,255,255,.03);font-family:'JetBrains Mono',monospace;font-size:8px;color:rgba(140,160,200,.3)}
+.s-dot{width:4px;height:4px;border-radius:50%;background:#2ee88a}
+
+/* ═══ Custom Layout Builder ═══ */
+.cl-section{border-top:1px solid rgba(255,255,255,.04);margin-top:4px;padding-top:6px}
+.cl-saved{display:flex;flex-wrap:wrap;gap:3px;margin-bottom:4px}
+.cl-saved-item{display:flex;align-items:center;gap:3px;padding:2px 6px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08);border-radius:4px;cursor:pointer;font-family:'JetBrains Mono',monospace;font-size:7px;color:rgba(140,160,200,.55);transition:all .1s}
+.cl-saved-item:hover{border-color:rgba(124,90,247,.4);color:#c4b5fd;background:rgba(124,90,247,.06)}
+.cl-saved-item.active{border-color:rgba(124,90,247,.6);color:#c4b5fd;background:rgba(124,90,247,.1)}
+.cl-del{width:10px;height:10px;font-size:7px;color:rgba(224,48,96,.4);cursor:pointer;display:flex;align-items:center;justify-content:center;border-radius:2px}
+.cl-del:hover{color:rgba(224,48,96,.8);background:rgba(224,48,96,.1)}
+.cl-new-btn{padding:2px 8px;background:rgba(124,90,247,.08);border:1px dashed rgba(124,90,247,.3);border-radius:4px;color:rgba(124,90,247,.5);font-family:'JetBrains Mono',monospace;font-size:7px;cursor:pointer;transition:all .1s}
+.cl-new-btn:hover{background:rgba(124,90,247,.15);color:#c4b5fd;border-color:rgba(124,90,247,.5)}
+.cl-builder{display:none;padding:6px 0 2px}
+.cl-builder.open{display:block}
+.cl-builder-title{font-size:7px;font-weight:600;color:rgba(124,90,247,.5);letter-spacing:.08em;margin-bottom:5px}
+.cl-grid-pick{display:flex;gap:3px;margin-bottom:6px}
+.cl-grid-opt{width:36px;height:22px;background:rgba(255,255,255,.02);border:1px solid rgba(255,255,255,.08);border-radius:3px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .12s}
+.cl-grid-opt:hover{border-color:rgba(124,90,247,.4)}
+.cl-grid-opt.selected{border-color:rgba(124,90,247,.7);background:rgba(124,90,247,.1)}
+.cl-grid-opt svg{width:24px;height:14px}
+.cl-grid-opt svg rect{stroke:rgba(200,210,230,.35);fill:none;stroke-width:.7}
+.cl-grid-opt.selected svg rect{stroke:#c4b5fd}
+.cl-slot-row{display:flex;align-items:center;gap:4px;margin-bottom:3px}
+.cl-slot-lbl{font-family:'JetBrains Mono',monospace;font-size:6.5px;color:rgba(140,160,200,.35);width:32px;flex-shrink:0}
+.cl-slot-sel{flex:1;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08);border-radius:3px;padding:2px 4px;font-family:'JetBrains Mono',monospace;font-size:7px;color:rgba(200,210,230,.6);cursor:pointer;-webkit-appearance:none;appearance:none}
+.cl-slot-sel:focus{outline:none;border-color:rgba(124,90,247,.4)}
+.cl-name-row{display:flex;gap:4px;margin-top:5px}
+.cl-name-input{flex:1;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.1);border-radius:3px;padding:3px 6px;font-family:'JetBrains Mono',monospace;font-size:7.5px;color:rgba(200,210,230,.7);outline:none}
+.cl-name-input:focus{border-color:rgba(124,90,247,.5)}
+.cl-name-input::placeholder{color:rgba(140,160,200,.25)}
+.cl-save-btn{padding:3px 10px;background:rgba(46,232,138,.1);border:1px solid rgba(46,232,138,.3);border-radius:3px;color:rgba(46,232,138,.7);font-family:'JetBrains Mono',monospace;font-size:7px;font-weight:600;cursor:pointer;transition:all .1s}
+.cl-save-btn:hover{background:rgba(46,232,138,.2);color:rgba(46,232,138,.9)}
+.cl-cancel-btn{padding:3px 8px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08);border-radius:3px;color:rgba(140,160,200,.4);font-family:'JetBrains Mono',monospace;font-size:7px;cursor:pointer}
+</style>
+</head>
+<body>
+<div id="app-root">
+
+  <div id="toolbar">
+    <span class="tb-logo">⚡ ALTARIS</span>
+    <span class="tb-div"></span>
+    <span class="tb-lbl">INSTRUMENT</span>
+    <div id="tb-syms" style="display:flex;gap:2px">
+      <button class="tb-btn active" data-sym="NQ">NQ</button>
+      <button class="tb-btn" data-sym="ES">ES</button>
+      <button class="tb-btn" data-sym="GC">GC</button>
+    </div>
+    <span class="tb-div"></span>
+    <span class="tb-lbl">TIMEFRAME</span>
+    <div id="tb-tfs" style="display:flex;gap:2px">
+      <button class="tb-btn" data-tf="5s">5s</button>
+      <button class="tb-btn" data-tf="15s">15s</button>
+      <button class="tb-btn active" data-tf="1m">1m</button>
+      <button class="tb-btn" data-tf="5m">5m</button>
+      <button class="tb-btn" data-tf="15m">15m</button>
+    </div>
+    <span class="tb-spacer"></span>
+    <span class="tb-lbl" id="tb-sym-display">NQ · 1m</span>
+    <span class="tb-div"></span>
+    <button class="tb-btn" id="tb-save" title="Save Workspace" style="color:rgba(46,232,138,.6);border-color:rgba(46,232,138,.15)">💾 Save</button>
+    <span class="tb-div"></span>
+    <div class="layout-sel" id="layout-sel">
+      <button class="tb-btn" id="layout-trigger">
+        <svg width="12" height="12" viewBox="0 0 16 16"><rect x="1" y="1" width="14" height="14" rx="2" stroke="currentColor" fill="none" stroke-width="1.2"/></svg>
+        Layout
+      </button>
+      <div class="layout-dropdown" id="layout-dropdown">
+        <div class="layout-dropdown-title">⚡ Futures Execution</div>
+        <div class="ld-row">
+          <div class="ld-opt active" data-layout="single" title="Single Feature — Full screen">
+            <svg viewBox="0 0 28 20"><rect x="1" y="1" width="26" height="18" rx="1.5"/></svg>
+            <span class="ld-opt-lbl">SINGLE</span>
+          </div>
+          <div class="ld-opt" data-layout="exec" title="EXECUTION — Chart 60% | Ladder 40%">
+            <svg viewBox="0 0 28 20"><rect x="1" y="1" width="16" height="18" rx="1.5" stroke="rgba(46,232,138,.5)"/><rect x="19" y="1" width="8" height="18" rx="1" stroke="rgba(124,90,247,.5)"/></svg>
+            <span class="ld-opt-lbl">EXEC</span>
+          </div>
+          <div class="ld-opt" data-layout="scalp" title="SCALP — Big Ladder 70% | Chart 30%">
+            <svg viewBox="0 0 28 20"><rect x="1" y="1" width="18" height="18" rx="1.5" stroke="rgba(124,90,247,.6)"/><rect x="21" y="1" width="6" height="18" rx="1" stroke="rgba(46,232,138,.4)"/></svg>
+            <span class="ld-opt-lbl">SCALP</span>
+          </div>
+        </div>
+        <div class="ld-row">
+          <div class="ld-opt" data-layout="flow" title="FLOW — Chart | GEX | DEX">
+            <svg viewBox="0 0 28 20"><rect x="1" y="1" width="14" height="18" rx="1.5" stroke="rgba(46,232,138,.5)"/><rect x="16.5" y="1" width="5" height="18" rx=".8" stroke="rgba(100,165,250,.5)"/><rect x="23" y="1" width="4" height="18" rx=".5" stroke="rgba(200,130,255,.5)"/></svg>
+            <span class="ld-opt-lbl">FLOW</span>
+          </div>
+          <div class="ld-opt" data-layout="dom" title="DOM — Chart | Heatmap | Ladder">
+            <svg viewBox="0 0 28 20"><rect x="1" y="1" width="14" height="18" rx="1.5"/><rect x="16.5" y="1" width="6" height="18" rx="1" stroke="rgba(255,180,40,.5)"/><rect x="24" y="1" width="3" height="18" rx=".5" stroke="rgba(124,90,247,.5)"/></svg>
+            <span class="ld-opt-lbl">DOM</span>
+          </div>
+          <div class="ld-opt" data-layout="intel" title="INTEL — Big Chart + Heatmap + IV Skew">
+            <svg viewBox="0 0 28 20"><rect x="1" y="1" width="16" height="18" rx="1.5" stroke="rgba(46,232,138,.5)"/><rect x="19" y="1" width="8" height="8" rx="1" stroke="rgba(255,180,40,.4)"/><rect x="19" y="11" width="8" height="8" rx="1" stroke="rgba(100,165,250,.4)"/></svg>
+            <span class="ld-opt-lbl">INTEL</span>
+          </div>
+        </div>
+        <div class="layout-dropdown-title" style="padding-top:6px">📋 Options Desk</div>
+        <div class="ld-row">
+          <div class="ld-opt" data-layout="oc-desk" title="OPTIONS DESK — Chart+OC Levels / OC Heat+OC Liq">
+            <svg viewBox="0 0 28 20"><rect x="1" y="1" width="12" height="10" rx="1" stroke="rgba(46,232,138,.5)"/><rect x="15" y="1" width="12" height="10" rx="1" stroke="rgba(124,90,247,.5)"/><rect x="1" y="13" width="12" height="6" rx=".8" stroke="rgba(255,100,40,.5)"/><rect x="15" y="13" width="12" height="6" rx=".8" stroke="rgba(0,180,255,.5)"/></svg>
+            <span class="ld-opt-lbl">OC DESK</span>
+          </div>
+          <div class="ld-opt" data-layout="hedge" title="HEDGE — Ladder | OC Levels | IV Skew">
+            <svg viewBox="0 0 28 20"><rect x="1" y="1" width="10" height="18" rx="1" stroke="rgba(124,90,247,.5)"/><rect x="12.5" y="1" width="8" height="18" rx="1" stroke="rgba(124,90,247,.4)"/><rect x="22" y="1" width="5" height="18" rx=".8" stroke="rgba(100,165,250,.5)"/></svg>
+            <span class="ld-opt-lbl">HEDGE</span>
+          </div>
+          <div class="ld-opt" data-layout="oc-scan" title="OC SCAN — GEX Heatmap | Liquidity Map">
+            <svg viewBox="0 0 28 20"><rect x="1" y="1" width="12" height="18" rx="1.5" stroke="rgba(255,100,40,.6)"/><rect x="15" y="1" width="12" height="18" rx="1.5" stroke="rgba(0,180,255,.6)"/></svg>
+            <span class="ld-opt-lbl">OC SCAN</span>
+          </div>
+        </div>
+        <div class="layout-dropdown-title" style="padding-top:6px">🖥️ Full Station</div>
+        <div class="ld-row">
+          <div class="ld-opt" data-layout="recon" title="RECON — 6-Panel All Features">
+            <svg viewBox="0 0 28 20"><rect x="1" y="1" width="7.5" height="8" rx=".8" stroke="rgba(46,232,138,.4)"/><rect x="10.25" y="1" width="7.5" height="8" rx=".8" stroke="rgba(255,180,40,.4)"/><rect x="19.5" y="1" width="7.5" height="8" rx=".8" stroke="rgba(124,90,247,.4)"/><rect x="1" y="11" width="7.5" height="8" rx=".8" stroke="rgba(124,90,247,.4)"/><rect x="10.25" y="11" width="7.5" height="8" rx=".8" stroke="rgba(255,100,40,.4)"/><rect x="19.5" y="11" width="7.5" height="8" rx=".8" stroke="rgba(0,180,255,.4)"/></svg>
+            <span class="ld-opt-lbl">RECON</span>
+          </div>
+        </div>
+        <!-- ⭐ Custom Layouts -->
+        <div class="cl-section">
+          <div class="layout-dropdown-title">⭐ My Layouts</div>
+          <div id="cl-saved-list" class="cl-saved"></div>
+          <button class="cl-new-btn" id="cl-new-btn">+ Create Custom Layout</button>
+          <div class="cl-builder" id="cl-builder">
+            <div class="cl-builder-title">GRID SHAPE</div>
+            <div class="cl-grid-pick" id="cl-grid-pick"></div>
+            <div class="cl-builder-title">FEATURES</div>
+            <div id="cl-slots"></div>
+            <div class="cl-name-row">
+              <input class="cl-name-input" id="cl-name" placeholder="Layout name..." maxlength="20">
+              <button class="cl-save-btn" id="cl-save-btn">Save</button>
+              <button class="cl-cancel-btn" id="cl-cancel-btn">Cancel</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="pane-grid" data-layout="single"></div>
+  <div id="drag-overlay"></div>
+
+  <div id="status-bar">
+    <span class="s-dot"></span>
+    <span id="s-layout">Layout: Single</span>
+    <span>|</span>
+    <span id="s-sym">NQ · 1m</span>
+    <span>|</span>
+    <span id="s-fps">FPS: --</span>
+  </div>
+</div>
+
+<script>
+(function(){
+'use strict';
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FEATURES — Each feature has a unique mock renderer
+// ═══════════════════════════════════════════════════════════════════════════
+const FEATURES = {
+  chart:   { label: 'CHART',    icon: '📈', desc: 'Price Chart' },
+  heatmap: { label: 'HEATMAP',  icon: '🟧', desc: 'DOM Heatmap' },
+  ladder:  { label: 'LADDER',   icon: '📊', desc: 'Depth Ladder' },
+  gex:     { label: 'GEX',      icon: 'γ',  desc: 'Gamma Exposure' },
+  dex:     { label: 'DEX',      icon: 'Δ',  desc: 'Delta Exposure' },
+  ivskew:  { label: 'IV SKEW',  icon: '🌊', desc: 'Volatility Surface' },
+  oclvl:   { label: 'OC LEVELS',icon: '📋', desc: 'Option Chain Levels' },
+  ocheat:  { label: 'OC HEAT',  icon: '🔥', desc: 'Option Chain Heatmap' },
+  ocliq:   { label: 'OC LIQ',   icon: '💧', desc: 'OC Liquidity Heatmap' },
+};
+const FEAT_KEYS = Object.keys(FEATURES);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LAYOUTS — Each defines slots + default features
+// ═══════════════════════════════════════════════════════════════════════════
+const LAYOUTS = {
+  'single':   { label:'Single',       slots:1, cols:1, rows:1, defaults:['chart'] },
+  // ── Futures Execution ──
+  'exec':     { label:'Execution',    slots:2, cols:2, rows:1, defaults:['chart','ladder'] },
+  'scalp':    { label:'Scalp',        slots:2, cols:2, rows:1, defaults:['ladder','chart'] },
+  'flow':     { label:'Flow',         slots:3, cols:3, rows:1, defaults:['chart','gex','dex'] },
+  'dom':      { label:'DOM',          slots:3, cols:3, rows:1, defaults:['chart','heatmap','ladder'] },
+  'intel':    { label:'Intel',        slots:3, cols:2, rows:2, defaults:['chart','heatmap','ivskew'] },
+  // ── Options Desk ──
+  'oc-desk':  { label:'OC Desk',      slots:4, cols:2, rows:2, defaults:['chart','oclvl','ocheat','ocliq'] },
+  'hedge':    { label:'Hedge',        slots:3, cols:3, rows:1, defaults:['ladder','oclvl','ivskew'] },
+  'oc-scan':  { label:'OC Scan',      slots:2, cols:2, rows:1, defaults:['ocheat','ocliq'] },
+  // ── Full Station ──
+  'recon':    { label:'Recon',        slots:6, cols:3, rows:2, defaults:['chart','heatmap','ladder','oclvl','ocheat','ocliq'] },
+};
+
+const MAX_PANES = 6;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GLOBAL STATE
+// ═══════════════════════════════════════════════════════════════════════════
+let _sym = 'NQ', _tf = '1m';
+let _layout = 'single';
+let _maximized = -1;
+const _panes = [];
+const _paneFeature = []; // which feature each pane shows
+const _observers = [];
+const _resizers = [];
+
+const grid = document.getElementById('pane-grid');
+const dragOverlay = document.getElementById('drag-overlay');
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MOCK RENDERERS — One per feature type
+// ═══════════════════════════════════════════════════════════════════════════
+const RENDERERS = {
+  chart(ctx, w, h, dpr) {
+    ctx.save(); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle='#070a14'; ctx.fillRect(0,0,w,h);
+    // Grid
+    ctx.strokeStyle='rgba(20,30,50,.4)'; ctx.lineWidth=.5;
+    for(let x=80;x<w;x+=80){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.stroke()}
+    for(let y=60;y<h;y+=60){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke()}
+    // Symbol + Price
+    const bp=_sym==='NQ'?23300:_sym==='ES'?5800:_sym==='GC'?3100:70;
+    ctx.font=`600 ${Math.max(11,h*.025)}px "JetBrains Mono",monospace`;
+    ctx.fillStyle='rgba(0,220,200,.5)'; ctx.textAlign='left'; ctx.fillText(_sym,10,26);
+    ctx.font=`700 ${Math.max(14,h*.04)}px "JetBrains Mono",monospace`;
+    ctx.fillStyle='rgba(220,225,240,.85)'; ctx.fillText(bp.toFixed(2),10,52);
+    ctx.font='500 9px "JetBrains Mono",monospace'; ctx.fillStyle='rgba(140,160,200,.25)';
+    ctx.textAlign='right'; ctx.fillText(_tf,w-8,18);
+    // ── Option Level Overlays (Call/Put Walls, GEX Flip, Max Pain) ──
+    const tickSz=_sym==='NQ'?.25:_sym==='ES'?.25:_sym==='GC'?.1:.01;
+    const priceRange=h*.003; // price range visible
+    const pxPerTick=h/(60/tickSz);
+    const mid=h*.5;
+    // Call Wall
+    const callWallOff=Math.round(h*.22);
+    ctx.strokeStyle='rgba(46,232,138,.25)'; ctx.lineWidth=1; ctx.setLineDash([6,3]);
+    ctx.beginPath(); ctx.moveTo(0,mid-callWallOff); ctx.lineTo(w,mid-callWallOff); ctx.stroke();
+    ctx.font='600 7px "JetBrains Mono",monospace'; ctx.fillStyle='rgba(46,232,138,.35)';
+    ctx.textAlign='left'; ctx.fillText('CALL WALL '+(bp+8).toFixed(0),4,mid-callWallOff-3);
+    // Put Wall
+    const putWallOff=Math.round(h*.18);
+    ctx.strokeStyle='rgba(224,48,96,.25)'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(0,mid+putWallOff); ctx.lineTo(w,mid+putWallOff); ctx.stroke();
+    ctx.fillStyle='rgba(224,48,96,.35)';
+    ctx.fillText('PUT WALL '+(bp-6).toFixed(0),4,mid+putWallOff-3);
+    // GEX Flip
+    const gexFlipOff=Math.round(h*.06);
+    ctx.strokeStyle='rgba(124,90,247,.3)'; ctx.lineWidth=1.5; ctx.setLineDash([3,2]);
+    ctx.beginPath(); ctx.moveTo(0,mid+gexFlipOff); ctx.lineTo(w,mid+gexFlipOff); ctx.stroke();
+    ctx.fillStyle='rgba(124,90,247,.4)'; ctx.font='600 7px "JetBrains Mono",monospace';
+    ctx.fillText('⚡ GEX FLIP '+(bp-2).toFixed(0),4,mid+gexFlipOff-3);
+    // Max Pain
+    const mpOff=Math.round(h*.04);
+    ctx.strokeStyle='rgba(255,180,40,.2)'; ctx.lineWidth=1; ctx.setLineDash([2,4]);
+    ctx.beginPath(); ctx.moveTo(0,mid-mpOff); ctx.lineTo(w,mid-mpOff); ctx.stroke();
+    ctx.fillStyle='rgba(255,180,40,.3)'; ctx.font='500 6px "JetBrains Mono",monospace';
+    ctx.textAlign='right'; ctx.fillText('MAX PAIN '+(bp+1.5).toFixed(0),w-4,mid-mpOff-2);
+    ctx.setLineDash([]);
+    // ── VWAP ──
+    ctx.strokeStyle='rgba(0,180,255,.22)'; ctx.lineWidth=1.5;
+    ctx.beginPath();
+    for(let i=0;i<w;i++){ctx.lineTo(i,mid+Math.sin(i*.008)*h*.08+Math.cos(i*.003)*h*.04)}
+    ctx.stroke();
+    ctx.font='500 6px "JetBrains Mono",monospace'; ctx.fillStyle='rgba(0,180,255,.3)';
+    ctx.textAlign='right'; ctx.fillText('VWAP',w-4,mid+Math.sin(w*.008)*h*.08-4);
+    // ── Candles ──
+    const bw=7,gap=3,n=Math.floor((w-60)/(bw+gap));
+    let prev=h*.5;
+    for(let i=0;i<n;i++){
+      const s=Math.sin(i*.3)*18+Math.cos(i*.1)*8;
+      const o=prev,c=o+s+(Math.random()-.5)*6;
+      const hi=Math.min(o,c)-Math.abs(s)*.4-Math.random()*4;
+      const lo=Math.max(o,c)+Math.abs(s)*.4+Math.random()*4;
+      const x=50+i*(bw+gap), bull=c<o;
+      ctx.strokeStyle=bull?'rgba(46,232,138,.6)':'rgba(224,48,96,.6)';
+      ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(x+bw/2,hi); ctx.lineTo(x+bw/2,lo); ctx.stroke();
+      ctx.fillStyle=bull?'rgba(46,232,138,.7)':'rgba(224,48,96,.7)';
+      ctx.fillRect(x,Math.min(o,c),bw,Math.max(Math.abs(c-o),1));
+      prev=c;
+    }
+    // ── Legend Box ──
+    const lx=w-120, ly=30, lw=115, lh=52;
+    ctx.fillStyle='rgba(6,8,18,.8)'; ctx.fillRect(lx,ly,lw,lh);
+    ctx.strokeStyle='rgba(255,255,255,.04)'; ctx.lineWidth=1; ctx.strokeRect(lx,ly,lw,lh);
+    ctx.font='500 6.5px "JetBrains Mono",monospace'; ctx.textAlign='left';
+    const leg=[['CALL WALL','rgba(46,232,138,.5)'],['PUT WALL','rgba(224,48,96,.5)'],['GEX FLIP','rgba(124,90,247,.5)'],['VWAP','rgba(0,180,255,.4)']];
+    leg.forEach(([t,c],i)=>{ ctx.fillStyle=c; ctx.fillRect(lx+6,ly+8+i*11,8,6); ctx.fillStyle='rgba(200,210,230,.4)'; ctx.fillText(t,lx+18,ly+13+i*11); });
+    ctx.restore();
+  },
+
+  heatmap(ctx, w, h, dpr) {
+    ctx.save(); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle='#060912'; ctx.fillRect(0,0,w,h);
+    // Header
+    ctx.font='600 9px "JetBrains Mono",monospace';
+    ctx.fillStyle='rgba(255,180,40,.45)'; ctx.textAlign='left'; ctx.fillText('DOM HEATMAP · '+_sym,8,14);
+    // Heatmap cells
+    const cols=Math.floor(w/8), rows=Math.floor((h-20)/4);
+    const midRow=Math.floor(rows/2);
+    for(let r=0;r<rows;r++){
+      for(let c=0;c<cols;c++){
+        const dist=Math.abs(r-midRow)/rows;
+        const intensity=Math.random()*(1-dist*1.5);
+        if(intensity<.15) continue;
+        const isBid=r>midRow;
+        const rr=isBid?0:Math.round(intensity*200);
+        const gg=isBid?Math.round(intensity*180):Math.round(intensity*40);
+        const bb=isBid?Math.round(intensity*80):Math.round(intensity*30);
+        ctx.fillStyle=`rgba(${rr},${gg},${bb},${Math.min(intensity*.8,.7).toFixed(2)})`;
+        ctx.fillRect(c*8,20+r*4,7,3);
+      }
+    }
+    // Mid-price line
+    ctx.strokeStyle='rgba(255,220,0,.5)'; ctx.lineWidth=1; ctx.setLineDash([3,2]);
+    ctx.beginPath(); ctx.moveTo(0,20+midRow*4); ctx.lineTo(w,20+midRow*4); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.restore();
+  },
+
+  ladder(ctx, w, h, dpr) {
+    ctx.save(); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle='#060810'; ctx.fillRect(0,0,w,h);
+    ctx.font='600 9px "JetBrains Mono",monospace';
+    ctx.fillStyle='rgba(124,90,247,.4)'; ctx.textAlign='left'; ctx.fillText('DEPTH LADDER · '+_sym,8,14);
+    // Ladder rows
+    const bp=_sym==='NQ'?23300:_sym==='ES'?5800:_sym==='GC'?3100:70;
+    const rowH=16, nRows=Math.floor((h-24)/rowH);
+    const mid=Math.floor(nRows/2);
+    ctx.font='500 9px "JetBrains Mono",monospace';
+    for(let r=0;r<nRows;r++){
+      const y=22+r*rowH;
+      const price=bp+(mid-r)*.25;
+      const isBid=r>mid;
+      const sz=Math.floor(Math.random()*300+10);
+      // Bar
+      const barW=Math.min((sz/300)*w*.4,w*.4);
+      if(isBid){
+        ctx.fillStyle='rgba(46,232,138,.08)';
+        ctx.fillRect(w*.55,y,barW,rowH-2);
+      } else {
+        ctx.fillStyle='rgba(224,48,96,.08)';
+        ctx.fillRect(w*.55-barW,y,barW,rowH-2);
+      }
+      // Price
+      ctx.fillStyle=r===mid?'rgba(255,220,0,.8)':isBid?'rgba(46,232,138,.5)':'rgba(224,48,96,.5)';
+      ctx.textAlign='center';
+      ctx.fillText(price.toFixed(2),w*.5,y+11);
+      // Size
+      ctx.fillStyle='rgba(200,210,230,.35)'; ctx.textAlign=isBid?'left':'right';
+      ctx.fillText(sz,isBid?w*.55+barW+4:w*.55-barW-4,y+11);
+    }
+    ctx.restore();
+  },
+
+  gex(ctx, w, h, dpr) {
+    ctx.save(); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle='#060810'; ctx.fillRect(0,0,w,h);
+    ctx.font='600 9px "JetBrains Mono",monospace';
+    ctx.fillStyle='rgba(0,230,160,.5)'; ctx.fillText('γ GEX · GAMMA EXPOSURE · '+_sym,8,14);
+    // GEX heatmap mock
+    const bp=_sym==='NQ'?500:_sym==='ES'?580:_sym==='GC'?290:70;
+    const exps=['Mar 31','Apr 1','Apr 2'];
+    const colW=(w-50)/exps.length;
+    ctx.font='500 7px "JetBrains Mono",monospace'; ctx.fillStyle='rgba(140,160,200,.35)'; ctx.textAlign='center';
+    for(let c=0;c<exps.length;c++) ctx.fillText(exps[c],50+c*colW+colW/2,28);
+    const rowH=Math.max(5,Math.min(10,(h-36)/40));
+    const nRows=Math.min(Math.floor((h-36)/rowH),40);
+    const mid=Math.floor(nRows/2);
+    for(let r=0;r<nRows;r++){
+      const y=34+r*rowH;
+      const strike=bp+(mid-r)*.5;
+      ctx.font='500 6px "JetBrains Mono",monospace'; ctx.fillStyle='rgba(140,160,200,.3)';
+      ctx.textAlign='right'; ctx.fillText('$'+strike.toFixed(0),46,y+rowH*.7);
+      for(let c=0;c<exps.length;c++){
+        const dist=Math.abs(r-mid)/nRows;
+        const val=(Math.random()-.3)*(1-dist*2);
+        if(Math.abs(val)<.05) continue;
+        const t=Math.min(Math.abs(val),1);
+        let rr,gg,bb;
+        if(val>0){rr=0;gg=Math.round(t*220);bb=Math.round(t*80)}
+        else{rr=Math.round(t*200);gg=Math.round(t*20);bb=Math.round(t*40)}
+        ctx.fillStyle=`rgba(${rr},${gg},${bb},${(t*.7).toFixed(2)})`;
+        ctx.fillRect(50+c*colW+1,y,colW-2,rowH-1);
+        // Value label
+        ctx.font='500 5.5px "JetBrains Mono",monospace';
+        ctx.fillStyle=`rgba(200,210,230,${(t*.6+.1).toFixed(2)})`;
+        ctx.textAlign='center';
+        const fv=Math.abs(val*100)>=1e3?(val*100/1e3).toFixed(1)+'K':(val*100).toFixed(0);
+        ctx.fillText(fv,50+c*colW+colW/2,y+rowH*.75);
+      }
+    }
+    ctx.restore();
+  },
+
+  dex(ctx, w, h, dpr) {
+    ctx.save(); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle='#060810'; ctx.fillRect(0,0,w,h);
+    ctx.font='600 9px "JetBrains Mono",monospace';
+    ctx.fillStyle='rgba(30,215,100,.5)'; ctx.fillText('Δ DEX · DELTA EXPOSURE · '+_sym,8,14);
+    // DEX heatmap mock
+    const bp=_sym==='NQ'?500:_sym==='ES'?580:_sym==='GC'?290:70;
+    const exps=['Mar 31','Apr 1','Apr 2'];
+    const colW=(w-50)/exps.length;
+    ctx.font='500 7px "JetBrains Mono",monospace'; ctx.fillStyle='rgba(140,160,200,.35)'; ctx.textAlign='center';
+    for(let c=0;c<exps.length;c++) ctx.fillText(exps[c],50+c*colW+colW/2,28);
+    const rowH=Math.max(5,Math.min(10,(h-36)/40));
+    const nRows=Math.min(Math.floor((h-36)/rowH),40);
+    const mid=Math.floor(nRows/2);
+    for(let r=0;r<nRows;r++){
+      const y=34+r*rowH;
+      const strike=bp+(mid-r)*.5;
+      ctx.font='500 6px "JetBrains Mono",monospace'; ctx.fillStyle='rgba(140,160,200,.3)';
+      ctx.textAlign='right'; ctx.fillText('$'+strike.toFixed(0),46,y+rowH*.7);
+      for(let c=0;c<exps.length;c++){
+        const dist=Math.abs(r-mid)/nRows;
+        const val=(Math.random()-.4)*(1-dist*1.8);
+        if(Math.abs(val)<.05) continue;
+        const t=Math.min(Math.abs(val),1);
+        let rr,gg,bb;
+        if(val>0){rr=Math.round(t*10);gg=Math.round(80+t*135);bb=Math.round(50+t*50)}
+        else{rr=Math.round(140+t*60);gg=Math.round(t*20);bb=Math.round(30+t*15)}
+        ctx.fillStyle=`rgba(${rr},${gg},${bb},${(t*.65).toFixed(2)})`;
+        ctx.fillRect(50+c*colW+1,y,colW-2,rowH-1);
+        const fv=Math.abs(val*100)>=1e3?(val*100/1e3).toFixed(1)+'K':(val*100).toFixed(0);
+        ctx.font='500 5.5px "JetBrains Mono",monospace';
+        ctx.fillStyle=`rgba(200,210,230,${(t*.5+.1).toFixed(2)})`;
+        ctx.textAlign='center';
+        ctx.fillText(fv,50+c*colW+colW/2,y+rowH*.75);
+      }
+    }
+    ctx.restore();
+  },
+
+  ivskew(ctx, w, h, dpr) {
+    ctx.save(); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle='#06080e'; ctx.fillRect(0,0,w,h);
+    ctx.font='600 9px "JetBrains Mono",monospace';
+    ctx.fillStyle='rgba(100,180,255,.5)'; ctx.fillText('🌊 IV SKEW · VOLATILITY SURFACE · '+_sym,8,14);
+    // Mock IV surface grid
+    const cols=7, rows=Math.floor((h-30)/14);
+    const colW=(w-60)/cols;
+    const baseIV=0.20;
+    ctx.font='500 8px "JetBrains Mono",monospace';
+    for(let r=0;r<rows;r++){
+      const y=28+r*14;
+      const strike=Math.round(565-rows/2+r);
+      ctx.fillStyle='rgba(100,180,255,.3)'; ctx.fillText('$'+strike,4,y+10);
+      for(let c=0;c<cols;c++){
+        const iv=baseIV+Math.abs(r-rows/2)*.008+c*.012+Math.random()*.02;
+        const t=Math.max(0,Math.min(1,(iv-0.15)/0.25));
+        const red=Math.round(20+t*230), grn=Math.round(180-t*120), blu=Math.round(220-t*180);
+        ctx.fillStyle=`rgba(${red},${grn},${blu},${0.2+t*0.5})`;
+        ctx.fillRect(55+c*colW,y,colW-2,12);
+        ctx.fillStyle='rgba(255,255,255,.6)';
+        ctx.textAlign='center';
+        ctx.fillText((iv*100).toFixed(1)+'%',55+c*colW+colW/2,y+10);
+      }
+    }
+    ctx.restore();
+  },
+
+  tape(ctx, w, h, dpr) {
+    ctx.save(); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle='#060810'; ctx.fillRect(0,0,w,h);
+    ctx.font='600 9px "JetBrains Mono",monospace';
+    ctx.fillStyle='rgba(200,130,255,.4)'; ctx.fillText('TIME & SALES · '+_sym,8,14);
+    // Tape rows
+    const bp=_sym==='NQ'?23300:_sym==='ES'?5800:_sym==='GC'?3100:70;
+    const rowH=14, nRows=Math.floor((h-24)/rowH);
+    ctx.font='500 8px "JetBrains Mono",monospace';
+    for(let r=0;r<nRows;r++){
+      const y=24+r*rowH;
+      const isBuy=Math.random()>.48;
+      const px=bp+(Math.random()-.5)*2;
+      const sz=Math.floor(Math.random()*50+1);
+      const t=new Date(Date.now()-r*Math.random()*2000);
+      const ts=t.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+      // Stripe
+      if(r%2===0){ctx.fillStyle='rgba(255,255,255,.01)';ctx.fillRect(0,y,w,rowH)}
+      // Time
+      ctx.fillStyle='rgba(140,160,200,.25)'; ctx.textAlign='left'; ctx.fillText(ts,6,y+10);
+      // Price
+      ctx.fillStyle=isBuy?'rgba(46,232,138,.6)':'rgba(224,48,96,.6)';
+      ctx.textAlign='center'; ctx.fillText(px.toFixed(2),w*.5,y+10);
+      // Size
+      ctx.fillStyle='rgba(200,210,230,.35)'; ctx.textAlign='right'; ctx.fillText(sz,w-8,y+10);
+    }
+    ctx.restore();
+  },
+
+  oclvl(ctx, w, h, dpr) {
+    ctx.save(); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle='#060810'; ctx.fillRect(0,0,w,h);
+    ctx.font='600 9px "JetBrains Mono",monospace';
+    ctx.fillStyle='rgba(124,90,247,.5)'; ctx.fillText('OPTION CHAIN LEVELS · '+_sym,8,14);
+    // Column headers
+    const sym=_sym==='NQ'?'QQQ':_sym==='ES'?'SPY':_sym==='GC'?'GLD':'USO';
+    const bp=_sym==='NQ'?500:_sym==='ES'?580:_sym==='GC'?290:70;
+    const cols=['Bid','Ask','Vol','IV','Strike','IV','Vol','Ask','Bid'];
+    const colW=w/cols.length;
+    ctx.font='600 7px "JetBrains Mono",monospace';
+    // Call header
+    ctx.fillStyle='rgba(46,232,138,.3)'; ctx.fillRect(0,20,w*.44,12);
+    ctx.fillStyle='rgba(46,232,138,.6)'; ctx.textAlign='center'; ctx.fillText('── CALLS ──',w*.22,29);
+    // Put header
+    ctx.fillStyle='rgba(224,48,96,.3)'; ctx.fillRect(w*.56,20,w*.44,12);
+    ctx.fillStyle='rgba(224,48,96,.6)'; ctx.textAlign='center'; ctx.fillText('── PUTS ──',w*.78,29);
+    // Sub headers
+    ctx.font='500 6.5px "JetBrains Mono",monospace'; ctx.fillStyle='rgba(140,160,200,.4)';
+    cols.forEach((c,i)=>{ctx.textAlign='center';ctx.fillText(c,colW*i+colW/2,42)});
+    // Rows
+    const rowH=14, nRows=Math.min(Math.floor((h-50)/rowH),30);
+    const mid=Math.floor(nRows/2);
+    ctx.font='500 8px "JetBrains Mono",monospace';
+    for(let r=0;r<nRows;r++){
+      const y=48+r*rowH;
+      const strike=bp+(mid-r)*.5;
+      const isATM=r===mid;
+      const itm=r<mid; // calls ITM above strike
+      if(r%2===0){ctx.fillStyle='rgba(255,255,255,.008)';ctx.fillRect(0,y,w,rowH)}
+      if(isATM){ctx.fillStyle='rgba(124,90,247,.06)';ctx.fillRect(0,y,w,rowH)}
+      // Strike column (center)
+      ctx.fillStyle=isATM?'rgba(124,90,247,.9)':'rgba(200,210,230,.5)';
+      ctx.textAlign='center'; ctx.font=isATM?'700 8.5px "JetBrains Mono",monospace':'500 8px "JetBrains Mono",monospace';
+      ctx.fillText('$'+strike.toFixed(0),colW*4+colW/2,y+10);
+      // Call side (left 4 cols)
+      const cBid=(Math.random()*5+.1).toFixed(2), cAsk=(parseFloat(cBid)+.05).toFixed(2);
+      const cVol=Math.floor(Math.random()*2000), cIV=(Math.random()*30+15).toFixed(1);
+      ctx.font='500 7.5px "JetBrains Mono",monospace';
+      ctx.fillStyle=itm?'rgba(46,232,138,.5)':'rgba(46,232,138,.3)'; ctx.textAlign='center';
+      ctx.fillText(cBid,colW*0+colW/2,y+10); ctx.fillText(cAsk,colW*1+colW/2,y+10);
+      ctx.fillStyle='rgba(200,210,230,.35)'; ctx.fillText(cVol,colW*2+colW/2,y+10);
+      ctx.fillStyle='rgba(140,160,200,.3)'; ctx.fillText(cIV+'%',colW*3+colW/2,y+10);
+      // Put side (right 4 cols)
+      const pBid=(Math.random()*5+.1).toFixed(2), pAsk=(parseFloat(pBid)+.05).toFixed(2);
+      const pVol=Math.floor(Math.random()*2000), pIV=(Math.random()*30+15).toFixed(1);
+      ctx.fillStyle=!itm?'rgba(224,48,96,.5)':'rgba(224,48,96,.3)';
+      ctx.fillText(pIV+'%',colW*5+colW/2,y+10);
+      ctx.fillStyle='rgba(200,210,230,.35)'; ctx.fillText(pVol,colW*6+colW/2,y+10);
+      ctx.fillStyle=!itm?'rgba(224,48,96,.5)':'rgba(224,48,96,.3)';
+      ctx.fillText(pAsk,colW*7+colW/2,y+10); ctx.fillText(pBid,colW*8+colW/2,y+10);
+    }
+    // ATM line
+    ctx.strokeStyle='rgba(124,90,247,.3)'; ctx.lineWidth=1; ctx.setLineDash([3,2]);
+    ctx.beginPath(); ctx.moveTo(0,48+mid*rowH); ctx.lineTo(w,48+mid*rowH); ctx.stroke();
+    ctx.restore();
+  },
+
+  ocheat(ctx, w, h, dpr) {
+    ctx.save(); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle='#060810'; ctx.fillRect(0,0,w,h);
+    ctx.font='600 9px "JetBrains Mono",monospace';
+    ctx.fillStyle='rgba(255,100,40,.5)'; ctx.fillText('OC HEATMAP (GEX/DEX) · '+_sym,8,14);
+    // Column headers = expirations
+    const exps=['Apr 4','Apr 11','Apr 18','May 2','May 16','Jun 20'];
+    const nExp=Math.min(exps.length,Math.floor((w-50)/50));
+    const colW=(w-50)/nExp;
+    ctx.font='500 7px "JetBrains Mono",monospace'; ctx.fillStyle='rgba(140,160,200,.35)'; ctx.textAlign='center';
+    for(let c=0;c<nExp;c++) ctx.fillText(exps[c],50+c*colW+colW/2,28);
+    // Strike rows
+    const bp=_sym==='NQ'?500:_sym==='ES'?580:_sym==='GC'?290:70;
+    const rowH=Math.max(4,Math.min(8,(h-36)/40));
+    const nRows=Math.min(Math.floor((h-36)/rowH),50);
+    const mid=Math.floor(nRows/2);
+    // GEX heatmap colors
+    for(let r=0;r<nRows;r++){
+      const y=34+r*rowH;
+      const strike=bp+(mid-r)*.5;
+      // Strike label
+      ctx.font='500 6px "JetBrains Mono",monospace'; ctx.fillStyle='rgba(140,160,200,.3)';
+      ctx.textAlign='right'; ctx.fillText(strike.toFixed(0),46,y+rowH*.7);
+      for(let c=0;c<nExp;c++){
+        const dist=Math.abs(r-mid)/nRows;
+        const val=Math.random()*(1-dist*2);
+        if(Math.abs(val)<.05) continue;
+        // GEX color: negative=red, positive=green
+        let rr,gg,bb;
+        if(val>0){rr=0;gg=Math.round(val*220);bb=Math.round(val*80)}
+        else{rr=Math.round(Math.abs(val)*220);gg=0;bb=Math.round(Math.abs(val)*40)}
+        const alpha=Math.min(Math.abs(val)*.9,.75);
+        ctx.fillStyle=`rgba(${rr},${gg},${bb},${alpha.toFixed(2)})`;
+        ctx.fillRect(50+c*colW+1,y,colW-2,rowH-1);
+      }
+    }
+    // ATM marker
+    ctx.strokeStyle='rgba(255,220,0,.4)'; ctx.lineWidth=1; ctx.setLineDash([2,2]);
+    ctx.beginPath(); ctx.moveTo(48,34+mid*rowH); ctx.lineTo(w,34+mid*rowH); ctx.stroke();
+    ctx.setLineDash([]);
+    // Legend
+    ctx.font='500 7px "JetBrains Mono",monospace';
+    ctx.fillStyle='rgba(224,48,96,.5)'; ctx.textAlign='left'; ctx.fillText('−GEX',w-55,14);
+    ctx.fillStyle='rgba(46,232,138,.5)'; ctx.fillText('+GEX',w-28,14);
+    ctx.restore();
+  },
+
+  ocliq(ctx, w, h, dpr) {
+    ctx.save(); ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.fillStyle='#060812'; ctx.fillRect(0,0,w,h);
+    ctx.font='600 9px "JetBrains Mono",monospace';
+    ctx.fillStyle='rgba(0,180,255,.5)'; ctx.fillText('OC LIQUIDITY HEATMAP · '+_sym,8,14);
+    // This shows OI concentration as a liquidity surface
+    const bp=_sym==='NQ'?500:_sym==='ES'?580:_sym==='GC'?290:70;
+    const exps=['1d','3d','7d','14d','30d','60d','90d'];
+    const nExp=Math.min(exps.length,Math.floor((w-50)/45));
+    const colW=(w-50)/nExp;
+    // Exp headers
+    ctx.font='500 7px "JetBrains Mono",monospace'; ctx.fillStyle='rgba(0,180,255,.3)'; ctx.textAlign='center';
+    for(let c=0;c<nExp;c++) ctx.fillText(exps[c],50+c*colW+colW/2,28);
+    // Liquidity cells
+    const rowH=Math.max(3,Math.min(6,(h-36)/50));
+    const nRows=Math.min(Math.floor((h-36)/rowH),60);
+    const mid=Math.floor(nRows/2);
+    for(let r=0;r<nRows;r++){
+      const y=34+r*rowH;
+      const strike=bp+(mid-r)*.5;
+      ctx.font='500 5px "JetBrains Mono",monospace'; ctx.fillStyle='rgba(140,160,200,.2)';
+      ctx.textAlign='right'; ctx.fillText(strike.toFixed(0),46,y+rowH*.8);
+      for(let c=0;c<nExp;c++){
+        const dist=Math.abs(r-mid)/nRows;
+        const dte=c/nExp; // further expiry = more spread out
+        // OI clusters near ATM, with gaussian-like falloff
+        const gaussian=Math.exp(-dist*dist*12)*(1-dte*.5);
+        const noise=Math.random()*.3;
+        const intensity=Math.max(0,gaussian+noise-.15);
+        if(intensity<.05) continue;
+        // Blue-cyan-white color scale
+        const t=Math.min(intensity,1);
+        const rr=Math.round(t*t*180);
+        const gg=Math.round(t*200+40);
+        const bb=Math.round(180+t*75);
+        ctx.fillStyle=`rgba(${rr},${gg},${bb},${(t*.65).toFixed(2)})`;
+        ctx.fillRect(50+c*colW+1,y,colW-2,rowH-1);
+      }
+    }
+    // Call/Put wall indicators
+    const callWall=mid-Math.floor(nRows*.15);
+    const putWall=mid+Math.floor(nRows*.15);
+    ctx.strokeStyle='rgba(46,232,138,.25)'; ctx.lineWidth=1; ctx.setLineDash([2,3]);
+    ctx.beginPath(); ctx.moveTo(48,34+callWall*rowH); ctx.lineTo(w,34+callWall*rowH); ctx.stroke();
+    ctx.strokeStyle='rgba(224,48,96,.25)';
+    ctx.beginPath(); ctx.moveTo(48,34+putWall*rowH); ctx.lineTo(w,34+putWall*rowH); ctx.stroke();
+    ctx.setLineDash([]);
+    // ATM
+    ctx.strokeStyle='rgba(255,220,0,.35)'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(48,34+mid*rowH); ctx.lineTo(w,34+mid*rowH); ctx.stroke();
+    // Legend
+    ctx.font='500 7px "JetBrains Mono",monospace';
+    ctx.fillStyle='rgba(0,180,255,.4)'; ctx.textAlign='left'; ctx.fillText('Low',w-52,14);
+    ctx.fillStyle='rgba(180,240,255,.6)'; ctx.fillText('High',w-28,14);
+    ctx.restore();
+  },
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PANE POOL — Create once, reuse (zero GC)
+// ═══════════════════════════════════════════════════════════════════════════
+function createPanes() {
+  for(let i=0;i<MAX_PANES;i++){
+    const p=document.createElement('div');
+    p.className='pane'+(i===0?' active':' hidden');
+    p.setAttribute('data-slot',i);
+
+    // Header
+    const hdr=document.createElement('div'); hdr.className='pane-hdr';
+    const tag=document.createElement('div'); tag.className='pane-hdr-tag feat-sel';
+    const icon=document.createElement('span'); icon.className='pane-hdr-icon';
+    const lbl=document.createElement('span'); lbl.className='pane-hdr-label';
+    lbl.style.cursor='pointer'; lbl.title='Click to change feature';
+    tag.appendChild(icon); tag.appendChild(lbl);
+    // Feature dropdown
+    const drop=document.createElement('div'); drop.className='feat-sel-drop';
+    FEAT_KEYS.forEach(fk=>{
+      const item=document.createElement('div'); item.className='feat-sel-item';
+      item.setAttribute('data-feat',fk);
+      item.innerHTML=`<span>${FEATURES[fk].icon}</span> ${FEATURES[fk].desc}`;
+      item.addEventListener('click',(e)=>{e.stopPropagation();setFeature(i,fk);drop.classList.remove('open')});
+      drop.appendChild(item);
+    });
+    tag.appendChild(drop);
+    lbl.addEventListener('click',(e)=>{e.stopPropagation();drop.classList.toggle('open')});
+
+    const ctrls=document.createElement('div'); ctrls.className='pane-hdr-ctrls';
+    const maxBtn=document.createElement('button'); maxBtn.className='pane-ctrl'; maxBtn.innerHTML='⬜'; maxBtn.title='Maximize';
+    maxBtn.addEventListener('click',(e)=>{e.stopPropagation();toggleMax(i)});
+    ctrls.appendChild(maxBtn);
+    hdr.appendChild(tag); hdr.appendChild(ctrls);
+
+    const canvas=document.createElement('canvas'); canvas.className='pane-canvas';
+    const dims=document.createElement('div'); dims.className='pane-dims';
+    const chV=document.createElement('div'); chV.className='ch-v';
+
+    p.appendChild(hdr); p.appendChild(canvas); p.appendChild(dims); p.appendChild(chV);
+    grid.appendChild(p);
+
+    p.addEventListener('mousedown',()=>setActive(i));
+    p.addEventListener('mousemove',(e)=>routeCH(i,e));
+    p.addEventListener('mouseleave',()=>clearCH());
+
+    _panes.push(p);
+    _paneFeature.push('chart');
+
+    // ResizeObserver
+    let raf=false;
+    const ro=new ResizeObserver(()=>{
+      if(raf)return; raf=true;
+      requestAnimationFrame(()=>{raf=false;if(!p.classList.contains('hidden'))renderPane(i)});
+    });
+    ro.observe(p);
+    _observers.push(ro);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RENDER — Draws the assigned feature into the pane's canvas
+// ═══════════════════════════════════════════════════════════════════════════
+function renderPane(i) {
+  const p=_panes[i]; if(!p||p.classList.contains('hidden'))return;
+  const canvas=p.querySelector('canvas'); if(!canvas)return;
+  const dpr=window.devicePixelRatio||1;
+  const rect=p.getBoundingClientRect();
+  const w=rect.width, h=rect.height;
+  canvas.width=Math.round(w*dpr); canvas.height=Math.round(h*dpr);
+  canvas.style.width=w+'px'; canvas.style.height=h+'px';
+  const d=p.querySelector('.pane-dims');
+  if(d) d.textContent=`${Math.round(w)}×${Math.round(h)}`;
+  const ctx=canvas.getContext('2d');
+  const feat=_paneFeature[i];
+  if(RENDERERS[feat]) RENDERERS[feat](ctx,w,h,dpr);
+}
+
+function renderAll() {
+  const info=LAYOUTS[_layout]; if(!info)return;
+  requestAnimationFrame(()=>{
+    for(let i=0;i<info.slots;i++){
+      if(_maximized>=0&&i!==_maximized)continue;
+      renderPane(i);
+    }
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FEATURE ASSIGNMENT
+// ═══════════════════════════════════════════════════════════════════════════
+function setFeature(i, feat) {
+  _paneFeature[i]=feat;
+  updatePaneHeader(i);
+  renderPane(i);
+  autoSave();
+}
+
+function updatePaneHeader(i) {
+  const p=_panes[i]; const feat=_paneFeature[i];
+  const f=FEATURES[feat];
+  p.querySelector('.pane-hdr-icon').textContent=f.icon;
+  p.querySelector('.pane-hdr-label').textContent=f.label;
+  // Mark current in dropdown
+  p.querySelectorAll('.feat-sel-item').forEach(item=>{
+    item.classList.toggle('current',item.getAttribute('data-feat')===feat);
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LAYOUT SWITCHING
+// ═══════════════════════════════════════════════════════════════════════════
+function setLayout(id) {
+  if(!LAYOUTS[id])return;
+  _layout=id; _maximized=-1;
+  grid.style.removeProperty('grid-template-columns');
+  grid.style.removeProperty('grid-template-rows');
+  const info=LAYOUTS[id];
+  grid.setAttribute('data-layout',id);
+
+  for(let i=0;i<MAX_PANES;i++){
+    const p=_panes[i];
+    if(i<info.slots){
+      p.classList.remove('hidden'); p.setAttribute('data-slot',i);
+      p.style.removeProperty('grid-column'); p.style.removeProperty('grid-row');
+      // Assign default feature if switching to a layout with more panes
+      if(info.defaults[i]&&_paneFeature[i]==='chart'&&i>0) _paneFeature[i]=info.defaults[i];
+      else if(info.defaults[i]&&i<info.defaults.length) _paneFeature[i]=info.defaults[i];
+      updatePaneHeader(i);
+    } else {
+      p.classList.add('hidden');
+    }
+  }
+
+  if(_activePaneIdx>=info.slots) setActive(0);
+  document.querySelectorAll('.ld-opt').forEach(o=>o.classList.toggle('active',o.dataset.layout===id));
+  document.getElementById('s-layout').textContent='Layout: '+info.label;
+  buildResizers();
+  renderAll();
+  autoSave();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ACTIVE PANE
+// ═══════════════════════════════════════════════════════════════════════════
+let _activePaneIdx=0;
+function setActive(i) {
+  _activePaneIdx=i;
+  _panes.forEach((p,j)=>p.classList.toggle('active',j===i));
+  document.getElementById('s-sym').textContent=`${_sym} · ${_tf} · ${FEATURES[_paneFeature[i]].label}`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MAXIMIZE / RESTORE
+// ═══════════════════════════════════════════════════════════════════════════
+function toggleMax(i) {
+  if(_maximized===i){_maximized=-1;setLayout(_layout);return}
+  _maximized=i;
+  _resizers.forEach(r=>r.style.display='none');
+  for(let j=0;j<MAX_PANES;j++){
+    if(j===i){_panes[j].classList.remove('hidden');_panes[j].style.gridColumn='1/-1';_panes[j].style.gridRow='1/-1'}
+    else{_panes[j].classList.add('hidden')}
+  }
+  setActive(i);
+  requestAnimationFrame(()=>renderPane(i));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CROSSHAIR ROUTER
+// ═══════════════════════════════════════════════════════════════════════════
+function routeCH(src, e) {
+  const sr=_panes[src].getBoundingClientRect();
+  const xr=(e.clientX-sr.left)/sr.width;
+  const info=LAYOUTS[_layout]; const slots=_maximized>=0?1:(info?info.slots:0);
+  for(let i=0;i<slots;i++){
+    const pi=_maximized>=0?_maximized:i;
+    const ch=_panes[pi].querySelector('.ch-v'); if(!ch)continue;
+    if(pi===src){ch.style.display='block';ch.style.left=(e.clientX-sr.left)+'px'}
+    else{const tr=_panes[pi].getBoundingClientRect();ch.style.display='block';ch.style.left=Math.round(xr*tr.width)+'px'}
+  }
+}
+function clearCH(){for(let i=0;i<MAX_PANES;i++){const c=_panes[i].querySelector('.ch-v');if(c)c.style.display='none'}}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RESIZERS — Overlay-based
+// ═══════════════════════════════════════════════════════════════════════════
+function buildResizers() {
+  _resizers.forEach(r=>r.remove()); _resizers.length=0;
+  if(_maximized>=0)return;
+  requestAnimationFrame(()=>{
+    const info=LAYOUTS[_layout]; if(!info||(info.cols<=1&&info.rows<=1))return;
+    const cs=getComputedStyle(grid);
+    const ct=cs.gridTemplateColumns.split(/\s+/).map(parseFloat);
+    const rt=cs.gridTemplateRows.split(/\s+/).map(parseFloat);
+    let x=0;
+    for(let c=0;c<ct.length-1;c++){
+      x+=ct[c];
+      const r=document.createElement('div');r.className='resizer r-col';r.style.left=x+'px';r.setAttribute('data-col',c);
+      grid.appendChild(r);_resizers.push(r);
+      addColDrag(r,c,ct.length);
+    }
+    let y=0;
+    for(let rr=0;rr<rt.length-1;rr++){
+      y+=rt[rr];
+      const r=document.createElement('div');r.className='resizer r-row';r.style.top=y+'px';r.setAttribute('data-row',rr);
+      grid.appendChild(r);_resizers.push(r);
+      addRowDrag(r,rr,rt.length);
+    }
+  });
+}
+
+function addColDrag(el,ci,nc) {
+  el.addEventListener('mousedown',(e)=>{
+    e.preventDefault();e.stopPropagation();el.classList.add('dragging');
+    dragOverlay.style.display='block';dragOverlay.style.cursor='col-resize';
+    const gr=grid.getBoundingClientRect();let raf=false;
+    function mv(ev){if(raf)return;raf=true;requestAnimationFrame(()=>{raf=false;
+      const cs=getComputedStyle(grid);const t=cs.gridTemplateColumns.split(/\s+/).map(parseFloat);
+      const tot=t.reduce((a,b)=>a+b,0);const cur=t.slice(0,ci+1).reduce((a,b)=>a+b,0);
+      const d=ev.clientX-gr.left-cur;
+      t[ci]=Math.max(60,t[ci]+d);t[ci+1]=Math.max(60,t[ci+1]-d);
+      grid.style.gridTemplateColumns=t.map(v=>`minmax(0,${(v/tot).toFixed(4)}fr)`).join(' ');
+      reposResizers();
+    })}
+    function up(){el.classList.remove('dragging');dragOverlay.style.display='none';
+      document.removeEventListener('mousemove',mv);document.removeEventListener('mouseup',up);buildResizers()}
+    document.addEventListener('mousemove',mv);document.addEventListener('mouseup',up);
+  });
+}
+
+function addRowDrag(el,ri,nr) {
+  el.addEventListener('mousedown',(e)=>{
+    e.preventDefault();e.stopPropagation();el.classList.add('dragging');
+    dragOverlay.style.display='block';dragOverlay.style.cursor='row-resize';
+    const gr=grid.getBoundingClientRect();let raf=false;
+    function mv(ev){if(raf)return;raf=true;requestAnimationFrame(()=>{raf=false;
+      const cs=getComputedStyle(grid);const t=cs.gridTemplateRows.split(/\s+/).map(parseFloat);
+      const tot=t.reduce((a,b)=>a+b,0);const cur=t.slice(0,ri+1).reduce((a,b)=>a+b,0);
+      const d=ev.clientY-gr.top-cur;
+      t[ri]=Math.max(40,t[ri]+d);t[ri+1]=Math.max(40,t[ri+1]-d);
+      grid.style.gridTemplateRows=t.map(v=>`minmax(0,${(v/tot).toFixed(4)}fr)`).join(' ');
+      reposResizers();
+    })}
+    function up(){el.classList.remove('dragging');dragOverlay.style.display='none';
+      document.removeEventListener('mousemove',mv);document.removeEventListener('mouseup',up);buildResizers()}
+    document.addEventListener('mousemove',mv);document.addEventListener('mouseup',up);
+  });
+}
+
+function reposResizers() {
+  const cs=getComputedStyle(grid);
+  const ct=cs.gridTemplateColumns.split(/\s+/).map(parseFloat);
+  const rt=cs.gridTemplateRows.split(/\s+/).map(parseFloat);
+  _resizers.forEach(r=>{
+    if(r.classList.contains('r-col')){
+      const ci=+r.getAttribute('data-col');let x=0;for(let c=0;c<=ci;c++)x+=ct[c]||0;r.style.left=x+'px';
+    } else {
+      const ri=+r.getAttribute('data-row');let y=0;for(let rr=0;rr<=ri;rr++)y+=rt[rr]||0;r.style.top=y+'px';
+    }
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TOOLBAR — Global symbol/timeframe
+// ═══════════════════════════════════════════════════════════════════════════
+document.getElementById('tb-syms').addEventListener('click',e=>{
+  const b=e.target.closest('[data-sym]');if(!b)return;
+  _sym=b.dataset.sym;
+  document.querySelectorAll('#tb-syms .tb-btn').forEach(x=>x.classList.toggle('active',x.dataset.sym===_sym));
+  document.getElementById('tb-sym-display').textContent=`${_sym} · ${_tf}`;
+  document.getElementById('s-sym').textContent=`${_sym} · ${_tf}`;
+  renderAll();
+  autoSave();
+});
+document.getElementById('tb-tfs').addEventListener('click',e=>{
+  const b=e.target.closest('[data-tf]');if(!b)return;
+  _tf=b.dataset.tf;
+  document.querySelectorAll('#tb-tfs .tb-btn').forEach(x=>x.classList.toggle('active',x.dataset.tf===_tf));
+  document.getElementById('tb-sym-display').textContent=`${_sym} · ${_tf}`;
+  document.getElementById('s-sym').textContent=`${_sym} · ${_tf}`;
+  renderAll();
+  autoSave();
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DROPDOWN
+// ═══════════════════════════════════════════════════════════════════════════
+document.getElementById('layout-trigger').addEventListener('click',e=>{e.stopPropagation();document.getElementById('layout-dropdown').classList.toggle('open')});
+document.addEventListener('click',()=>{document.getElementById('layout-dropdown').classList.remove('open');
+  document.querySelectorAll('.feat-sel-drop').forEach(d=>d.classList.remove('open'));});
+document.getElementById('layout-dropdown').addEventListener('click',e=>{
+  e.stopPropagation();const o=e.target.closest('.ld-opt');
+  if(o&&o.dataset.layout){setLayout(o.dataset.layout);document.getElementById('layout-dropdown').classList.remove('open')}
+});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'){if(_maximized>=0)toggleMax(_maximized);
+  document.getElementById('layout-dropdown').classList.remove('open')}});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FPS & RESIZE
+// ═══════════════════════════════════════════════════════════════════════════
+let fc=0,ft=performance.now();
+function fpsLoop(){fc++;const n=performance.now();if(n-ft>=1000){document.getElementById('s-fps').textContent='FPS: '+fc;fc=0;ft=n}requestAnimationFrame(fpsLoop)}
+let wr=false;
+window.addEventListener('resize',()=>{if(wr)return;wr=true;requestAnimationFrame(()=>{wr=false;renderAll();if(_maximized<0)buildResizers()})});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SAVE / LOAD WORKSPACE — Full state persistence
+// ═══════════════════════════════════════════════════════════════════════════
+const WS_KEY = 'altaris_workspace_v2';
+
+function saveWorkspace() {
+  const cs = getComputedStyle(grid);
+  const state = {
+    layout: _layout,
+    features: _paneFeature.slice(0, LAYOUTS[_layout] ? LAYOUTS[_layout].slots : MAX_PANES),
+    sym: _sym,
+    tf: _tf,
+    active: _activePaneIdx,
+    gridCols: grid.style.gridTemplateColumns || '',
+    gridRows: grid.style.gridTemplateRows || '',
+    ts: Date.now(),
+  };
+  try { localStorage.setItem(WS_KEY, JSON.stringify(state)); } catch(e) {}
+  // Flash save indicator
+  const btn = document.getElementById('tb-save');
+  if (btn) { btn.textContent = '✅ Saved'; setTimeout(() => { btn.textContent = '💾 Save'; }, 1200); }
+  console.log('[Workspace] Saved:', state.layout, state.features);
+}
+
+function loadWorkspace() {
+  try {
+    const raw = localStorage.getItem(WS_KEY);
+    if (!raw) return false;
+    const s = JSON.parse(raw);
+    if (!s || !s.layout || !LAYOUTS[s.layout]) return false;
+
+    // Restore global state
+    if (s.sym) { _sym = s.sym; }
+    if (s.tf) { _tf = s.tf; }
+
+    // Restore features before layout so they're set when panes render
+    if (s.features && Array.isArray(s.features)) {
+      s.features.forEach((f, i) => { if (i < MAX_PANES && FEATURES[f]) _paneFeature[i] = f; });
+    }
+
+    // Apply layout
+    setLayout(s.layout);
+
+    // Restore custom grid tracks (from dragged resizers)
+    if (s.gridCols) grid.style.gridTemplateColumns = s.gridCols;
+    if (s.gridRows) grid.style.gridTemplateRows = s.gridRows;
+
+    // Restore active pane
+    if (typeof s.active === 'number') setActive(s.active);
+
+    // Update toolbar buttons
+    document.querySelectorAll('#tb-syms .tb-btn').forEach(b => b.classList.toggle('active', b.dataset.sym === _sym));
+    document.querySelectorAll('#tb-tfs .tb-btn').forEach(b => b.classList.toggle('active', b.dataset.tf === _tf));
+    document.getElementById('tb-sym-display').textContent = `${_sym} · ${_tf}`;
+
+    // Re-render with restored features
+    requestAnimationFrame(() => {
+      const info = LAYOUTS[_layout];
+      for (let i = 0; i < (info ? info.slots : 0); i++) {
+        updatePaneHeader(i);
+        renderPane(i);
+      }
+      buildResizers();
+    });
+
+    console.log('[Workspace] Restored:', s.layout, s.features, `(saved ${Math.round((Date.now() - s.ts) / 1000)}s ago)`);
+    return true;
+  } catch(e) { console.warn('[Workspace] Load failed:', e); return false; }
+}
+
+function autoSave() {
+  // Debounced auto-save — saves 500ms after last change
+  clearTimeout(autoSave._t);
+  autoSave._t = setTimeout(saveWorkspace, 500);
+}
+autoSave._t = null;
+
+// Save button
+document.getElementById('tb-save').addEventListener('click', (e) => { e.stopPropagation(); saveWorkspace(); });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CUSTOM LAYOUT BUILDER
+// ═══════════════════════════════════════════════════════════════════════════
+const CL_KEY = 'altaris_custom_layouts';
+const GRID_SHAPES = [
+  { id:'g1',   label:'1',   slots:1, cols:'1fr', rows:'1fr',
+    svg:'<rect x="1" y="1" width="22" height="12" rx="1.5"/>' },
+  { id:'g2h',  label:'2H',  slots:2, cols:'1fr 1fr', rows:'1fr',
+    svg:'<rect x="1" y="1" width="10" height="12" rx="1"/><rect x="13" y="1" width="10" height="12" rx="1"/>' },
+  { id:'g2v',  label:'2V',  slots:2, cols:'1fr', rows:'1fr 1fr',
+    svg:'<rect x="1" y="1" width="22" height="5" rx="1"/><rect x="1" y="8" width="22" height="5" rx="1"/>' },
+  { id:'g3h',  label:'3H',  slots:3, cols:'1fr 1fr 1fr', rows:'1fr',
+    svg:'<rect x="1" y="1" width="6" height="12" rx=".8"/><rect x="9" y="1" width="6" height="12" rx=".8"/><rect x="17" y="1" width="6" height="12" rx=".8"/>' },
+  { id:'g22',  label:'2×2', slots:4, cols:'1fr 1fr', rows:'1fr 1fr',
+    svg:'<rect x="1" y="1" width="10" height="5" rx=".8"/><rect x="13" y="1" width="10" height="5" rx=".8"/><rect x="1" y="8" width="10" height="5" rx=".8"/><rect x="13" y="8" width="10" height="5" rx=".8"/>' },
+  { id:'g32',  label:'3×2', slots:6, cols:'1fr 1fr 1fr', rows:'1fr 1fr',
+    svg:'<rect x="1" y="1" width="6" height="5" rx=".6"/><rect x="9" y="1" width="6" height="5" rx=".6"/><rect x="17" y="1" width="6" height="5" rx=".6"/><rect x="1" y="8" width="6" height="5" rx=".6"/><rect x="9" y="8" width="6" height="5" rx=".6"/><rect x="17" y="8" width="6" height="5" rx=".6"/>' },
+];
+const defaultFeatsForSlots = ['chart','heatmap','ladder','gex','dex','ivskew'];
+let _clSelectedGrid = null;
+let _clSlotSelects = [];
+
+function getCustomLayouts() {
+  try { return JSON.parse(localStorage.getItem(CL_KEY)) || []; } catch(e) { return []; }
+}
+function saveCustomLayouts(arr) {
+  try { localStorage.setItem(CL_KEY, JSON.stringify(arr)); } catch(e) {}
+}
+
+// Register a custom layout into the LAYOUTS object so the engine can use it
+function registerCustomLayout(cl) {
+  const shape = GRID_SHAPES.find(g => g.id === cl.gridId);
+  if (!shape) return;
+  LAYOUTS[cl.id] = {
+    label: cl.name,
+    slots: shape.slots,
+    cols: shape.cols.split(' ').length,
+    rows: shape.rows.split(' ').length,
+    defaults: cl.features,
+    custom: true,
+    gridCols: shape.cols,
+    gridRows: shape.rows,
+  };
+}
+
+// Apply a custom layout (set CSS grid tracks dynamically)
+const _origSetLayout = setLayout;
+// Patch setLayout to handle custom grid tracks
+const _setLayoutOrig = window._setLayoutPatched ? null : true;
+function applyCustomGrid(id) {
+  const info = LAYOUTS[id];
+  if (info && info.custom) {
+    grid.style.gridTemplateColumns = info.gridCols.split(' ').map(v => `minmax(0,${v})`).join(' ');
+    grid.style.gridTemplateRows = info.gridRows.split(' ').map(v => `minmax(0,${v})`).join(' ');
+  }
+}
+
+// Build the grid shape picker
+function initBuilder() {
+  const pick = document.getElementById('cl-grid-pick');
+  pick.innerHTML = '';
+  GRID_SHAPES.forEach(shape => {
+    const opt = document.createElement('div');
+    opt.className = 'cl-grid-opt';
+    opt.innerHTML = `<svg viewBox="0 0 24 14">${shape.svg}</svg>`;
+    opt.title = shape.label;
+    opt.addEventListener('click', (e) => {
+      e.stopPropagation();
+      _clSelectedGrid = shape;
+      pick.querySelectorAll('.cl-grid-opt').forEach(o => o.classList.remove('selected'));
+      opt.classList.add('selected');
+      buildSlotSelectors(shape.slots);
+    });
+    pick.appendChild(opt);
+  });
+}
+
+function buildSlotSelectors(n) {
+  const container = document.getElementById('cl-slots');
+  container.innerHTML = '';
+  _clSlotSelects = [];
+  for (let i = 0; i < n; i++) {
+    const row = document.createElement('div');
+    row.className = 'cl-slot-row';
+    const lbl = document.createElement('span');
+    lbl.className = 'cl-slot-lbl';
+    lbl.textContent = `SLOT ${i + 1}`;
+    const sel = document.createElement('select');
+    sel.className = 'cl-slot-sel';
+    FEAT_KEYS.forEach(fk => {
+      const opt = document.createElement('option');
+      opt.value = fk;
+      opt.textContent = `${FEATURES[fk].icon} ${FEATURES[fk].desc}`;
+      if (fk === defaultFeatsForSlots[i % defaultFeatsForSlots.length]) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    sel.addEventListener('click', e => e.stopPropagation());
+    row.appendChild(lbl);
+    row.appendChild(sel);
+    container.appendChild(row);
+    _clSlotSelects.push(sel);
+  }
+}
+
+function renderSavedList() {
+  const list = document.getElementById('cl-saved-list');
+  list.innerHTML = '';
+  const customs = getCustomLayouts();
+  if (customs.length === 0) {
+    list.innerHTML = '<span style="font-size:6.5px;color:rgba(140,160,200,.25);font-family:\'JetBrains Mono\',monospace">No saved layouts yet</span>';
+    return;
+  }
+  customs.forEach(cl => {
+    registerCustomLayout(cl); // make sure it's registered
+    const item = document.createElement('div');
+    item.className = 'cl-saved-item' + (_layout === cl.id ? ' active' : '');
+    const nameSpan = document.createElement('span');
+    nameSpan.textContent = cl.name;
+    nameSpan.style.cursor = 'pointer';
+    nameSpan.addEventListener('click', (e) => {
+      e.stopPropagation();
+      // Apply features before layout
+      cl.features.forEach((f, i) => { if (i < MAX_PANES && FEATURES[f]) _paneFeature[i] = f; });
+      setLayout(cl.id);
+      applyCustomGrid(cl.id);
+      // Re-render + rebuild
+      const info = LAYOUTS[cl.id];
+      for (let i = 0; i < (info ? info.slots : 0); i++) { updatePaneHeader(i); renderPane(i); }
+      buildResizers();
+      document.getElementById('layout-dropdown').classList.remove('open');
+    });
+    const del = document.createElement('span');
+    del.className = 'cl-del';
+    del.textContent = '×';
+    del.title = 'Delete';
+    del.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const arr = getCustomLayouts().filter(c => c.id !== cl.id);
+      delete LAYOUTS[cl.id];
+      saveCustomLayouts(arr);
+      renderSavedList();
+    });
+    item.appendChild(nameSpan);
+    item.appendChild(del);
+    list.appendChild(item);
+  });
+}
+
+// Builder events
+document.getElementById('cl-new-btn').addEventListener('click', (e) => {
+  e.stopPropagation();
+  document.getElementById('cl-builder').classList.toggle('open');
+  if (!_clSelectedGrid) {
+    // Auto-select 2H by default
+    const pick = document.getElementById('cl-grid-pick');
+    const opts = pick.querySelectorAll('.cl-grid-opt');
+    if (opts[1]) { opts[1].click(); }
+  }
+});
+
+document.getElementById('cl-cancel-btn').addEventListener('click', (e) => {
+  e.stopPropagation();
+  document.getElementById('cl-builder').classList.remove('open');
+});
+
+document.getElementById('cl-save-btn').addEventListener('click', (e) => {
+  e.stopPropagation();
+  const name = document.getElementById('cl-name').value.trim();
+  if (!name) { document.getElementById('cl-name').style.borderColor='rgba(224,48,96,.5)'; return; }
+  if (!_clSelectedGrid) return;
+
+  const features = _clSlotSelects.map(s => s.value);
+  const id = 'custom_' + Date.now();
+  const cl = { id, name, gridId: _clSelectedGrid.id, features };
+
+  // Save
+  const arr = getCustomLayouts();
+  arr.push(cl);
+  saveCustomLayouts(arr);
+
+  // Register and apply
+  registerCustomLayout(cl);
+  cl.features.forEach((f, i) => { if (i < MAX_PANES && FEATURES[f]) _paneFeature[i] = f; });
+  setLayout(id);
+  applyCustomGrid(id);
+  const info = LAYOUTS[id];
+  for (let i = 0; i < (info ? info.slots : 0); i++) { updatePaneHeader(i); renderPane(i); }
+  buildResizers();
+
+  // Reset builder
+  document.getElementById('cl-builder').classList.remove('open');
+  document.getElementById('cl-name').value = '';
+  document.getElementById('cl-name').style.borderColor = '';
+  renderSavedList();
+  document.getElementById('layout-dropdown').classList.remove('open');
+  console.log('[Custom Layout] Saved:', name, features);
+});
+
+// Stop dropdown clicks from propagating
+document.getElementById('cl-builder').addEventListener('click', e => e.stopPropagation());
+document.getElementById('cl-name').addEventListener('click', e => e.stopPropagation());
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PUBLIC API
+// ═══════════════════════════════════════════════════════════════════════════
+window.AltarisLayout={setLayout,setActive,toggleMax,setFeature,renderAll,saveWorkspace,loadWorkspace,
+  getState:()=>({layout:_layout,active:_activePaneIdx,maximized:_maximized,sym:_sym,tf:_tf,features:_paneFeature.slice()}),
+  getPane:i=>_panes[i], LAYOUTS, FEATURES};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INIT
+// ═══════════════════════════════════════════════════════════════════════════
+createPanes();
+// Register all saved custom layouts
+getCustomLayouts().forEach(cl => registerCustomLayout(cl));
+initBuilder();
+renderSavedList();
+const didRestore = loadWorkspace();
+if (!didRestore) setLayout('single');
+requestAnimationFrame(fpsLoop);
+console.log('[AltarisLayout] Feature-pane engine ready');
+
+})();
+</script>
+</body>
+</html>

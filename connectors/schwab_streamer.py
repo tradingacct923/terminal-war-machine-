@@ -192,14 +192,22 @@ class SchwabStreamer:
     def subscribe_equities(self, symbols, fields=None):
         """Subscribe to Level 1 equity quotes."""
         if fields is None:
-            fields = '0,1,2,3,4,5,8,9,10,11,12,17,18,25,32,33,42'
+            # Fields 37-41: bid_time, ask_time, ask_mic, bid_mic, last_mic
+            # — NBBO venue tracking for MM withdrawal detection at tick speed
+            fields = '0,1,2,3,4,5,8,9,10,11,12,17,18,25,32,33,37,38,39,40,41,42'
         self._subscribe('LEVELONE_EQUITIES', symbols, fields)
 
     def subscribe_options(self, symbols, fields=None):
-        """Subscribe to Level 1 options with greeks."""
+        """Subscribe to Level 1 options with full greeks + enriched fields."""
         if fields is None:
-            # bid, ask, last, volume, OI, IV, strike, dte, delta, gamma, theta, vega, underlying
-            fields = '0,1,2,3,4,5,6,7,8,9,10,16,17,18,19,20,21,22,25,27,28,29,30,31,32,34,35,37'
+            # Full field set: bid, ask, last, high, low, close, volume, OI, IV,
+            # intrinsic_value, open, bid/ask/last_size, net_change, strike,
+            # contract_type, underlying, time_value, dte, delta, gamma, theta,
+            # vega, rho, security_status, theoretical_value, underlying_price,
+            # exp_type, mark, quote_time, trade_time, exchange, exchange_name,
+            # mark_change, mark_pct_change, indicative_ask, indicative_bid,
+            # exercise_type
+            fields = '0,1,2,3,4,5,6,7,8,9,10,11,15,16,17,18,19,20,21,22,25,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,45,46,52,53,55'
         self._subscribe('LEVELONE_OPTIONS', symbols, fields)
 
     def subscribe_nyse_book(self, symbols):
@@ -225,6 +233,16 @@ class SchwabStreamer:
     def subscribe_account_activity(self):
         """Subscribe to account activity (order fills, etc.)."""
         self._subscribe('ACCT_ACTIVITY', ['Account Activity'], '0,1,2,3')
+
+    def subscribe_screener_option(self, sort='VOLUME', frequency='0'):
+        """Subscribe to real-time options screener stream.
+        Args:
+            sort: Sort criterion (VOLUME, TRADES, PERCENT_CHANGE_UP, PERCENT_CHANGE_DOWN, AVERAGE_PERCENT_VOLUME)
+            frequency: '0' (all), '1', '5', '10', '30', '60' minute windows
+        """
+        # Key format per Schwab API: PREFIX_SORTFIELD_FREQUENCY
+        # e.g., OPTION_ALL_VOLUME_0
+        self._subscribe('SCREENER_OPTION', [f'OPTION_ALL_{sort}_{frequency}'], '0,1,2,3,4')
 
     def get_book(self, symbol, exchange='NASDAQ_BOOK'):
         """Get latest Level 2 book snapshot for a symbol."""
@@ -467,8 +485,49 @@ class SchwabStreamer:
                     self._process_book(service, content, timestamp)
                 elif service == 'ACCT_ACTIVITY':
                     self._process_acct_activity(content, timestamp)
+                elif service == 'SCREENER_OPTION':
+                    self._process_screener(service, content, timestamp)
                 else:
                     self._process_level1(service, content, timestamp)
+
+    def _process_screener(self, service, content, timestamp):
+        """Process screener data (SCREENER_OPTION / SCREENER_EQUITY).
+        
+        Schwab screener structure per entry:
+          key: 'OPTION_ALL_VOLUME_0'
+          0: key (same)
+          1: timestamp (ms since epoch)
+          2: sort field name
+          3: frequency
+          4: Items array - list of dicts with named keys:
+              {symbol, description, lastPrice, netChange, 
+               netPercentChange, totalVolume, ...}
+        """
+        for entry in content:
+            screener_key = entry.get('key', entry.get('0', 'UNKNOWN'))
+            items = entry.get('4', [])  # Field 4 = Items array
+            
+            if not isinstance(items, list):
+                items = []
+
+            decoded = {
+                'symbol': screener_key,
+                '_timestamp': timestamp,
+                'sort_field': entry.get('2', ''),
+                'frequency': entry.get('3', 0),
+                'items': items,
+                '_raw': entry,
+            }
+
+            # Store latest
+            self.latest[service][screener_key] = decoded
+
+            # Fire callbacks — each callback gets the full screener result
+            for cb in self._callbacks.get(service, []):
+                try:
+                    cb(decoded)
+                except Exception as e:
+                    print(f"[STREAM] ⚠️  Screener callback error: {e}")
 
     def _process_level1(self, service, content, timestamp):
         """Process Level 1 data (futures, equities, options)."""

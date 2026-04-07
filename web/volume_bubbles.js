@@ -22,6 +22,9 @@
 const HM_DEFAULTS = {
     imbalance: true, bidColor: '#00ff96', askColor: '#ff4030', imbalanceOpacity: 75,
     wallglow: false, wallglowBlur: 8,
+    wallColor: '#ffffff',  // color heavy orders blend toward (default white)
+    wallBlend: 90,         // 0-100: how much heavy orders blend toward wallColor
+    densityBoost: 100,     // 50-300: intensity multiplier (100 = default, 200 = 2× brighter)
     midprice: true, midpriceColor: '#ffdc00', midpriceWidth: 2,
     microprice: true, micropriceColor: '#00dcff', micropriceWidth: 3,
     trades: false, buyColor: '#00ff78', sellColor: '#ff3246', tradesSize: 6,
@@ -76,15 +79,20 @@ document.addEventListener('DOMContentLoaded', () => {
 
     if (!panel || !openBtn) return;
 
-    // Toggle panel
-    openBtn.addEventListener('click', () => {
-        panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
-    });
-    if (closeBtn) closeBtn.addEventListener('click', () => { panel.style.display = 'none'; });
-
-    // Close on click outside
+    // Toggle panel — use event delegation so it survives layout re-renders
     document.addEventListener('click', (e) => {
-        if (panel.style.display !== 'none' && !panel.contains(e.target) && e.target !== openBtn) {
+        // Open/close when clicking the gear button (or its SVG child)
+        if (e.target.closest('#t-heatmap-settings-btn')) {
+            panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+            return;
+        }
+        // Close button (✕) inside the panel
+        if (e.target.closest('#hm-settings-close')) {
+            panel.style.display = 'none';
+            return;
+        }
+        // Close when clicking outside the panel (but not the button)
+        if (panel.style.display !== 'none' && !panel.contains(e.target)) {
             panel.style.display = 'none';
         }
     });
@@ -116,6 +124,9 @@ document.addEventListener('DOMContentLoaded', () => {
         { id: 'hms-flicker-filter', key: 'flickerFilter', type: 'range' },
         { id: 'hms-bbo-bar', key: 'bboBar', type: 'check' },
         { id: 'hms-cluster-tape', key: 'clusterTape', type: 'check' },
+        { id: 'hms-wall-color', key: 'wallColor', type: 'color' },
+        { id: 'hms-wall-blend', key: 'wallBlend', type: 'range' },
+        { id: 'hms-density-boost', key: 'densityBoost', type: 'range' },
     ];
 
     // Set initial values from HeatmapSettings and bind listeners
@@ -149,6 +160,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 'wallglowPct': 'hms-wallglow-pct-val',
                 'ewmaAlpha': 'hms-ewma-alpha-val',
                 'flickerFilter': 'hms-flicker-filter-val',
+                'wallBlend': 'hms-wall-blend-val',
+                'densityBoost': 'hms-density-boost-val',
             };
             if (labelMap[b.key]) {
                 const lbl2 = document.getElementById(labelMap[b.key]);
@@ -157,6 +170,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     if (b.key === 'velSigma') lbl2.textContent = (parseInt(el.value) / 10).toFixed(1);
                     else if (b.key === 'ewmaAlpha') lbl2.textContent = (parseInt(el.value) / 100).toFixed(2);
                     else if (b.key === 'flickerFilter') lbl2.textContent = parseInt(el.value) === 0 ? 'off' : el.value;
+                    else if (b.key === 'densityBoost') lbl2.textContent = (parseInt(el.value) / 100).toFixed(1) + '×';
                     else lbl2.textContent = el.value;
                 }
             }
@@ -186,6 +200,8 @@ document.addEventListener('DOMContentLoaded', () => {
             lbl('hms-wallglow-pct-val', String(HM_DEFAULTS.wallglowPct));
             lbl('hms-ewma-alpha-val', (HM_DEFAULTS.ewmaAlpha / 100).toFixed(2));
             lbl('hms-flicker-filter-val', 'off');
+            lbl('hms-wall-blend-val', String(HM_DEFAULTS.wallBlend));
+            lbl('hms-density-boost-val', (HM_DEFAULTS.densityBoost / 100).toFixed(1) + '×');
         });
     }
 });
@@ -344,10 +360,8 @@ class VolumeBubbleRenderer {
 
         const barSpacing = d.barSpacing || 6;
 
-        // ── Bird's eye: skip rendering entirely ──
-        if (barSpacing <= 5) return;
-
-        const useDots = barSpacing <= 20;  // macro zoom: dots only
+        // ── Always render full bubbles regardless of zoom level ──
+        const useDots = false;  // dots-only mode removed; full bubbles at all zoom levels
         const { from, to } = d.visibleRange;
 
         target.useMediaCoordinateSpace(({ context: ctx, mediaSize }) => {
@@ -830,502 +844,22 @@ window.VolumeBubbleSeries = VolumeBubbleSeries;
 window.BUBBLE_CONFIG = BUBBLE_CONFIG;
 
 // ═══════════════════════════════════════════════════════════════════════════
-// DOM DEPTH HEATMAP — thermal strip on right edge showing passive orders
+// [REMOVED] DOM Heatmap v1 (renderDomHeatmap, _drawHeatmapSide,
+//           _drawGhostLevels, _updateLiquidityMemory)
+// Superseded by renderDomHeatmap2D below. ~500 lines removed.
 // ═══════════════════════════════════════════════════════════════════════════
 
-/**
- * Global DOM data store. Updated by app.js from /api/l2 poll.
- * Format: { bids: {price: size, ...}, asks: {price: size, ...},
- *           best_bid: float, best_ask: float, mid_price: float }
- */
-window._domSnapshot = null;
 
-// ── Δ Size: previous DOM bucket snapshots for change detection ──
-window._prevDomBidBuckets = null;   // null = first frame (suppress flash)
-window._prevDomAskBuckets = null;   // null = first frame (suppress flash)
 
-// ── Persistent Liquidity Memory ──
-// Accumulates every DOM level seen during the session.
-// Structure: { bids: {priceKey: {size, ts, maxSize}}, asks: {priceKey: {size, ts, maxSize}} }
-window._liquidityMemory = { bids: {}, asks: {} };
 
-const LIQ_STALE_SEC  = 10;   // seconds until a level is "stale" (outside live window)
-const LIQ_ANCIENT_SEC = 300; // 5 min = "ancient" ghost
-const LIQ_PURGE_SEC  = 900;  // 15 min = purge entirely
 
-/**
- * Update the persistent liquidity memory with current DOM data.
- * Called every L2 poll (~1 sec). Levels inside the live window get refreshed.
- * Levels outside the window keep their last-known size + timestamp.
- */
-function _updateLiquidityMemory(bids, asks, bucketSize) {
-    const now = Date.now() / 1000;
-    const mem = window._liquidityMemory;
 
-    // Merge current bid levels into memory
-    for (const [price, size] of Object.entries(bids)) {
-        const p = parseFloat(price);
-        if (isNaN(p) || size <= 0) continue;
-        const key = (Math.floor(p / bucketSize) * bucketSize).toFixed(2);
-        const existing = mem.bids[key];
-        if (existing) {
-            existing.size = (existing.size || 0);
-            // Accumulate into same bucket
-            existing.size = size; // update to current live size
-            existing.ts = now;
-            if (size > (existing.maxSize || 0)) existing.maxSize = size;
-        } else {
-            mem.bids[key] = { size, ts: now, maxSize: size };
-        }
-    }
 
-    // Merge current ask levels
-    for (const [price, size] of Object.entries(asks)) {
-        const p = parseFloat(price);
-        if (isNaN(p) || size <= 0) continue;
-        const key = (Math.floor(p / bucketSize) * bucketSize).toFixed(2);
-        const existing = mem.asks[key];
-        if (existing) {
-            existing.size = size;
-            existing.ts = now;
-            if (size > (existing.maxSize || 0)) existing.maxSize = size;
-        } else {
-            mem.asks[key] = { size, ts: now, maxSize: size };
-        }
-    }
 
-    // Purge ancient entries (>15 min old)
-    for (const side of [mem.bids, mem.asks]) {
-        for (const key of Object.keys(side)) {
-            if (now - side[key].ts > LIQ_PURGE_SEC) {
-                delete side[key];
-            }
-        }
-    }
-}
 
-/**
- * DOM Heatmap Renderer — Institutional-grade thermal strip showing
- * passive resting orders on the right edge of the chart.
- *
- * Features:
- *   • Price-aggregated buckets (min 5px per cell at any zoom)
- *   • Dark backdrop for contrast
- *   • Horizontal gradient fills (bright center → dark edges)
- *   • 1px cell gaps for definition
- *   • Smooth color ramp from dark base to saturated glow
- *
- * @param {HTMLCanvasElement} canvas  — overlay canvas
- * @param {Function} priceToY        — chart.priceToCoordinate(price)
- * @param {Object} domData           — {bids:{}, asks:{}, mid_price}
- */
-function renderDomHeatmap(canvas, priceToY, domData) {
-    if (!BUBBLE_CONFIG.DOM_HEATMAP_ENABLED || !domData) return;
-    if (!canvas || !priceToY) return;
 
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
 
-    const bids = domData.bids || {};
-    const asks = domData.asks || {};
-    const midPrice = domData.mid_price || 0;
-    if (midPrice === 0) return;
 
-    const W = BUBBLE_CONFIG.DOM_HEATMAP_WIDTH;
-    const PRICE_W = BUBBLE_CONFIG.DOM_HEATMAP_PRICE_LABEL_W;
-
-    // ── CSS rect for retina-safe positioning ──
-    const cssRect = canvas.getBoundingClientRect();
-    const cssW = cssRect.width;
-    const cssH = cssRect.height;
-    if (cssW <= 0 || cssH <= 0) return; // guard: canvas not yet laid out
-    // Flush against the price scale
-    const stripX = cssW - W - PRICE_W;
-
-    // ── Scale canvas for retina ──
-    const dpr = window.devicePixelRatio || 1;
-    const needW = Math.round(cssW * dpr);
-    const needH = Math.round(cssH * dpr);
-    if (canvas.width !== needW || canvas.height !== needH) {
-        canvas.width = needW;
-        canvas.height = needH;
-    }
-
-    // ── Compute tick size and pixel-per-tick ──
-    const refY1 = priceToY(midPrice);
-    const refY2 = priceToY(midPrice + 0.25);
-    if (refY1 === null || refY2 === null) return;
-    const pxPerTick = Math.abs(refY2 - refY1);
-
-    // ── Determine aggregation: bucket size in ticks ──
-    // If zoomed out (pxPerTick < 5), aggregate multiple ticks into one cell
-    const MIN_CELL_PX = 5;
-    let ticksPerBucket = 1;
-    if (pxPerTick < MIN_CELL_PX) {
-        ticksPerBucket = Math.ceil(MIN_CELL_PX / pxPerTick);
-    }
-    const bucketSize = ticksPerBucket * 0.25; // in price units
-    const cellH = Math.max(pxPerTick * ticksPerBucket, MIN_CELL_PX);
-
-    // ── Aggregate levels into price buckets ──
-    const bidBuckets = {};   // bucketKey → totalSize
-    const askBuckets = {};
-
-    for (const [price, size] of Object.entries(bids)) {
-        const p = parseFloat(price);
-        if (isNaN(p) || size <= 0) continue;
-        // FIX: toFixed(2) prevents floating-point key mismatch in Δ detection
-        const key = (Math.floor(p / bucketSize) * bucketSize).toFixed(2);
-        bidBuckets[key] = (bidBuckets[key] || 0) + size;
-    }
-    for (const [price, size] of Object.entries(asks)) {
-        const p = parseFloat(price);
-        if (isNaN(p) || size <= 0) continue;
-        const key = (Math.floor(p / bucketSize) * bucketSize).toFixed(2);
-        askBuckets[key] = (askBuckets[key] || 0) + size;
-    }
-
-    // ── Update persistent liquidity memory with raw DOM (before bucketing) ──
-    _updateLiquidityMemory(bids, asks, bucketSize);
-
-    // ── Find max bucket size for normalization ──
-    let maxBucket = 1;
-    for (const s of Object.values(bidBuckets)) if (s > maxBucket) maxBucket = s;
-    for (const s of Object.values(askBuckets)) if (s > maxBucket) maxBucket = s;
-    // Include ghost levels in max normalization for consistent scaling
-    const mem = window._liquidityMemory;
-    for (const entry of Object.values(mem.bids)) if (entry.size > maxBucket) maxBucket = entry.size;
-    for (const entry of Object.values(mem.asks)) if (entry.size > maxBucket) maxBucket = entry.size;
-
-    // ── Prepare to draw ──
-    ctx.save();
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-    // ── Dark backdrop (extends to cover memory range, not just live) ──
-    const liveKeys = [...Object.keys(bidBuckets), ...Object.keys(askBuckets)].map(Number);
-    const ghostBidKeys = Object.keys(mem.bids).map(Number);
-    const ghostAskKeys = Object.keys(mem.asks).map(Number);
-    const allKeys = [...liveKeys, ...ghostBidKeys, ...ghostAskKeys];
-    if (allKeys.length === 0) { ctx.restore(); return; }
-    const minPrice = Math.min(...allKeys);
-    const maxPrice = Math.max(...allKeys) + bucketSize;
-    const topY = priceToY(maxPrice);
-    const botY = priceToY(minPrice);
-    if (topY !== null && botY !== null) {
-        const bgTop = Math.min(topY, botY) - 4;
-        const bgBot = Math.max(topY, botY) + 4;
-        // Only draw backdrop for visible region
-        const clampTop = Math.max(bgTop, -10);
-        const clampBot = Math.min(bgBot, cssH + 10);
-        if (clampBot > clampTop) {
-            ctx.fillStyle = 'rgba(8, 12, 20, 0.55)';
-            ctx.fillRect(stripX - 3, clampTop, W + 6, clampBot - clampTop);
-        }
-    }
-
-    // ── LAYER 1: Draw GHOST levels (stale memory, behind live) ──
-    _drawGhostLevels(ctx, mem.bids, bidBuckets, 'bid', priceToY, stripX, W, cellH, cssH, maxBucket, bucketSize);
-    _drawGhostLevels(ctx, mem.asks, askBuckets, 'ask', priceToY, stripX, W, cellH, cssH, maxBucket, bucketSize);
-
-    // ── Draw bid cells with Δ detection ──
-    // On first frame (prevBuckets === null), pass empty {} so no borders flash
-    const prevBids = window._prevDomBidBuckets || {};
-    const prevAsks = window._prevDomAskBuckets || {};
-    const isFirstFrame = window._prevDomBidBuckets === null;
-
-    const absorption = domData._absorption || {};
-    _drawHeatmapSide(ctx, bidBuckets, 'bid', priceToY, stripX, W, cellH, cssH, maxBucket, bucketSize, prevBids, isFirstFrame, absorption);
-
-    // ── Draw ask cells with Δ detection ──
-    _drawHeatmapSide(ctx, askBuckets, 'ask', priceToY, stripX, W, cellH, cssH, maxBucket, bucketSize, prevAsks, isFirstFrame, absorption);
-
-    // ── Store current buckets as previous for next frame's Δ ──
-    window._prevDomBidBuckets = Object.assign({}, bidBuckets);
-    window._prevDomAskBuckets = Object.assign({}, askBuckets);
-
-    // ── Mid-price marker (crisp white line) ──
-    const midY = priceToY(midPrice);
-    if (midY !== null && !isNaN(midY)) {
-        ctx.shadowColor = 'rgba(255, 255, 255, 0.6)';
-        ctx.shadowBlur = 5;
-        ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
-        ctx.fillRect(stripX - 4, midY - 1, W + 8, 2);
-        ctx.shadowBlur = 0;
-    }
-
-    ctx.restore();
-}
-
-/**
- * Draw ghost levels from the persistent liquidity memory.
- * Only draws levels NOT in the current live buckets (stale/out-of-range).
- * Rendered behind live bars.
- */
-function _drawGhostLevels(ctx, memSide, liveBuckets, side, priceToY, stripX, W, cellH, cssH, maxBucket, bucketSize) {
-    const now = Date.now() / 1000;
-    const MIN_BAR_W = 4;
-    const ghostColor = side === 'bid' ? [0, 140, 130] : [160, 55, 15];
-
-    for (const [priceKey, entry] of Object.entries(memSide)) {
-        // Skip if this level is currently LIVE (will be drawn by _drawHeatmapSide)
-        if (liveBuckets[priceKey]) continue;
-
-        const price = parseFloat(priceKey);
-        const y = priceToY(price + bucketSize / 2);
-        if (y === null || y === undefined || isNaN(y)) continue;
-        if (y < -cellH || y > cssH + cellH) continue;
-
-        const age = now - entry.ts;
-        if (age < LIQ_STALE_SEC) continue; // still "fresh" — skip, live draw handles it
-
-        // ── Opacity based on age ──
-        let ghostAlpha;
-        if (age < 60) {
-            ghostAlpha = 0.40;  // 10-60s: fairly visible
-        } else if (age < LIQ_ANCIENT_SEC) {
-            ghostAlpha = 0.25;  // 1-5 min: dimmer
-        } else {
-            ghostAlpha = 0.15;  // 5-15 min: very faint
-        }
-
-        // Width proportional to the last known size
-        const norm = entry.size / maxBucket;
-        const sqrtNorm = Math.sqrt(norm);
-        const barW = MIN_BAR_W + sqrtNorm * (W - MIN_BAR_W);
-        const barX = stripX + (W - barW);
-        const cellTop = y - cellH / 2 + 0.5;
-        const cellBot = cellH - 1;
-        if (cellBot <= 0) continue;
-
-        // ── Ghost bar: dashed outline + faint fill ──
-        const r = ghostColor[0], g = ghostColor[1], b = ghostColor[2];
-
-        // Faint fill
-        ctx.fillStyle = `rgba(${r},${g},${b},${ghostAlpha * 0.4})`;
-        ctx.fillRect(barX, cellTop, barW, cellBot);
-
-        // Dashed border
-        ctx.setLineDash([3, 3]);
-        ctx.strokeStyle = `rgba(${r},${g},${b},${ghostAlpha})`;
-        ctx.lineWidth = 1;
-        ctx.strokeRect(barX + 0.5, cellTop + 0.5, barW - 1, cellBot - 1);
-        ctx.setLineDash([]); // reset
-
-        // Age label on significant ghost walls
-        if (norm >= 0.20 && cellBot >= 8) {
-            ctx.font = '7px "JetBrains Mono", "SF Mono", monospace';
-            ctx.fillStyle = `rgba(180,180,180,${ghostAlpha})`;
-            ctx.textAlign = 'right';
-            ctx.textBaseline = 'middle';
-            const ageStr = age < 60 ? `${Math.round(age)}s` : `${Math.round(age / 60)}m`;
-            ctx.fillText(`${entry.size} (${ageStr})`, barX + barW - 2, y);
-        }
-    }
-}
-
-/**
- * Internal: draw one side (bids or asks) with WIDTH-proportional bars.
- * Heavy walls extend wider from the right edge. Thin levels are narrow.
- * Contract count labels on significant walls.
- */
-function _drawHeatmapSide(ctx, buckets, side, priceToY, stripX, W, cellH, cssH, maxBucket, bucketSize, prevBuckets, isFirstFrame, absorption) {
-    prevBuckets = prevBuckets || {};
-    isFirstFrame = isFirstFrame || false;
-    const GAP = 1;
-    const MIN_BAR_W = 4;  // minimum bar width even for 1-contract levels
-
-    // Thermal color palette: dark base → warm mid → hot peak
-    const baseRGB = side === 'bid' ? [10, 40, 45]  : [45, 15, 5];
-    const warmRGB = side === 'bid' ? [0, 160, 150] : [200, 70, 20];
-    const hotRGB  = side === 'bid' ? [0, 255, 245] : [255, 55, 20];
-
-    for (const [priceStr, totalSize] of Object.entries(buckets)) {
-        const price = parseFloat(priceStr);
-        const y = priceToY(price + bucketSize / 2);
-        if (y === null || y === undefined || isNaN(y)) continue;
-        if (y < -cellH || y > cssH + cellH) continue;
-
-        // ── Width proportional to size (sqrt for better range) ──
-        const norm = totalSize / maxBucket;
-        const sqrtNorm = Math.sqrt(norm);
-        const barW = MIN_BAR_W + sqrtNorm * (W - MIN_BAR_W);
-
-        // Bar anchored to RIGHT side of strip (near price scale)
-        const barX = stripX + (W - barW);
-        const cellTop = y - cellH / 2 + GAP / 2;
-        const cellBot = cellH - GAP;
-        if (cellBot <= 0) continue;
-
-        // ── Thermal color interpolation ──
-        let r, g, b;
-        if (norm < 0.35) {
-            const t = norm / 0.35;
-            r = Math.round(baseRGB[0] + (warmRGB[0] - baseRGB[0]) * t);
-            g = Math.round(baseRGB[1] + (warmRGB[1] - baseRGB[1]) * t);
-            b = Math.round(baseRGB[2] + (warmRGB[2] - baseRGB[2]) * t);
-        } else {
-            const t = (norm - 0.35) / 0.65;
-            r = Math.round(warmRGB[0] + (hotRGB[0] - warmRGB[0]) * t);
-            g = Math.round(warmRGB[1] + (hotRGB[1] - warmRGB[1]) * t);
-            b = Math.round(warmRGB[2] + (hotRGB[2] - warmRGB[2]) * t);
-        }
-
-        const alpha = 0.40 + norm * 0.55;
-
-        // ── Glow on heavy walls ──
-        if (norm >= 0.35) {
-            ctx.shadowColor = `rgba(${r},${g},${b},${alpha * 0.5})`;
-            ctx.shadowBlur = BUBBLE_CONFIG.DOM_HEATMAP_GLOW_BLUR;
-        } else {
-            ctx.shadowColor = 'transparent';
-            ctx.shadowBlur = 0;
-        }
-
-        // ── Gradient: dark at left edge → bright at right (near price) ──
-        const grad = ctx.createLinearGradient(barX, 0, barX + barW, 0);
-        grad.addColorStop(0,   `rgba(${r},${g},${b},${alpha * 0.15})`);
-        grad.addColorStop(0.3, `rgba(${r},${g},${b},${alpha * 0.6})`);
-        grad.addColorStop(1,   `rgba(${r},${g},${b},${alpha})`);
-
-        ctx.fillStyle = grad;
-        ctx.fillRect(barX, cellTop, barW, cellBot);
-
-        // ── Δ SIZE DETECTION: green border = growing, red = shrinking ──
-        ctx.shadowBlur = 0;
-        ctx.shadowColor = 'transparent';
-        const prevSize = prevBuckets[priceStr] || 0;
-        const delta = totalSize - prevSize;
-        const absDelta = Math.abs(delta);
-
-        // Only show Δ borders after first frame (suppress initial flash)
-        if (!isFirstFrame) {
-            // Show border if change is meaningful (≥2 contracts)
-            if (absDelta >= 2 && prevSize > 0) {
-                // Border thickness: 1px for small changes, up to 3px for big swings
-                const borderW = Math.min(1 + Math.floor(absDelta / 5), 3);
-
-                if (delta > 0) {
-                    // GROWING — green border (wall being reinforced)
-                    const gAlpha = Math.min(0.4 + (absDelta / maxBucket) * 2, 0.95);
-                    ctx.strokeStyle = `rgba(0, 255, 100, ${gAlpha})`;
-                } else {
-                    // SHRINKING — red border (wall being pulled)
-                    const rAlpha = Math.min(0.4 + (absDelta / maxBucket) * 2, 0.95);
-                    ctx.strokeStyle = `rgba(255, 50, 50, ${rAlpha})`;
-                }
-                ctx.lineWidth = borderW;
-                ctx.strokeRect(barX + 0.5, cellTop + 0.5, barW - 1, cellBot - 1);
-            }
-
-            // ── NEW WALL: bright green flash (didn't exist in previous snapshot) ──
-            if (prevSize === 0 && totalSize >= 5) {
-                ctx.strokeStyle = 'rgba(0, 255, 120, 0.8)';
-                ctx.lineWidth = 2;
-                ctx.strokeRect(barX + 0.5, cellTop + 0.5, barW - 1, cellBot - 1);
-            }
-        }
-
-        // ── Contract count + Δ label on significant walls ──
-        if (norm >= 0.30 && cellBot >= 8) {
-            ctx.font = '8px "JetBrains Mono", "SF Mono", monospace';
-            ctx.textAlign = 'right';
-            ctx.textBaseline = 'middle';
-
-            // Main size label
-            ctx.fillStyle = `rgba(255,255,255,${0.5 + norm * 0.4})`;
-            ctx.fillText(totalSize.toString(), barX + barW - 3, y);
-
-            // Δ indicator (show change if significant)
-            if (absDelta >= 3 && prevSize > 0) {
-                const deltaStr = delta > 0 ? `+${delta}` : `${delta}`;
-                const dColor = delta > 0 ? 'rgba(0,255,100,0.8)' : 'rgba(255,80,80,0.8)';
-                ctx.fillStyle = dColor;
-                ctx.textAlign = 'left';
-                ctx.fillText(deltaStr, barX + 2, y);
-            }
-        }
-
-        // ── ABSORPTION ENGINE v2: institutional microstructure indicators ──
-        if (absorption && typeof absorption === 'object') {
-            const absEntry = absorption[priceStr];
-            if (absEntry && absEntry.score !== undefined && absEntry.hits >= 2) {
-                const absScore = absEntry.score;
-                const rawScore = absEntry.raw_score || absScore;
-                const waves = absEntry.waves || 0;
-                const intensity = absEntry.intensity || 0;
-                const consumed = absEntry.passive_consumed || 0;
-                const currPassive = absEntry.curr_passive || 0;
-                ctx.shadowBlur = 0;
-                ctx.shadowColor = 'transparent';
-
-                // Conviction level: waves × intensity
-                const conviction = waves * Math.min(intensity, 5);
-
-                if (absScore >= 2.0 && waves >= 2) {
-                    // ██ ABSORBING — multi-wave tested wall (REAL institutional)
-                    // Glow intensity scales with conviction
-                    const pulsePhase = (Date.now() % 1500) / 1500;
-                    const pulse = 0.5 + 0.5 * Math.sin(pulsePhase * Math.PI * 2);
-                    const glowStr = Math.min(0.4 + conviction * 0.1, 0.95);
-                    ctx.shadowColor = `rgba(60, 140, 255, ${glowStr * pulse})`;
-                    ctx.shadowBlur = 6 + conviction * 2 + pulse * 4;
-                    // Border color shifts white-hot with more conviction
-                    const bw = Math.min(150 + conviction * 20, 255);
-                    ctx.strokeStyle = `rgba(${bw}, ${bw}, 255, ${0.6 + pulse * 0.3})`;
-                    ctx.lineWidth = Math.min(1 + Math.floor(waves / 2), 3);
-                    ctx.strokeRect(barX + 0.5, cellTop + 0.5, barW - 1, cellBot - 1);
-                    ctx.shadowBlur = 0;
-                    ctx.shadowColor = 'transparent';
-
-                    // Label: ABS {score}x W{waves}
-                    if (cellBot >= 8) {
-                        ctx.font = '7px "JetBrains Mono", "SF Mono", monospace';
-                        ctx.fillStyle = `rgba(${bw}, ${bw}, 255, ${0.7 + pulse * 0.25})`;
-                        ctx.textAlign = 'left';
-                        ctx.textBaseline = 'middle';
-                        const tag = waves >= 3 ? 'FORT' : 'ABS';
-                        ctx.fillText(`${tag} ${Math.round(rawScore)}x W${waves}`, barX + 2, y - cellH * 0.35);
-                    }
-                } else if (absScore < 0.3 && absEntry.side_hits >= 3 && consumed > 0) {
-                    // ██ COLLAPSING — wall failed under pressure (FAKE / spoof)
-                    ctx.setLineDash([4, 3]);
-                    const crackAlpha = Math.min(0.5 + intensity * 0.2, 0.9);
-                    ctx.strokeStyle = `rgba(255, 40, 40, ${crackAlpha})`;
-                    ctx.lineWidth = 2;
-                    ctx.strokeRect(barX + 0.5, cellTop + 0.5, barW - 1, cellBot - 1);
-                    ctx.setLineDash([]);
-
-                    if (cellBot >= 8) {
-                        ctx.font = '7px "JetBrains Mono", "SF Mono", monospace';
-                        ctx.fillStyle = `rgba(255, 80, 80, ${crackAlpha})`;
-                        ctx.textAlign = 'left';
-                        ctx.textBaseline = 'middle';
-                        ctx.fillText(`CRACK -${consumed}`, barX + 2, y - cellH * 0.35);
-                    }
-                } else if (absScore >= 1.0) {
-                    // ██ HOLDING — under attack but hasn't cracked yet
-                    // Yellow → orange as intensity rises
-                    const holdR = Math.min(255, 220 + Math.round(intensity * 10));
-                    const holdG = Math.max(100, 200 - Math.round(intensity * 20));
-                    ctx.strokeStyle = `rgba(${holdR}, ${holdG}, 30, 0.5)`;
-                    ctx.lineWidth = 1;
-                    ctx.strokeRect(barX + 0.5, cellTop + 0.5, barW - 1, cellBot - 1);
-
-                    // Subtle label for significant holds
-                    if (cellBot >= 8 && intensity >= 0.5) {
-                        ctx.font = '7px "JetBrains Mono", "SF Mono", monospace';
-                        ctx.fillStyle = `rgba(${holdR}, ${holdG}, 30, 0.6)`;
-                        ctx.textAlign = 'left';
-                        ctx.textBaseline = 'middle';
-                        ctx.fillText(`HOLD ${Math.round(rawScore)}x`, barX + 2, y - cellH * 0.35);
-                    }
-                }
-            }
-        }
-    }
-}
-
-window.renderDomHeatmap = renderDomHeatmap;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 2D PASSIVE DOM HEATMAP v2 — Market-Maker Grade
@@ -1345,11 +879,12 @@ window.renderDomHeatmap = renderDomHeatmap;
 const DOM2D = {
     // ── Config ──
     ENABLED: true,
-    COL_WIDTH: 3,               // px per time column
-    MAX_COLS: 200,              // max columns displayed
+    COL_WIDTH: 4,               // px per time column (wider for readability)
+    MAX_COLS: 2500,             // max columns displayed (supports up to 10k pixels width)
     FETCH_INTERVAL_MS: 2000,    // poll interval (REST fallback only)
-    HEATMAP_2D_WIDTH: 500,      // max px width of the 2D area (expanded after removing 1D strip)
+    HEATMAP_2D_WIDTH: 350,      // max px width of the 2D area (focused right-side strip)
     WALL_GLOW_BLUR: 8,         // glow blur for heavy walls
+    CURRENT_COL_WIDTH: 12,     // px width of the rightmost "current state" column
 
     // ── State ──
     _snapshots: [],             // [{ts, bids:{price:size}, asks:{price:size}}, ...]
@@ -1389,7 +924,117 @@ const DOM2D = {
 
     // Clustered Trade Tape: aggregated trades grouped by time+price
     _clusteredTape: [],           // [{ts, price, side, totalVol, count, maxSingle}]
+
+    // ── Lifecycle ──
+    destroy() {
+        this._snapshots = [];
+        this._depthPersistence.clear();
+        this._prevSnapSizes.clear();
+        this._velocityFlash.clear();
+        this._fillAccum.clear();
+        this._otrScores.clear();
+        this._bboHistory = [];
+        this._asymmetryHistory = [];
+        this._clusteredTape = [];
+        this._ewmaInitialized = false;
+        _rgbaCache.clear();
+        // Clean up KineticText WebGL if active
+        if (typeof KineticText !== 'undefined' && KineticText.gl) {
+            try { KineticText.destroy(); } catch (e) { /* ignore */ }
+        }
+    },
 };
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PHASE 1: ZERO-ALLOCATION INFRASTRUCTURE
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Pre-built rgba() string cache (eliminates per-cell template literal + .toFixed) ──
+// Key: (r << 24 | g << 16 | b << 8 | alphaIdx) → cached "rgba(r,g,b,0.xxx)" string
+const _rgbaCache = new Map();
+function _cachedRgba(r, g, b, alpha) {
+    // Quantize alpha to 64 levels (0.015 precision — invisible difference)
+    const ai = (alpha * 64 + 0.5) | 0;
+    const key = (r << 17) | (g << 9) | (b << 1) | (ai > 63 ? 63 : ai);
+    let s = _rgbaCache.get(key);
+    if (s) return s;
+    const qa = (ai / 64);
+    s = `rgba(${r},${g},${b},${qa < 0.004 ? '0' : qa > 0.996 ? '1' : qa.toFixed(3)})`;
+    _rgbaCache.set(key, s);
+    return s;
+}
+
+// ── Snapshot pre-processing: compute allPrices array + sorted data at ingestion ──
+// Eliminates per-frame new Set(Object.keys()) + parseFloat() for every column
+function _prepSnapshot(snap) {
+    // Build combined unique price set ONCE at ingestion time
+    const priceSet = new Set();
+    const bidKeys = Object.keys(snap.bids);
+    const askKeys = Object.keys(snap.asks);
+
+    // ── Pre-compute BBO, mid, micro, spread at ingestion (not per-frame) ──
+    // Parse bid entries: [price, size] sorted descending
+    const bidEntries = [];
+    for (let i = 0; i < bidKeys.length; i++) {
+        const p = parseFloat(bidKeys[i]);
+        const s = snap.bids[bidKeys[i]];
+        priceSet.add(bidKeys[i]);
+        if (!isNaN(p) && s > 0) bidEntries.push([p, s]);
+    }
+    bidEntries.sort((a, b) => b[0] - a[0]);
+
+    // Parse ask entries: [price, size] sorted ascending
+    const askEntries = [];
+    for (let i = 0; i < askKeys.length; i++) {
+        const p = parseFloat(askKeys[i]);
+        const s = snap.asks[askKeys[i]];
+        priceSet.add(askKeys[i]);
+        if (!isNaN(p) && s > 0) askEntries.push([p, s]);
+    }
+    askEntries.sort((a, b) => a[0] - b[0]);
+
+    const bestBid = bidEntries.length ? bidEntries[0][0] : null;
+    const bestAsk = askEntries.length ? askEntries[0][0] : null;
+    snap._bestBid = bestBid;
+    snap._bestAsk = bestAsk;
+    snap._midPrice = (bestBid !== null && bestAsk !== null) ? (bestBid + bestAsk) / 2 : null;
+    snap._spread = (bestBid !== null && bestAsk !== null) ? (bestAsk - bestBid) : 0;
+    snap._bidEntries = bidEntries;
+    snap._askEntries = askEntries;
+
+    // ── Multi-level weighted micro-price (computed once at ingestion) ──
+    let microNum = 0, microDen = 0;
+    const LAMBDA = 0.5;
+    const maxLevels = Math.max(bidEntries.length, askEntries.length);
+    for (let i = 0; i < maxLevels; i++) {
+        const w = Math.exp(-LAMBDA * i);
+        if (i < bidEntries.length && i < askEntries.length) {
+            const [bidP, bidS] = bidEntries[i];
+            const [askP, askS] = askEntries[i];
+            microNum += (askP * bidS * w) + (bidP * askS * w);
+            microDen += (bidS + askS) * w;
+        } else if (i < bidEntries.length) {
+            const [bidP, bidS] = bidEntries[i];
+            microNum += bidP * bidS * w;
+            microDen += bidS * w;
+        } else if (i < askEntries.length) {
+            const [askP, askS] = askEntries[i];
+            microNum += askP * askS * w;
+            microDen += askS * w;
+        }
+    }
+    snap._micro = microDen > 0 ? microNum / microDen : (snap._midPrice || 0);
+
+    // Convert to array (reusable, no per-frame allocation)
+    snap._allPrices = Array.from(priceSet);
+    // Pre-parse float values for hot path
+    snap._parsedPrices = new Float64Array(snap._allPrices.length);
+    for (let i = 0; i < snap._allPrices.length; i++) {
+        snap._parsedPrices[i] = parseFloat(snap._allPrices[i]);
+    }
+    return snap;
+}
+
 
 // ── Perceptual color ramps (HSL-inspired, 5 stops each) ──
 // Each stop: [r, g, b, minNorm, maxNorm]
@@ -1446,7 +1091,7 @@ function _fetchDomHistory(symbol) {
                 const asks = snap[2] || {};
                 const trades = snap[3] || [];  // [{p, v, s}, ...]
                 const absorption = snap[4] || {};  // {price: {s, w, i, h, c, sh, rs, sd}}
-                DOM2D._snapshots.push({ ts, bids, asks, trades, absorption });
+                DOM2D._snapshots.push(_prepSnapshot({ ts, bids, asks, trades, absorption }));
                 if (ts > DOM2D._lastFetchTs) DOM2D._lastFetchTs = ts;
             }
 
@@ -1468,6 +1113,15 @@ function _fetchDomHistory(symbol) {
                 DOM2D._p75 = Math.max(p(0.75), 1);
                 DOM2D._p90 = Math.max(p(0.90), 1);
                 DOM2D._globalMax = allSizes[allSizes.length - 1];
+
+                // Bootstrap EWMA from initial REST data so normalization isn't stuck at 0
+                if (!DOM2D._ewmaInitialized) {
+                    const avg = allSizes.reduce((a, b) => a + b, 0) / allSizes.length;
+                    DOM2D._ewmaMean = avg;
+                    DOM2D._ewmaVar = allSizes.reduce((acc, s) => acc + (s - avg) ** 2, 0) / allSizes.length;
+                    DOM2D._ewmaStdDev = Math.max(Math.sqrt(DOM2D._ewmaVar), 1);
+                    DOM2D._ewmaInitialized = true;
+                }
             }
         })
         .catch(() => {});
@@ -1497,21 +1151,41 @@ function _updatePercentiles() {
  * Returns true if WebSocket is available, false otherwise.
  */
 function _initDomWebSocket(symbol) {
-    if (typeof _sio === 'undefined' || !_sio) return false;
+    if (!window._sio) return false;
 
-    _sio.off('dom_snapshot'); // remove stale listener
-    _sio.on('dom_snapshot', (data) => {
+    window._sio.off('dom_snapshot'); // remove stale listener
+    window._sio.on('dom_snapshot', (data) => {
+        const _auditT0 = performance.now(); // pipeline latency start
         if (!data || data.sym !== symbol) return;
 
-        const snap = {
+        const snap = _prepSnapshot({
             ts: data.ts,
             bids: data.bids || {},
             asks: data.asks || {},
             trades: data.trades || [],
             absorption: data.abs || {},
-        };
+        });
         DOM2D._snapshots.push(snap);
         if (data.ts > DOM2D._lastFetchTs) DOM2D._lastFetchTs = data.ts;
+
+        // ── Feed trade data to KineticText shock engine ──
+        if (typeof KineticText !== 'undefined' && KineticText.programValid) {
+            const trades = data.trades || [];
+            if (trades.length > 0) {
+                KineticText.processTrades(trades, data.bids || {}, data.asks || {});
+            }
+        }
+
+        // ── Feed SigmaEngine with raw trade volumes (sigma-driven thresholds) ──
+        if (typeof SigmaEngine !== 'undefined') {
+            SigmaEngine.feedTrades(data.trades || []);
+            SigmaEngine.feedAbsorption(data.abs || {});
+        }
+
+        // ── Feed absorption data to PressureField (continuous pressure sources) ──
+        if (typeof PressureField !== 'undefined' && PressureField._ready && data.abs) {
+            PressureField.feedAbsorption(data.abs);
+        }
 
         // Trim to max capacity
         const maxKeep = DOM2D.MAX_COLS * 3;
@@ -1522,6 +1196,11 @@ function _initDomWebSocket(symbol) {
         // Throttled percentile recalc (every 10 snapshots ≈ 5s)
         DOM2D._wsSnapCount = (DOM2D._wsSnapCount || 0) + 1;
         if (DOM2D._wsSnapCount % 10 === 0) _updatePercentiles();
+
+        // ── DataAudit: measure pipeline latency ──
+        if (typeof DataAudit !== 'undefined' && DataAudit._active) {
+            DataAudit.measure(data, _auditT0);
+        }
     });
 
     DOM2D._wsActive = true;
@@ -1540,6 +1219,21 @@ function startDomHistory(symbol) {
     DOM2D._p50 = 1;
     DOM2D._wsActive = false;
     DOM2D._wsSnapCount = 0;
+
+    // ── Full state reset on symbol switch ──
+    // Prevents stale data from previous symbol bleeding into new heatmap
+    DOM2D._bboHistory = [];
+    DOM2D._asymmetryHistory = [];
+    DOM2D._bookAsymmetry = 0.5;
+    DOM2D._depthPersistence = new Map();
+    DOM2D._velocityFlash = new Map();
+    DOM2D._fillAccum = new Map();
+    DOM2D._otrScores = new Map();
+    DOM2D._prevSnapSizes = new Map();
+    DOM2D._ewmaInitialized = false;
+    DOM2D._ewmaMean = 0;
+    DOM2D._ewmaVar = 0;
+    DOM2D._ewmaStdDev = 1;
 
     // Always do one REST fetch for history backfill
     _fetchDomHistory(symbol);
@@ -1568,8 +1262,10 @@ function startDomHistory(symbol) {
 function stopDomHistory() {
     if (DOM2D._fetchTimer) { clearInterval(DOM2D._fetchTimer); DOM2D._fetchTimer = null; }
     if (DOM2D._wsRetryTimer) { clearTimeout(DOM2D._wsRetryTimer); DOM2D._wsRetryTimer = null; }
-    if (typeof _sio !== 'undefined' && _sio) _sio.off('dom_snapshot');
+    if (window._sio) window._sio.off('dom_snapshot');
     DOM2D._wsActive = false;
+    // Clean up GC engine listeners and timers to prevent memory leaks
+    if (typeof DOM2D.destroy === 'function') DOM2D.destroy();
 }
 
 /**
@@ -1590,20 +1286,65 @@ function renderDomHeatmap2D(canvas, priceToY, midPrice) {
 
     const dpr = window.devicePixelRatio || 1;
     const STRIP_W = BUBBLE_CONFIG.DOM_HEATMAP_WIDTH;
-    const PRICE_W = BUBBLE_CONFIG.DOM_HEATMAP_PRICE_LABEL_W;
+    const PRICE_W = 0; // prices now in separate ladder zone
     const COL_W = DOM2D.COL_WIDTH;
 
-    const heatmapRight = cssW - PRICE_W - 4;  // 1D strip removed — 2D extends to price labels
-    const maxCols = Math.min(DOM2D.MAX_COLS, Math.floor(DOM2D.HEATMAP_2D_WIDTH / COL_W));
+    const heatmapRight = cssW - 2;  // right edge of canvas (small margin)
+    // Standalone heatmap pane: fill the entire canvas width
+    // Overlay mode (on chart): limit to 25% / 350px strip on the right edge
+    // Force standalone rendering to guarantee full-width heatmap drawing
+    const isStandalone = canvas.parentElement && canvas.parentElement.dataset.feature === 'heatmap';
+    const heatmapW = isStandalone
+        ? cssW - 4  // full width minus small margins
+        : Math.min(DOM2D.HEATMAP_2D_WIDTH, cssW * 0.25);
+    const maxCols = Math.min(DOM2D.MAX_COLS, Math.floor(heatmapW / COL_W));
 
     const displaySnaps = snaps.slice(-maxCols);
     if (displaySnaps.length < 2) return;
 
     // ── Pixel scale ──
-    const refY1 = priceToY(midPrice);
-    const refY2 = priceToY(midPrice + 0.25);
-    if (refY1 === null || refY2 === null) return;
-    const pxPerTick = Math.abs(refY2 - refY1);
+    // Standalone mode: use custom linear price mapping that fills the full canvas height
+    // Overlay mode: use chart's priceToCoordinate mapping
+    let pxPerTick, visMin, visMax, _priceToY;
+    
+    if (isStandalone) {
+        // Standalone: center on midPrice, show ±7 points (28 ticks each side)
+        const DOM_RANGE = 7.0; // ±7 points around mid (covers full 25-level depth)
+        visMin = midPrice - DOM_RANGE;
+        visMax = midPrice + DOM_RANGE;
+        const totalTicks = (DOM_RANGE * 2) / 0.25; // 56 ticks
+        pxPerTick = cssH / totalTicks; // ~16.6px per tick at 933px height
+        // Custom priceToY: linear mapping, higher price = lower Y (inverted)
+        _priceToY = (price) => {
+            if (price < visMin || price > visMax) return null;
+            return cssH - ((price - visMin) / (visMax - visMin)) * cssH;
+        };
+    } else {
+        // Overlay: use chart coordinate system with safe wrapper
+        const refY1 = priceToY(midPrice);
+        const refY2 = priceToY(midPrice + 0.25);
+        // If the chart cannot map the price (e.g., out of view), fall back to a clamped mapping.
+        const safePriceToY = (price) => {
+            const y = priceToY(price);
+            if (y !== null) return y;
+            // Clamp to canvas edges when out of range.
+            return price < midPrice ? cssH : 0;
+        };
+        const _priceToY = safePriceToY;
+        // Compute tick spacing using the reference points (fallback if null).
+        const baseY1 = refY1 !== null ? refY1 : cssH;
+        const baseY2 = refY2 !== null ? refY2 : 0;
+        pxPerTick = Math.abs(baseY2 - baseY1);
+        if (pxPerTick <= 0) return;
+        
+        // ── Visible price range (clamped to actual data window) ──
+        const visibleTicks = cssH / pxPerTick;
+        const chartRangeHalf = visibleTicks * 0.25 * 0.85;
+        const dataRangeHalf = 25 * 0.25;
+        const rangeHalf = Math.min(chartRangeHalf, dataRangeHalf * 1.1);
+        visMin = midPrice - rangeHalf;
+        visMax = midPrice + rangeHalf;
+    }
     if (pxPerTick <= 0) return;
 
     const MIN_ROW_H = 3;
@@ -1614,29 +1355,30 @@ function renderDomHeatmap2D(canvas, priceToY, midPrice) {
     const bucketSize = ticksPerRow * 0.25;
     const rowH = Math.max(pxPerTick * ticksPerRow, MIN_ROW_H);
 
-    // ── Visible price range (only render what's on screen) ──
-    // Use midPrice ± some range based on chart height
-    const visibleTicks = cssH / pxPerTick;
-    const rangeHalf = visibleTicks * 0.25 * 0.6; // 60% of visible range
-    const visMin = midPrice - rangeHalf;
-    const visMax = midPrice + rangeHalf;
-
     // ── Draw ──
     ctx.save();
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+
+    // Only clear the heatmap strip zone — leave the rest of the canvas untouched
+    const heatmapLeft = Math.max(0, heatmapRight - heatmapW);
+    ctx.clearRect(heatmapLeft - 2, 0, heatmapW + 4, cssH);
 
     const numCols = displaySnaps.length;
-    const heatmapLeft = heatmapRight - numCols * COL_W;
-    if (heatmapLeft < 0) { ctx.restore(); return; }
 
-    // ── Dark backdrop ──
-    const topY = priceToY(visMax);
-    const botY = priceToY(visMin);
+    // ── Deep space backdrop ──
+    const topY = _priceToY(visMax);
+    const botY = _priceToY(visMin);
     if (topY !== null && botY !== null) {
         const bgTop = Math.max(Math.min(topY, botY) - 2, 0);
         const bgBot = Math.min(Math.max(topY, botY) + 2, cssH);
         if (bgBot > bgTop) {
-            ctx.fillStyle = 'rgba(4, 6, 14, 0.55)';
+            const bgGr = ctx.createLinearGradient(0, bgTop, 0, bgBot);
+            bgGr.addColorStop(0, 'rgba(4, 7, 18, 0.6)');
+            bgGr.addColorStop(0.5, 'rgba(5, 8, 20, 0.55)');
+            bgGr.addColorStop(1, 'rgba(4, 6, 16, 0.6)');
+            ctx.fillStyle = bgGr;
             ctx.fillRect(heatmapLeft - 1, bgTop, numCols * COL_W + 2, bgBot - bgTop);
         }
     }
@@ -1666,20 +1408,23 @@ function renderDomHeatmap2D(canvas, priceToY, midPrice) {
     const _bidRgb = _hexToRgb(HeatmapSettings.bidColor);
     const _askRgb = _hexToRgb(HeatmapSettings.askColor);
     const _imbOpacity = HeatmapSettings.imbalanceOpacity / 100;
+    // PERF: Hoist per-settings constants out of inner loop (computed once per frame)
+    const _wallRgb_hoisted = _hexToRgb(HeatmapSettings.wallColor);
+    const _wallBlendPct_hoisted = HeatmapSettings.wallBlend / 100;
+    const _densityMul_hoisted = HeatmapSettings.densityBoost / 100;
     if (HeatmapSettings.imbalance)
     for (let col = 0; col < numCols; col++) {
         const snap = displaySnaps[col];
         const x = heatmapLeft + col * COL_W;
 
-        // Build a combined price map with bid and ask sizes for imbalance calc
-        const allPrices = new Set([
-            ...Object.keys(snap.bids),
-            ...Object.keys(snap.asks),
-        ]);
+        // PERF: Use pre-computed price array from _prepSnapshot (zero alloc)
+        const allPriceStrs = snap._allPrices || Object.keys(snap.bids).concat(Object.keys(snap.asks));
+        const parsedPrices = snap._parsedPrices; // Float64Array if available
 
-        for (const priceStr of allPrices) {
-            const price = parseFloat(priceStr);
-            if (isNaN(price)) continue;
+        for (let pi = 0; pi < allPriceStrs.length; pi++) {
+            const priceStr = allPriceStrs[pi];
+            const price = parsedPrices ? parsedPrices[pi] : parseFloat(priceStr);
+            if (price !== price) continue; // NaN check (faster than isNaN)
             if (price < visMin || price > visMax) continue;
 
             const bidSize = snap.bids[priceStr] || 0;
@@ -1696,7 +1441,7 @@ function renderDomHeatmap2D(canvas, priceToY, midPrice) {
             }
 
             const bucketPrice = Math.floor(price / bucketSize) * bucketSize;
-            const y = priceToY(bucketPrice + bucketSize / 2);
+            const y = _priceToY(bucketPrice + bucketSize / 2);
             if (y === null || y < -rowH || y > cssH + rowH) continue;
 
             // ── Imbalance ratio: 0 = all ask, 0.5 = balanced, 1 = all bid ──
@@ -1716,34 +1461,64 @@ function renderDomHeatmap2D(canvas, priceToY, midPrice) {
                 baseR = _askRgb.r; baseG = _askRgb.g; baseB = _askRgb.b;
             }
 
-            // ── Smooth 2-phase color ramp ──
+            // ── Smooth 2-phase color ramp with configurable wall color ──
+            // PERF: _wallRgb, _wallBlendPct, _densityMul hoisted above loop
+            const boostedNorm = Math.min(norm * _densityMul_hoisted, 1.0);
             let r, g, b;
-            if (norm < 0.5) {
-                const p = norm * 2;
+            if (boostedNorm < 0.5) {
+                const p = boostedNorm * 2;
                 const brightness = 0.03 + p * p * 0.97;
                 r = Math.round(baseR * brightness);
                 g = Math.round(baseG * brightness);
                 b = Math.round(baseB * brightness);
             } else {
-                const p = (norm - 0.5) * 2;
-                const blend = p * p * 0.90;
-                r = Math.round(baseR + (255 - baseR) * blend);
-                g = Math.round(baseG + (255 - baseG) * blend);
-                b = Math.round(baseB + (255 - baseB) * blend);
+                const p = (boostedNorm - 0.5) * 2;
+                const blend = p * p * _wallBlendPct_hoisted;
+                r = Math.round(baseR + (_wallRgb_hoisted.r - baseR) * blend);
+                g = Math.round(baseG + (_wallRgb_hoisted.g - baseG) * blend);
+                b = Math.round(baseB + (_wallRgb_hoisted.b - baseB) * blend);
             }
 
-            // Alpha: smooth quadratic ramp
-            const alpha = (0.02 + norm * norm * 0.90) * _imbOpacity;
+            // Alpha: smooth quadratic ramp with density boost (0.06 base for visibility)
+            const alpha = (0.06 + boostedNorm * boostedNorm * 0.88) * _imbOpacity;
 
-            ctx.fillStyle = `rgba(${r},${g},${b},${alpha.toFixed(3)})`;
-            ctx.fillRect(x, y - rowH / 2 + GAP, COL_W - GAP, rowH - GAP * 2);
+            // PERF: cached rgba string (eliminates per-cell template literal + .toFixed())
+            ctx.fillStyle = _cachedRgba(r, g, b, alpha);
+            // Rounded cell for smoother look
+            const cellX = x + GAP * 0.5;
+            const cellY = y - rowH / 2 + GAP;
+            const cellW = COL_W - GAP;
+            const cellH = rowH - GAP * 2;
+            const cr = Math.min(1.5, cellH / 4);
+            ctx.beginPath();
+            ctx.moveTo(cellX + cr, cellY);
+            ctx.lineTo(cellX + cellW - cr, cellY);
+            ctx.arcTo(cellX + cellW, cellY, cellX + cellW, cellY + cr, cr);
+            ctx.lineTo(cellX + cellW, cellY + cellH - cr);
+            ctx.arcTo(cellX + cellW, cellY + cellH, cellX + cellW - cr, cellY + cellH, cr);
+            ctx.lineTo(cellX + cr, cellY + cellH);
+            ctx.arcTo(cellX, cellY + cellH, cellX, cellY + cellH - cr, cr);
+            ctx.lineTo(cellX, cellY + cr);
+            ctx.arcTo(cellX, cellY, cellX + cr, cellY, cr);
+            ctx.fill();
 
             // ── Wall glow for P90+ levels ──
             if (HeatmapSettings.wallglow && dominant >= wallThreshold) {
                 ctx.shadowColor = `rgba(${r},${g},${b},0.5)`;
                 ctx.shadowBlur = HeatmapSettings.wallglowBlur;
                 ctx.fillStyle = `rgba(${r},${g},${b},0.30)`;
-                ctx.fillRect(x, y - rowH / 2 + GAP, COL_W - GAP, rowH - GAP * 2);
+                // Reuse rounded rect path
+                ctx.beginPath();
+                ctx.moveTo(cellX + cr, cellY);
+                ctx.lineTo(cellX + cellW - cr, cellY);
+                ctx.arcTo(cellX + cellW, cellY, cellX + cellW, cellY + cr, cr);
+                ctx.lineTo(cellX + cellW, cellY + cellH - cr);
+                ctx.arcTo(cellX + cellW, cellY + cellH, cellX + cellW - cr, cellY + cellH, cr);
+                ctx.lineTo(cellX + cr, cellY + cellH);
+                ctx.arcTo(cellX, cellY + cellH, cellX, cellY + cellH - cr, cr);
+                ctx.lineTo(cellX, cellY + cr);
+                ctx.arcTo(cellX, cellY, cellX + cr, cellY, cr);
+                ctx.fill();
                 ctx.shadowBlur = 0;
             }
         }
@@ -1824,7 +1599,7 @@ function renderDomHeatmap2D(canvas, priceToY, midPrice) {
                 const price = parseFloat(priceStr);
                 if (isNaN(price) || price < visMin || price > visMax) continue;
                 const bucketPrice = Math.floor(price / bucketSize) * bucketSize;
-                const y = priceToY(bucketPrice + bucketSize / 2);
+                const y = _priceToY(bucketPrice + bucketSize / 2);
                 if (y === null) continue;
 
                 // Persistence tiers — COLOR CODED for visibility:
@@ -1874,7 +1649,7 @@ function renderDomHeatmap2D(canvas, priceToY, midPrice) {
                 const price = parseFloat(priceStr);
                 if (isNaN(price) || price < visMin || price > visMax) continue;
                 const bucketPrice = Math.floor(price / bucketSize) * bucketSize;
-                const y = priceToY(bucketPrice + bucketSize / 2);
+                const y = _priceToY(bucketPrice + bucketSize / 2);
                 if (y === null) continue;
 
                 // Pulse fades with age (0→6 frames)
@@ -1900,6 +1675,8 @@ function renderDomHeatmap2D(canvas, priceToY, midPrice) {
     if (latestSnap) {
         // ── OTR: Accumulate fills from ALL displayed snapshots ──
         // Trade fills tell us which levels are ACTUALLY getting hit
+        // CRITICAL: clear before re-accumulating to prevent multiplicative inflation
+        DOM2D._fillAccum.clear();
         for (let col = 0; col < numCols; col++) {
             const snap = displaySnaps[col];
             if (snap.trades && snap.trades.length) {
@@ -1972,7 +1749,7 @@ function renderDomHeatmap2D(canvas, priceToY, midPrice) {
             if (resting <= DOM2D._ewmaMean) continue;
 
             const bucketPrice = Math.floor(price / bucketSize) * bucketSize;
-            const y = priceToY(bucketPrice + bucketSize / 2);
+            const y = _priceToY(bucketPrice + bucketSize / 2);
             if (y === null) continue;
 
             // Small diamond marker at right edge of cell
@@ -2030,12 +1807,9 @@ function renderDomHeatmap2D(canvas, priceToY, midPrice) {
     // Real-time bar showing best bid vs best ask size ratio.
     // The single most predictive short-term signal for market makers.
     if (HeatmapSettings.bboBar && latestSnap) {
-        const bidEntries = Object.entries(latestSnap.bids)
-            .map(([p, s]) => [parseFloat(p), s]).filter(e => !isNaN(e[0]) && e[1] > 0);
-        const askEntries = Object.entries(latestSnap.asks)
-            .map(([p, s]) => [parseFloat(p), s]).filter(e => !isNaN(e[0]) && e[1] > 0);
-        bidEntries.sort((a, b) => b[0] - a[0]);
-        askEntries.sort((a, b) => a[0] - b[0]);
+        // Use pre-computed sorted entries from _prepSnapshot (zero alloc)
+        const bidEntries = latestSnap._bidEntries || [];
+        const askEntries = latestSnap._askEntries || [];
 
         // Sum top 3 levels for a more stable signal
         const bidSize = bidEntries.slice(0, 3).reduce((sum, e) => sum + e[1], 0);
@@ -2121,7 +1895,7 @@ function renderDomHeatmap2D(canvas, priceToY, midPrice) {
         const lastColXtape = heatmapLeft + (numCols - 1) * COL_W;
         for (const [, cl] of Object.entries(clusters)) {
             if (cl.count < 2) continue;
-            const y = priceToY(cl.bucket + bucketSize / 2);
+            const y = _priceToY(cl.bucket + bucketSize / 2);
             if (y === null || y < 0 || y > cssH) continue;
 
             // Size proportional to volume (sqrt scaling)
@@ -2156,88 +1930,74 @@ function renderDomHeatmap2D(canvas, priceToY, midPrice) {
 
     // ── LAYER 3: Mid-price trail (exact arithmetic mid) ──
     // Pre-compute per-snapshot bid/ask prices for reuse by micro-price and spread
-    const _snapMeta = [];  // {mid, micro, spread, bestBid, bestAsk}
+    // ── Use pre-computed BBO/mid/micro/spread from _prepSnapshot ──
+    // Zero per-frame allocation: no Object.entries, sort, or Math.exp calls here.
+    const _snapMeta = new Array(numCols);
     for (let col = 0; col < numCols; col++) {
         const snap = displaySnaps[col];
-        const bidEntries = Object.entries(snap.bids).map(([p, s]) => [parseFloat(p), s]).filter(e => !isNaN(e[0]) && e[1] > 0);
-        const askEntries = Object.entries(snap.asks).map(([p, s]) => [parseFloat(p), s]).filter(e => !isNaN(e[0]) && e[1] > 0);
-
-        // Sort bids descending, asks ascending
-        bidEntries.sort((a, b) => b[0] - a[0]);
-        askEntries.sort((a, b) => a[0] - b[0]);
-
-        const bestBid = bidEntries.length ? bidEntries[0][0] : null;
-        const bestAsk = askEntries.length ? askEntries[0][0] : null;
-
-        // Arithmetic mid
-        const mid = (bestBid !== null && bestAsk !== null) ? (bestBid + bestAsk) / 2 : midPrice;
-
-        // ── Multi-level weighted micro-price ──
-        // micro = Σ(ask_i × bidSize_i × w_i + bid_i × askSize_i × w_i) / Σ((bidSize_i + askSize_i) × w_i)
-        // w_i = e^(-λ×i), λ = 0.5 (decay per level)
-        let microNum = 0, microDen = 0;
-        const LAMBDA = 0.5;
-        const maxLevels = Math.max(bidEntries.length, askEntries.length);
-        for (let i = 0; i < maxLevels; i++) {
-            const w = Math.exp(-LAMBDA * i);
-            if (i < bidEntries.length && i < askEntries.length) {
-                const [bidP, bidS] = bidEntries[i];
-                const [askP, askS] = askEntries[i];
-                microNum += (askP * bidS * w) + (bidP * askS * w);
-                microDen += (bidS + askS) * w;
-            } else if (i < bidEntries.length) {
-                const [bidP, bidS] = bidEntries[i];
-                microNum += bidP * bidS * w;
-                microDen += bidS * w;
-            } else if (i < askEntries.length) {
-                const [askP, askS] = askEntries[i];
-                microNum += askP * askS * w;
-                microDen += askS * w;
-            }
-        }
-        const micro = microDen > 0 ? microNum / microDen : mid;
-
-        // ── Spread (pure subtraction) ──
-        const spread = (bestBid !== null && bestAsk !== null) ? (bestAsk - bestBid) : 0;
-
-        _snapMeta.push({ mid, micro, spread, bestBid, bestAsk, bidEntries, askEntries });
+        _snapMeta[col] = {
+            mid: snap._midPrice || midPrice,
+            micro: snap._micro || snap._midPrice || midPrice,
+            spread: snap._spread || 0,
+            bestBid: snap._bestBid || null,
+            bestAsk: snap._bestAsk || null,
+            bidEntries: snap._bidEntries || [],
+            askEntries: snap._askEntries || [],
+        };
     }
 
-    // Draw mid-price trail (YELLOW dashed — VISIBLE)
+    // Draw mid-price trail (YELLOW dashed — smooth Bézier)
     if (HeatmapSettings.midprice) {
     const _mpRgb = _hexToRgb(HeatmapSettings.midpriceColor);
     ctx.strokeStyle = `rgba(${_mpRgb.r}, ${_mpRgb.g}, ${_mpRgb.b}, 0.80)`;
     ctx.lineWidth = HeatmapSettings.midpriceWidth;
     ctx.setLineDash([3, 3]);
     ctx.beginPath();
-    let started = false;
+    const midPts = [];
     for (let col = 0; col < numCols; col++) {
-        const my = priceToY(_snapMeta[col].mid);
+        const my = _priceToY(_snapMeta[col].mid);
         if (my === null) continue;
-        const mx = heatmapLeft + col * COL_W + COL_W / 2;
-        if (!started) { ctx.moveTo(mx, my); started = true; }
-        else ctx.lineTo(mx, my);
+        midPts.push({ x: heatmapLeft + col * COL_W + COL_W / 2, y: my });
     }
-    if (started) ctx.stroke();
+    // Smooth Bézier path
+    if (midPts.length > 1) {
+        ctx.moveTo(midPts[0].x, midPts[0].y);
+        for (let i = 1; i < midPts.length; i++) {
+            const cpx = (midPts[i - 1].x + midPts[i].x) / 2;
+            ctx.quadraticCurveTo(midPts[i - 1].x, midPts[i - 1].y, cpx, (midPts[i - 1].y + midPts[i].y) / 2);
+        }
+        ctx.lineTo(midPts[midPts.length - 1].x, midPts[midPts.length - 1].y);
+        ctx.stroke();
+    }
     ctx.setLineDash([]);
     }
 
-    // ── LAYER 3b: Multi-Level Weighted Micro-Price Line (cyan solid) ──
-    // Shows true fair value — when this diverges from mid, the book is leaning
+    // ── LAYER 3b: Multi-Level Weighted Micro-Price Line (smooth Bézier + glow) ──
     if (HeatmapSettings.microprice) {
     const _mcRgb = _hexToRgb(HeatmapSettings.micropriceColor);
+    // Glow layer
+    ctx.shadowColor = `rgba(${_mcRgb.r}, ${_mcRgb.g}, ${_mcRgb.b}, 0.35)`;
+    ctx.shadowBlur = 6;
     ctx.strokeStyle = `rgba(${_mcRgb.r}, ${_mcRgb.g}, ${_mcRgb.b}, 0.90)`;
     ctx.lineWidth = HeatmapSettings.micropriceWidth;
     ctx.beginPath();
-    let microStarted = false;
+    const microPts = [];
     for (let col = 0; col < numCols; col++) {
-        const my = priceToY(_snapMeta[col].micro);
+        const my = _priceToY(_snapMeta[col].micro);
         if (my === null) continue;
-        const mx = heatmapLeft + col * COL_W + COL_W / 2;
-        if (!microStarted) { ctx.moveTo(mx, my); microStarted = true; }
-        else ctx.lineTo(mx, my);
+        microPts.push({ x: heatmapLeft + col * COL_W + COL_W / 2, y: my });
     }
-    if (microStarted) ctx.stroke();
+    // Smooth Bézier path
+    if (microPts.length > 1) {
+        ctx.moveTo(microPts[0].x, microPts[0].y);
+        for (let i = 1; i < microPts.length; i++) {
+            const cpx = (microPts[i - 1].x + microPts[i].x) / 2;
+            ctx.quadraticCurveTo(microPts[i - 1].x, microPts[i - 1].y, cpx, (microPts[i - 1].y + microPts[i].y) / 2);
+        }
+        ctx.lineTo(microPts[microPts.length - 1].x, microPts[microPts.length - 1].y);
+        ctx.stroke();
+    }
+    ctx.shadowBlur = 0;
     }
 
     // ── LAYER 5: Aggressive Fills (Trades-on-Heatmap) ──
@@ -2293,7 +2053,7 @@ function renderDomHeatmap2D(canvas, priceToY, midPrice) {
 
         for (const [bucketStr, agg] of Object.entries(byPrice)) {
             const bucketPrice = parseFloat(bucketStr);
-            const y = priceToY(bucketPrice + bucketSize / 2);
+            const y = _priceToY(bucketPrice + bucketSize / 2);
             if (y === null || y < 0 || y > cssH) continue;
 
             // Draw buy circle (filled green)
@@ -2492,6 +2252,122 @@ function renderDomHeatmap2D(canvas, priceToY, midPrice) {
     ctx.lineTo(heatmapRight, sepBot);
     ctx.stroke();
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // LAYER 9: CURRENT STATE COLUMN — MM-grade depth strip
+    // ═══════════════════════════════════════════════════════════════════════
+    // The rightmost column is drawn WIDER with clear bid/ask depth bars
+    // and contract size labels for instant reads on current book state.
+    if (latestSnap) {
+        const CSC_W = DOM2D.CURRENT_COL_WIDTH;  // 12px wide
+        const cscX = heatmapRight - CSC_W;
+
+        // Dark backdrop for current-state column
+        ctx.fillStyle = 'rgba(8, 10, 20, 0.7)';
+        ctx.fillRect(cscX, Math.min(topY || 0, botY || 0) - 2, CSC_W, Math.abs((botY || cssH) - (topY || 0)) + 4);
+
+        // Left border glow (subtle accent line)
+        ctx.strokeStyle = 'rgba(80, 120, 200, 0.25)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(cscX, sepTop);
+        ctx.lineTo(cscX, sepBot);
+        ctx.stroke();
+
+        // Find max depth for bar normalization
+        let cscMaxDepth = 1;
+        for (const s of Object.values(latestSnap.bids)) cscMaxDepth = Math.max(cscMaxDepth, s);
+        for (const s of Object.values(latestSnap.asks)) cscMaxDepth = Math.max(cscMaxDepth, s);
+
+        // Mean depth for label threshold
+        const allCscSizes = [];
+        for (const s of Object.values(latestSnap.bids)) if (s > 0) allCscSizes.push(s);
+        for (const s of Object.values(latestSnap.asks)) if (s > 0) allCscSizes.push(s);
+        const cscMean = allCscSizes.length > 0
+            ? allCscSizes.reduce((a, b) => a + b, 0) / allCscSizes.length : 1;
+
+        // Draw bid depth bars (green, growing LEFT from center)
+        const cscCenter = cscX + CSC_W / 2;
+        const halfW = CSC_W / 2 - 1;  // max bar half-width
+
+        for (const [priceStr, size] of Object.entries(latestSnap.bids)) {
+            const price = parseFloat(priceStr);
+            if (isNaN(price) || price < visMin || price > visMax) continue;
+            const bucketPrice = Math.floor(price / bucketSize) * bucketSize;
+            const y = _priceToY(bucketPrice + bucketSize / 2);
+            if (y === null || y < -rowH || y > cssH + rowH) continue;
+
+            const norm = Math.min(size / cscMaxDepth, 1.0);
+            const barW = norm * halfW;
+            const intensity = 0.3 + norm * 0.6;
+
+            // Bid bar (grows left from center)
+            ctx.fillStyle = `rgba(0, 220, 140, ${intensity.toFixed(2)})`;
+            ctx.fillRect(cscCenter - barW, y - rowH / 2 + 0.5, barW, rowH - 1);
+
+            // Size label for levels above mean
+            if (size >= cscMean * 1.5 && rowH >= 6) {
+                ctx.font = '7px "JetBrains Mono", monospace';
+                ctx.fillStyle = `rgba(200, 255, 220, ${Math.min(0.5 + norm, 0.95).toFixed(2)})`;
+                ctx.textAlign = 'right';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(size.toString(), cscCenter - barW - 2, y);
+            }
+        }
+
+        // Draw ask depth bars (red/amber, growing RIGHT from center)
+        for (const [priceStr, size] of Object.entries(latestSnap.asks)) {
+            const price = parseFloat(priceStr);
+            if (isNaN(price) || price < visMin || price > visMax) continue;
+            const bucketPrice = Math.floor(price / bucketSize) * bucketSize;
+            const y = _priceToY(bucketPrice + bucketSize / 2);
+            if (y === null || y < -rowH || y > cssH + rowH) continue;
+
+            const norm = Math.min(size / cscMaxDepth, 1.0);
+            const barW = norm * halfW;
+            const intensity = 0.3 + norm * 0.6;
+
+            // Ask bar (grows right from center)
+            ctx.fillStyle = `rgba(240, 80, 60, ${intensity.toFixed(2)})`;
+            ctx.fillRect(cscCenter, y - rowH / 2 + 0.5, barW, rowH - 1);
+
+            // Size label for levels above mean
+            if (size >= cscMean * 1.5 && rowH >= 6) {
+                ctx.font = '7px "JetBrains Mono", monospace';
+                ctx.fillStyle = `rgba(255, 200, 190, ${Math.min(0.5 + norm, 0.95).toFixed(2)})`;
+                ctx.textAlign = 'left';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(size.toString(), cscCenter + barW + 2, y);
+            }
+        }
+
+        // Center divider line in current-state column
+        ctx.strokeStyle = 'rgba(120, 140, 180, 0.2)';
+        ctx.lineWidth = 0.5;
+        ctx.beginPath();
+        ctx.moveTo(cscCenter, sepTop);
+        ctx.lineTo(cscCenter, sepBot);
+        ctx.stroke();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // LAYER 9b: MID-PRICE GLOW LINE (horizontal accent across heatmap)
+    // ═══════════════════════════════════════════════════════════════════════
+    if (midPrice > 0) {
+        const midY = _priceToY(midPrice);
+        if (midY !== null && midY >= 0 && midY <= cssH) {
+            // Subtle glow
+            ctx.shadowColor = 'rgba(255, 220, 50, 0.35)';
+            ctx.shadowBlur = 6;
+            ctx.strokeStyle = 'rgba(255, 220, 50, 0.4)';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(heatmapLeft, midY);
+            ctx.lineTo(heatmapRight, midY);
+            ctx.stroke();
+            ctx.shadowBlur = 0;
+        }
+    }
+
     // ── LAYER 10: Volume Profile Sidebar ──
     // Aggregated bid+ask depth across all visible snapshots, shown as a slim histogram
     const VP_WIDTH = 22;
@@ -2522,7 +2398,7 @@ function renderDomHeatmap2D(canvas, priceToY, midPrice) {
         for (const [priceStr, vol] of Object.entries(vpAgg)) {
             const price = parseFloat(priceStr);
             if (price < visMin || price > visMax) continue;
-            const y = priceToY(price + bucketSize / 2);
+            const y = _priceToY(price + bucketSize / 2);
             if (y === null || y < 0 || y > cssH) continue;
 
             const totalNorm = (vol.bid + vol.ask) / vpMax;
@@ -2596,7 +2472,7 @@ function renderDomHeatmap2D(canvas, priceToY, midPrice) {
             const allPrices = new Set([...Object.keys(snap.bids), ...Object.keys(snap.asks)]);
             for (const ps of allPrices) {
                 const p = parseFloat(ps);
-                const py = priceToY(p + bucketSize / 2);
+                const py = _priceToY(p + bucketSize / 2);
                 if (py === null) continue;
                 const d = Math.abs(py - hoverData.my);
                 if (d < closestDist) { closestDist = d; closestPrice = ps; }
@@ -2629,8 +2505,32 @@ function renderDomHeatmap2D(canvas, priceToY, midPrice) {
 
                 tooltip.innerHTML = html;
                 tooltip.style.display = 'block';
-                tooltip.style.left = (hoverData.clientX + 12) + 'px';
-                tooltip.style.top = (hoverData.clientY - 10) + 'px';
+
+                // ── Viewport collision detection ──
+                const ttRect = tooltip.getBoundingClientRect();
+                const ttW = ttRect.width || 140;
+                const ttH = ttRect.height || 80;
+                const vpW = window.innerWidth;
+                const vpH = window.innerHeight;
+                const margin = 12;
+
+                // Default: right of cursor
+                let ttLeft = hoverData.clientX + margin;
+                let ttTop = hoverData.clientY - 10;
+
+                // Flip to left if clipping right edge
+                if (ttLeft + ttW > vpW - 4) {
+                    ttLeft = hoverData.clientX - ttW - margin;
+                }
+                // Push up if clipping bottom edge
+                if (ttTop + ttH > vpH - 4) {
+                    ttTop = vpH - ttH - 4;
+                }
+                // Clamp to top
+                if (ttTop < 4) ttTop = 4;
+
+                tooltip.style.left = ttLeft + 'px';
+                tooltip.style.top = ttTop + 'px';
             } else {
                 tooltip.style.display = 'none';
             }
@@ -2644,8 +2544,33 @@ function renderDomHeatmap2D(canvas, priceToY, midPrice) {
     ctx.restore();
 }
 
-// Export
-window.renderDomHeatmap2D = renderDomHeatmap2D;
+// Preserve a reference to the real renderer before the throttle wrapper overwrites it
+const _origRenderDomHeatmap2D = renderDomHeatmap2D;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EXPORTS & rAF THROTTLE
+// ═══════════════════════════════════════════════════════════════════════════
+
+// rAF gating: prevent render storms from overlapping poll + WebSocket triggers
+let _dom2dRafPending = false;
+let _dom2dRafArgs = null;
+
+function _renderDomHeatmap2DThrottled(canvas, priceToY, midPrice) {
+    _dom2dRafArgs = [canvas, priceToY, midPrice];
+    if (_dom2dRafPending) return;
+    _dom2dRafPending = true;
+    requestAnimationFrame(() => {
+        _dom2dRafPending = false;
+        if (_dom2dRafArgs) {
+            // Call the original drawing function, not the throttled wrapper
+            _origRenderDomHeatmap2D(..._dom2dRafArgs);
+            _dom2dRafArgs = null;
+        }
+    });
+}
+
+window.renderDomHeatmap2D = _renderDomHeatmap2DThrottled;
 window.startDomHistory = startDomHistory;
 window.stopDomHistory = stopDomHistory;
-
+window.DOM2D = DOM2D;
+window.HeatmapSettings = HeatmapSettings;

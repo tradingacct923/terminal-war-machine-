@@ -32,3 +32,6 @@ war mechinee
 
 .vercel
 .env*.local
+logs/level2/*.csv
+logs/*.jsonl
+logs/level2/

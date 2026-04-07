@@ -1,63 +1,151 @@
-# 🏛️ Altaris GreekSite Architecture (War Machine)
+# Altaris Terminal — Architecture Reference
 
-The Altaris Inference Engine and GreekSite dashboard have been fully migrated and integrated into a professional, hedge-fund grade quantitative project structure. 
+## System Overview
 
-Everything is now safely self-contained inside: `C:\Users\aruna\OneDrive\war mechine\GreekSite\`
-
----
-
-## 📂 Core Architecture Map
-
-```mermaid
-graph TD
-    Root[GreekSite (Root Server)] --> API(server.py)
-    Root --> Web[web/ (Dashboard Frontend)]
-    Root --> FW[frameworks/ (Alpha Mathematics)]
-    Root --> BE[background_engine/ (Live Data Daemon)]
-    
-    FW --> TE(transfer_entropy.py)
-    FW --> SE(shannon_entropy.py)
-    FW --> IM(ising_magnetization.py)
-    FW --> MI(mutual_information.py)
-    FW --> RN(reynolds_number.py)
-    FW --> PT(percolation_threshold.py)
-    FW --> LS(lppl_sornette.py)
-    FW --> PL(powerlaw_tail.py)
-    
-    Web --> HTML(index.html)
-    Web --> JS(app.js)
-    Web --> CSS(css/)
-    
-    BE --> C(config.py)
-    BE --> M(main.py)
-    BE --> T(test_api.py...)
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    ALTARIS TERMINAL                          │
+│                                                             │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐   │
+│  │  CHART   │  │ HEATMAP  │  │  LADDER  │  │ EQ BOOK  │   │
+│  │ candles  │  │ depth    │  │ DOM      │  │ tape     │   │
+│  │ bubbles  │  │ overlay  │  │ bid/ask  │  │ trades   │   │
+│  │ walls    │  │          │  │ canvas   │  │          │   │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘   │
+│       │              │              │              │         │
+│  ┌────┴──────────────┴──────────────┴──────────────┴────┐   │
+│  │              ChartCore._instances[]                   │   │
+│  │         (tagged with feature key per pane)            │   │
+│  └──────────────────────┬───────────────────────────────┘   │
+│                         │                                    │
+│  ┌──────────────────────┴───────────────────────────────┐   │
+│  │                    app.js                             │   │
+│  │    Data Pipeline: fetch → broadcast → render          │   │
+│  └──────────────────────┬───────────────────────────────┘   │
+│                         │                                    │
+│  ┌──────────────────────┴───────────────────────────────┐   │
+│  │        AltarisLayout (layout_integration.js)          │   │
+│  │    Grid engine: slots, feature mount/unmount          │   │
+│  └──────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+          │
+          ▼
+┌─────────────────────────┐     ┌──────────────────────┐
+│   server.py (Flask)     │────▶│   l2_worker.py       │
+│   Port 3001 (dev)       │     │   TopStepX WS        │
+│   Auth, REST API,       │     │   Detection engine   │
+│   Socket.IO push        │     │   σ-adaptive logic   │
+└─────────────────────────┘     └──────────────────────┘
 ```
 
-### 1. `server.py` (The API Brain)
-This is the main Flask Server. It handles all endpoints including real-time spots, history, volatility layers, and the newly integrated `/api/inference` endpoint. 
-- **What changed:** It now utilizes a lightning-fast *Server-Side Memory Cache* (60s TTL) and has been decoupled completely from the scratch workspace. It now directly imports your mathematical files locally.
+## File Map
 
-### 2. `frameworks/` (The Quantitative Laboratory)
-This directory houses the pure mathematical logic. It is strictly isolated from the web server code, ensuring institutional-grade separation of concerns.
-- `lppl_sornette.py`: Market crash bubble detection via log-periodic power law (O(N) Scipy Optimize)
-- `powerlaw_tail.py`: Heavy-tail risk detection via Hill Estimators
-- `transfer_entropy.py` & `shannon_entropy.py`: Market flow and chaos metrics (Information Theory)
-- `ising_magnetization.py` & `percolation_threshold.py`: Order flow directionality (Statistical Mechanics)
-- `reynolds_number.py`: Market turbulence indicators (Fluid Dynamics)
-- `mutual_information.py`: Gamma/Price coupling correlation
+### `/web/` — Frontend
 
-### 3. `web/` (The Client Dashboard)
-The visualization layer. 
-- `index.html`: Contains all sidebar buttons and structural UI for the 10 tabs, including the new Alpha Engine zones (Inference, Crash Risk, Flow Analysis).
-- `app.js`: Contains robust dynamic javascript functions (`loadInference()`, `loadCrashRisk()`, `loadFlow()`) that fetch data asynchronously from the API, parse JSON, configure CSS alert badges, and render the signals onto your screen.
+| File | Size | Purpose |
+|---|---|---|
+| `app.js` | 61KB | Main controller — data pipeline, feature routing, L2 rendering, event wiring |
+| `volume_bubbles.js` | 120KB | Volume bubble renderer + DOM heatmap 2D + σ-engine |
+| `depth_ladder.js` | 17KB | Canvas 2D order book ladder (bid/ask bars + price levels) |
+| `layout_integration.js` | 39KB | Layout grid engine — presets, feature mount/unmount, pane dropdowns |
+| `layout_engine.css` | 11KB | CSS Grid engine for multi-pane layouts |
+| `style.css` | 134KB | Main stylesheet — terminal dark theme |
+| `kinetic_text.js` | 39KB | WebGL text physics engine (KineticText) |
+| `kinetic_hud.js` | 16KB | WebGL HUD overlay for ladder |
+| `pressure_field.js` | 41KB | Physics pressure visualization |
+| `sigma_engine.js` | 6KB | σ-adaptive threshold engine |
+| `index.html` | 36KB | Main terminal HTML shell |
 
-### 4. `background_engine/` (The Upcoming Pipeline)
-This is a newly created, isolated folder for all background operations. Right now it contains your API testing files and experiments (`test_tradier.py`, `test_api.py`, `config.py`). 
-- **The specific purpose of this folder** is to house the 24/7 background worker we will build next. This worker will constantly ingest live market data (like TopStepX Level 2), compute the heavy Alpha frameworks, and feed the results cleanly into `server.py` without lagging the dashboard.
+### `/web/features/` — Modular Feature Plugins
 
----
+| File | Purpose |
+|---|---|
+| `chart_core.js` | Multi-instance LightweightCharts manager (THE core engine) |
+| `thermal_flare.js` | GEX/DEX exposure glow overlay |
+| `wall_lines.js` | Call Wall / Put Wall / Gamma Flip price lines |
+| `options_chain.js` | Options chain data integration |
+| `alpha_dashboard.js` | Alpha signals dashboard |
+| `dashboard_charts.js` | Legacy dashboard charts (bar/candle polling) |
+| `data_fetch.js` | Socket.IO data fetching abstraction |
 
-### Why this is Hedge-Fund Grade:
-* **Separation of Concerns:** The UI (`web/`), the API (`server.py`), and the Math (`frameworks/`) are rigorously isolated from one another.
-* **Non-Blocking Architecture:** With `threaded=True` and server-side caching, the dashboard UI operates completely independently of how slow or heavy the background math is. 
-* **Scalability:** By placing future data ingestion scripts strictly inside `background_engine/`, we ensure that scaling data sources (adding Alpaca, Rithmic, Topstep) will *never* require breaking changes to the core Dashboard.
+## Layout System
+
+### Preset Layouts (12 total)
+
+| Layout | Slots | Grid | Default Features |
+|---|:---:|---|---|
+| **Single** | 1 | 1×1 | `chart` |
+| **Execution** | 2 | 2×1 | `chart`, `ladder` |
+| **Scalp** | 2 | 2×1 | `ladder`, `chart` |
+| **Flow** | 3 | 3×1 | `chart`, `gex`, `dex` |
+| **DOM** | 3 | 3×1 | `heatmap`, `ladder`, `eqbook` |
+| **Intel** | 3 | 2×2 | `chart`, `heatmap`, `ivskew` |
+| **OC Desk** | 4 | 2×2 | `chart`, `oclvl`, `ocheat`, `ocliq` |
+| **Hedge** | 3 | 3×1 | `chart`, `oclvl`, `ivskew` |
+| **OC Scan** | 2 | 2×1 | `ocheat`, `ocliq` |
+| **Recon** | 6 | 3×2 | `chart`, `heatmap`, `ladder`, `eqbook`, `oclvl`, `opscr` |
+| **Maker** | 3 | 3×1 | `heatmap`, `ladder`, `eqbook` |
+| **God Mode** | 5 | 3×2 | `chart`×2, `heatmap`, `alpha`, `ladder` |
+
+### Mount/Unmount Lifecycle
+
+```
+User selects layout → AltarisLayout.setLayout('dom')
+  → For each slot:
+    1. onFeatureUnmount(oldPane, oldFeature, slotEl)
+       → ChartCore.destroy(chartDiv)    // removes LW chart
+       → _useCanvasLadder = false       // resets ladder state
+    2. onFeatureMount(newPane, newFeature, slotEl)
+       → Creates DOM container
+       → ChartCore.init(container, symbol, featureKey)
+       → Emits 'chart:ready' event
+       → Plugins attach based on feature key
+```
+
+## Data Pipeline
+
+### Real-Time Data Flow
+
+```
+TopStepX WS → l2_worker.py → server.py → Socket.IO → app.js
+                                        ↘ REST /api/l2 (500ms fallback)
+```
+
+### Data Routing in app.js
+
+```
+_l2Render(data)
+  ├── _l2RenderImbalance(data)      → Bid/ask imbalance bars
+  ├── _l2RenderDOM(data.dom)        → Ladder (canvas) OR HTML DOM
+  ├── _l2RenderTape(data.trades)    → EQ Book trade tape
+  ├── _l2RenderSignals(data.signals)→ Detection alerts
+  └── _forceRenderHeatmap()         → DOM depth heatmap overlay
+
+_l2FetchCandles(fullRedraw)
+  → fetch /api/data → parse candles
+  → ChartCore.getInstances().forEach(inst => {
+      inst.candleSeries.setData(candles)     // ALL instances
+      inst.volumeSeries.setData(volume)      // ALL instances
+      if (inst.feature === 'chart')
+        inst.bubbleSeries.setData(bubbles)   // CHART only
+    })
+```
+
+### Event System
+
+| Event | Fires When | Used By |
+|---|---|---|
+| `chart:ready` | ChartCore.init() completes | Plugin attachment (WallLines, ThermalFlare) |
+| `chart:scroll` | User scrolls/zooms chart | ThermalFlare re-render, heatmap re-render |
+| `chart:resize` | Container resizes | Chart + overlay dimension sync |
+| `data:candles:update` | Socket.IO candle push | Real-time candle updates to all instances |
+| `data:trades:update` | Socket.IO trade push | Price ticker updates |
+| `data:zone:update` | Socket.IO zone push | WallLines level updates |
+
+## Known Gotchas
+
+1. **Legacy globals** (`_l2CandleSeries`, `_l2CandleChart`) — exist for backward compat but MUST NOT be used as guards. Use `ChartCore.getInstances()` instead.
+2. **Canvas renderers** (ladder, heatmap) — must NOT use rAF throttle wrappers. They're called every 500ms from the poll loop; throttling causes race conditions.
+3. **ThermalFlare is a singleton** — calling `.init()` multiple times resets its internal state. Multi-instance ThermalFlare requires refactoring if needed.
+4. **WallLines duplicate labels** — `updateLive()` can create duplicate price lines if called multiple times without cleanup. Known cosmetic bug.
+5. **`_l2ChartSymbol`** defaults to `'NQ'` — all DOM data keying uses `data.dom[_l2ChartSymbol]`.

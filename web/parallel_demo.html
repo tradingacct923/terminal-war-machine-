@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Parallel Processing Demo: Heatmap & Bubbles</title>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+    <style>
+        body { background: #050810; color: white; display: flex; gap: 20px; font-family: 'JetBrains Mono', monospace; padding: 20px; height: 100vh; overflow: hidden; margin: 0; box-sizing: border-box; }
+        .window { background: #0A0D16; border: 1px solid rgba(124,90,247,0.3); border-radius: 8px; flex: 1; display: flex; flex-direction: column; }
+        .title-bar { background: rgba(124,90,247,0.1); padding: 8px 12px; font-size: 12px; border-bottom: 1px solid rgba(124,90,247,0.2); color: #c4b5fd; display: flex; justify-content: space-between;}
+        .content { flex: 1; position: relative; }
+        #mock-controls { position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 100; background: #1a1f35; padding: 10px 20px; border-radius: 20px; border: 1px solid #7c5af7; display: flex; gap: 15px; align-items: center;}
+        button { background: #7c5af7; color: white; border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-family: 'JetBrains Mono', monospace; font-size: 12px;}
+        button:hover { background: #967bf9; }
+    </style>
+    <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+    <script src="core/event_bus.js"></script>
+    <script src="volume_bubbles.js"></script>
+</head>
+<body>
+    <div class="window">
+        <div class="title-bar">
+            <span>Chart Layout Pane</span>
+            <span style="color: #4ade80;">Active: Volume Bubbles</span>
+        </div>
+        <div class="content" id="chart-pane"></div>
+    </div>
+    <div class="window">
+        <div class="title-bar">
+            <span>DOM Layout Pane</span>
+            <span style="color: #60a5fa;">Active: 2D Heatmap Engine</span>
+        </div>
+        <div class="content">
+            <canvas id="hm-canvas" style="width:100%;height:100%;display:block;"></canvas>
+        </div>
+    </div>
+    
+    <div id="mock-controls">
+        <span style="font-size: 11px; color: #a5b4fc;">TopStepX WebSocket Source Simulation:</span>
+        <button onclick="injectTrade('buy')">Inject Heavy Buy</button>
+        <button onclick="injectTrade('sell')" style="background: #e11d48;">Inject Heavy Sell</button>
+        <button onclick="injectWall()" style="background: #d97706;">Inject Liquidity Wall</button>
+    </div>
+
+    <script>
+        // 1. Initialize Chart
+        const chartWrapper = document.getElementById('chart-pane');
+        const chart = LightweightCharts.createChart(chartWrapper, {
+            width: chartWrapper.clientWidth, height: chartWrapper.clientHeight,
+            layout: { background: { color: 'transparent' }, textColor: '#6b7280' },
+            grid: { vertLines: { visible: false }, horzLines: { visible: false } }
+        });
+        const candles = chart.addCandlestickSeries({ upColor: '#26a69a', downColor: '#ef5350' });
+        
+        // Feed initial dummy candle data
+        let baseTime = Math.floor(Date.now() / 1000) - 3600;
+        let basePrice = 18500;
+        const cData = [];
+        for(let i=0; i<60; i++) {
+            cData.push({ time: baseTime + i*60, open: basePrice, high: basePrice+5, low: basePrice-5, close: basePrice + (Math.random()*4-2) });
+            basePrice = cData[i].close;
+        }
+        candles.setData(cData);
+        
+        // 2. Initialize Volume Bubbles on Chart Pane
+        const bubbleSeries = chart.addCustomSeries(new VolumeBubbleSeries(), { priceScaleId: 'right' });
+        
+        // 3. Initialize Heatmap Engine on DOM Pane
+        const hmCanvas = document.getElementById('hm-canvas');
+        hmCanvas.width = hmCanvas.clientWidth;
+        hmCanvas.height = hmCanvas.clientHeight;
+        const hmCtx = hmCanvas.getContext('2d', { alpha: false });
+        
+        // Tell Volume Bubbles to listen
+        if (typeof startDomHistory === 'function') startDomHistory('NQ');
+        window._activeChartFeature = 'heatmap'; // enable heatmap renderer
+        
+        function renderLoop() {
+            if (typeof _renderDomHeatmap2DThrottled !== 'undefined') {
+                _renderDomHeatmap2DThrottled(hmCtx, hmCanvas.width, hmCanvas.height, 1, 'NQ');
+            }
+            requestAnimationFrame(renderLoop);
+        }
+        requestAnimationFrame(renderLoop);
+        
+        // Resize handling
+        new ResizeObserver(() => {
+            chart.applyOptions({ width: chartWrapper.clientWidth, height: chartWrapper.clientHeight });
+            hmCanvas.width = hmCanvas.clientWidth; hmCanvas.height = hmCanvas.clientHeight;
+        }).observe(document.body);
+
+        // Simulation functions -> both systems receive data from the exact same buffer!
+        function updateAll(price, size, isBuy) {
+            const ts = Date.now();
+            
+            // 1. Feed the Tape (caught by Volume Bubbles)
+            const tickEvt = new CustomEvent('ts_tick', { detail: { sym: 'NQ', price, size, isBuy, ts } });
+            window.dispatchEvent(tickEvt);
+            
+            // 2. Feed the DOM (caught by Heatmap)
+            DOM2D._clusteredTape.push({ ts, price, side: isBuy?1:-1, totalVol: size, count: 1, maxSingle: size });
+            DOM2D._globalMax = Math.max(DOM2D._globalMax, size);
+            
+            // 3. Update Chart Price
+            candles.update({ time: Math.floor(ts/1000), open: basePrice, high: Math.max(basePrice, price), low: Math.min(basePrice, price), close: price });
+            basePrice = price;
+        }
+
+        window.injectTrade = (side) => {
+            const p = basePrice + (side==='buy'?1:-1)*(Math.random()*3);
+            updateAll(p, Math.floor(Math.random()*150)+50, side==='buy');
+        };
+
+        window.injectWall = () => {
+            if (!DOM2D._snapshots.length) DOM2D._snapshots.push({ ts: Date.now(), bids: {}, asks: {} });
+            const snap = DOM2D._snapshots[DOM2D._snapshots.length-1];
+            const p = basePrice + 10;
+            snap.asks[p] = 500; // 500 lot sell wall
+        };
+    </script>
+</body>
+</html>

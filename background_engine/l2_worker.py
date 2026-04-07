@@ -65,11 +65,58 @@ _socketio = None
 _last_emit_time: dict = {}  # throttle: {"symbol:tf": timestamp}
 _EMIT_MIN_INTERVAL = 0.15   # max ~6.6 emits/sec per symbol/tf
 
+# ── Reconnect gap-fill tracking ──
+_LAST_TRADE_TS: dict[str, float] = {}   # {symbol: unix_ts of last trade}
+_connector_ref = None                    # set by start() for gap-fill access
+
+# ── Detection callback (for EdgeDetector cross-asset forwarding) ──
+_detection_callback = None  # callable(detection_type, detection_data, symbol)
+
+# ── Cross-asset context provider (set by EdgeDetector to push GEX/stop cluster data back) ──
+_cross_asset_provider = None  # callable(symbol) -> {gex_zone, stop_cluster_near, mm_bias, ...}
+
+def set_cross_asset_provider(provider_fn):
+    """Called by EdgeDetector to provide cross-asset context back to l2_worker.
+    
+    provider_fn(symbol) should return:
+        {'gex_zone': str, 'gex_factor': float, 'near_stop_cluster': bool,
+         'stop_cluster_price': float, 'stop_cluster_side': str,
+         'mm_pull_bias': int}  # -1=SHORT, 0=neutral, +1=LONG
+    """
+    global _cross_asset_provider
+    _cross_asset_provider = provider_fn
+    log.info("Cross-asset context provider registered")
+
+# ── Empirical stickiness distribution (replaces hardcoded 0.3 threshold) ──
+_STICKINESS_DIST: dict = defaultdict(lambda: deque(maxlen=500))
+# {symbol: deque of recent stickiness values}
+
 def set_socketio(sio):
     """Called by server.py to inject the SocketIO instance for real-time push."""
     global _socketio
     _socketio = sio
     log.info("Socket.IO reference set for real-time candle push")
+
+def set_detection_callback(callback):
+    """Register a callback for NQ detection events (iceberg, sweep, wall_gone).
+    Called by schwab_bridge or server.py to wire EdgeDetector.
+    callback(detection_type: str, detection_data: dict, symbol: str)
+    """
+    global _detection_callback
+    _detection_callback = callback
+    log.info("Detection callback registered for cross-asset forwarding")
+
+# ── Trade scoring callback (for tape glow via EdgeDetector) ──
+_trade_score_callback = None  # callable(symbol, volume, side, price, timestamp) -> dict|None
+
+def set_trade_score_callback(callback):
+    """Register EdgeDetector.score_trade() for regime-adaptive tape glow scoring.
+    Called by schwab_bridge to wire EdgeDetector.
+    callback(symbol: str, volume: int, side: str, price: float, timestamp: float) -> dict|None
+    """
+    global _trade_score_callback
+    _trade_score_callback = callback
+    log.info("Trade score callback registered for tape glow")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -242,6 +289,8 @@ def _update_market_stats(symbol: str, volume: int, side: str, timestamp: float):
             v5 = sum((x - m5) ** 2 for x in last5) / 5
             cv5 = math.sqrt(v5) / m5
             ms["cluster_cvs"].append(cv5)
+            # Feed into Kalman filter for state-space CV estimation
+            _KALMAN_CV[symbol].update(cv5)
 
     # Recompute derived stats at most once per second
     if timestamp - ms["last_stats_ts"] < 1.0:
@@ -321,10 +370,17 @@ def _get_adaptive_thresholds(symbol: str, side: str = "b") -> dict:
 
     sigma_mult = _REGIME_SIGMA.get(regime, 1.5)
 
-    # σ-adaptive CV threshold: flag anything abnormally consistent
-    # threshold = mean_cv - N*std_cv (lower CV = more consistent = suspicious)
-    mean_cv = ms["mean_cv"]
-    std_cv = ms["std_cv"]
+    # Kalman-filtered CV threshold (replaces laggy rolling mean)
+    # Uses Kalman state estimate ± sigma_mult * uncertainty
+    kalman = _KALMAN_CV[symbol]
+    if kalman._n >= 10:
+        # Use Kalman filter: faster regime tracking than rolling mean
+        mean_cv = kalman.state
+        std_cv = kalman.uncertainty
+    else:
+        # Fallback to rolling stats during Kalman warmup
+        mean_cv = ms["mean_cv"]
+        std_cv = ms["std_cv"]
     ice_cv = max(0.12, round(mean_cv - sigma_mult * std_cv, 3))
     drift_cv = max(0.15, round(ice_cv + 0.05, 3))  # drift always slightly looser
 
@@ -396,12 +452,227 @@ _ICE_MIN_CLIP_FLOOR   = 1       # absolute minimum clip size (never go below 1)
 _ICE_ZONE_TICKS       = 2       # ±2 ticks = adjacent prices count as same zone
 _ICE_ABSORB_MAX_MOVE  = 2       # price must stay within ±2 ticks to be "absorbing"
 
-# Tiered detection windows: (window_seconds, confidence_label)
+# Tiered detection windows: (fallback_seconds, volume_multiplier, confidence_label)
+# volume_multiplier × empirical_bucket_size = actual volume window
+# Multipliers are structural: 1× = one bucket, 3× = three buckets, 10× = ten buckets
+# These are NOT guesses — they represent "how many statistical samples back to look"
 _ICE_WINDOWS = [
-    (5.0,  "high"),    # fast refill = definitely iceberg
-    (15.0, "medium"),  # patient algo
-    (60.0, "low"),     # very patient, could be coincidence
+    (5.0,   1,   "high"),    # 1 bucket  back = fast refill
+    (15.0,  3,   "medium"),  # 3 buckets back = patient algo
+    (60.0,  10,  "low"),     # 10 buckets back = very patient
 ]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# VOLUME CLOCK — τ(t) = ⌊(1/V_bucket) × Σv_i⌋
+# ═══════════════════════════════════════════════════════════════════════════════
+# Replaces chronological time with volume-synchronized time.
+# Time only advances when trades happen. Each "volume tick" represents
+# V_bucket contracts traded, making all detection windows comparable
+# regardless of time-of-day (lunchtime vs market open).
+#
+# ZERO HARDCODED BUCKET SIZES. The bucket size is the P50 (median) of
+# observed 5-second volume windows from the live tape. It self-calibrates
+# after ~60 seconds of trading data.
+
+class VolumeClock:
+    """Volume-synchronized clock per symbol.
+
+    τ(t) = floor(cumulative_volume / bucket_size)
+
+    Bucket size is EMPIRICAL: the median volume traded per 5-second
+    interval, computed from a rolling window of live trade data.
+    No hardcoded numbers.
+    """
+
+    _CALIBRATION_INTERVAL = 5.0  # compute bucket from 5s volume intervals
+    _CALIBRATION_MIN_SAMPLES = 12  # need 12 intervals (~60s of data)
+
+    def __init__(self):
+        self._cumulative_volume = 0
+        self._tau = 0
+        self._trades_in_bucket = 0
+        self._total_trades = 0
+        self._last_bucket_time = 0
+        self._bucket_durations = deque(maxlen=100)
+
+        # Empirical bucket calibration
+        self._bucket_size = 0       # 0 = not calibrated yet
+        self._calibrated = False
+        self._interval_volumes = deque(maxlen=200)  # observed 5s volume totals
+        self._current_interval_vol = 0
+        self._current_interval_start = 0
+
+    @property
+    def tau(self):
+        return self._tau
+
+    @property
+    def warm(self):
+        """True when empirical bucket is calibrated AND we have enough ticks."""
+        return self._calibrated and self._tau >= len(self._interval_volumes) // 2
+
+    @property
+    def bucket_size(self):
+        return self._bucket_size if self._bucket_size > 0 else 1
+
+    def tick(self, volume, timestamp):
+        """Process a trade. Self-calibrates bucket size from live data."""
+        self._cumulative_volume += volume
+        self._total_trades += 1
+        self._trades_in_bucket += 1
+
+        # ── Empirical bucket calibration ──
+        if self._current_interval_start == 0:
+            self._current_interval_start = timestamp
+
+        self._current_interval_vol += volume
+
+        # Close 5-second interval and record volume
+        if timestamp - self._current_interval_start >= self._CALIBRATION_INTERVAL:
+            self._interval_volumes.append(self._current_interval_vol)
+            self._current_interval_vol = 0
+            self._current_interval_start = timestamp
+
+            # Recalibrate bucket from P50 of observed intervals
+            if len(self._interval_volumes) >= self._CALIBRATION_MIN_SAMPLES:
+                sorted_vols = sorted(self._interval_volumes)
+                p50_idx = len(sorted_vols) // 2
+                new_bucket = max(1, sorted_vols[p50_idx])
+                self._bucket_size = new_bucket
+                if not self._calibrated:
+                    self._calibrated = True
+                    import logging
+                    logging.getLogger('l2_worker').info(
+                        f'[VCLOCK] Calibrated: bucket={new_bucket} '
+                        f'(P50 of {len(sorted_vols)} intervals, '
+                        f'range={sorted_vols[0]}-{sorted_vols[-1]})'
+                    )
+
+        # ── Tick forward ──
+        if self._bucket_size > 0:
+            new_tau = self._cumulative_volume // self._bucket_size
+            if new_tau > self._tau:
+                if self._last_bucket_time > 0:
+                    duration = timestamp - self._last_bucket_time
+                    if duration > 0:
+                        self._bucket_durations.append(duration)
+                self._last_bucket_time = timestamp
+                self._trades_in_bucket = 0
+                self._tau = new_tau
+
+        return self._tau
+
+    def get_avg_bucket_duration(self):
+        if not self._bucket_durations:
+            return 0
+        return sum(self._bucket_durations) / len(self._bucket_durations)
+
+    def get_stats(self):
+        return {
+            'tau': self._tau,
+            'cumulative_volume': self._cumulative_volume,
+            'bucket_size': self._bucket_size,
+            'total_trades': self._total_trades,
+            'warm': self.warm,
+            'calibrated': self._calibrated,
+            'calibration_samples': len(self._interval_volumes),
+            'avg_bucket_sec': round(self.get_avg_bucket_duration(), 2),
+        }
+
+# Per-symbol Volume Clock instances (self-calibrating, no hardcoded bucket)
+_VOLUME_CLOCKS: dict = defaultdict(VolumeClock)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1D KALMAN FILTER — Order flow variance estimation (from State-Space spec)
+# ══════════════════════════════════════════════════════════════════════════════
+# Treats true order flow CV as a hidden state. Dynamically weights new
+# observations against internal estimate. Reacts instantly to structural
+# regime shifts while ignoring noise spikes.
+#
+# Prediction:  x̂(k|k-1) = x̂(k-1|k-1)       [constant velocity model]
+#              P(k|k-1) = P(k-1|k-1) + Q
+# Update:      K(k) = P(k|k-1) / (P(k|k-1) + R)
+#              x̂(k|k) = x̂(k|k-1) + K(k) * (z(k) - x̂(k|k-1))
+#              P(k|k) = (1 - K(k)) * P(k|k-1)
+
+class KalmanCV:
+    """1D Kalman Filter for order flow Coefficient of Variation."""
+
+    def __init__(self, Q=0.001, R_init=0.02):
+        self.x = 0.55       # initial state estimate (typical random CV)
+        self.P = 0.1        # initial uncertainty (wide)
+        self.Q = Q           # process noise (regime change rate)
+        self.R = R_init      # measurement noise (updated from data)
+        self._n = 0
+        self._sum_sq_innov = 0.0  # for adaptive R estimation
+
+    def predict(self):
+        """A priori step: project state forward."""
+        # x̂(k|k-1) = x̂(k-1|k-1)  (constant model, no drift)
+        # P(k|k-1) = P(k-1|k-1) + Q
+        self.P += self.Q
+
+    def update(self, z):
+        """A posteriori step: incorporate new observation z (measured CV).
+
+        Returns the Kalman Gain K for diagnostics.
+        """
+        self.predict()
+
+        # Innovation (residual)
+        innovation = z - self.x
+
+        # Adaptive R: track squared innovations to estimate measurement noise
+        self._n += 1
+        self._sum_sq_innov += innovation ** 2
+        if self._n >= 10:
+            # R ≈ variance of innovations (Mehra 1970 approach)
+            self.R = max(0.001, self._sum_sq_innov / self._n - self.P)
+
+        # Kalman Gain
+        K = self.P / (self.P + self.R) if (self.P + self.R) > 0 else 0.5
+
+        # State update
+        self.x += K * innovation
+
+        # Covariance update
+        self.P = (1 - K) * self.P
+
+        return K
+
+    @property
+    def state(self):
+        """Current filtered CV estimate."""
+        return self.x
+
+    @property
+    def uncertainty(self):
+        """Current state uncertainty (sqrt(P))."""
+        return math.sqrt(max(0, self.P))
+
+    def get_stats(self):
+        return {
+            'kalman_cv': round(self.x, 4),
+            'kalman_P': round(self.P, 6),
+            'kalman_R': round(self.R, 6),
+            'kalman_K': round(self.P / (self.P + self.R) if (self.P + self.R) > 0 else 0, 4),
+            'kalman_n': self._n,
+        }
+
+
+# Per-symbol Kalman filter instances
+_KALMAN_CV: dict = defaultdict(KalmanCV)
+
+# Per-symbol VPIN engine instances
+try:
+    from connectors.vpin_engine import VPINEngine
+    _VPIN_ENGINES: dict = defaultdict(VPINEngine)
+except ImportError:
+    _VPIN_ENGINES = {}
+
+# Per-symbol, per-fill volume-clock tagged tracker:
+# {symbol: {price_str: deque of (timestamp, volume, side, tau)}}
+_ICE_TRACKER_VTAG: dict = defaultdict(lambda: defaultdict(lambda: deque(maxlen=200)))
 
 # ── Rolling Trade Size Tracker (for adaptive min clip) ──
 # {symbol: deque of recent trade sizes, max 500}
@@ -424,11 +695,12 @@ _DOM_ASK_PREV: dict = defaultdict(dict)
 _DOM_FILLS_PENDING: dict = defaultdict(lambda: defaultdict(int))
 
 # ── Drifting Iceberg State (Elite Feature #4) ──
-_DRIFT_WINDOW_SEC      = 30.0   # look back 30 seconds
+_DRIFT_WINDOW_SEC      = 30.0   # fallback time-based window
+# _DRIFT_WINDOW_VOL: derived as 5× empirical bucket (set dynamically, no hardcode)
 _DRIFT_MIN_FILLS       = 5      # need at least 5 same-side fills
 _DRIFT_MAX_CV          = 0.40   # clip consistency (looser for drift)
 _DRIFT_MIN_PRICE_SPREAD = 3     # must span 3+ distinct prices
-# {symbol: {"b": deque, "s": deque}}
+# {symbol: {"b": deque, "s": deque}} — now includes tau tag
 _DRIFT_TRACKER: dict = defaultdict(lambda: {"b": deque(maxlen=100),
                                              "s": deque(maxlen=100)})
 
@@ -610,7 +882,21 @@ def _detect_drifting_iceberg(symbol: str, price_f: float, volume: int,
 
     tracker = _DRIFT_TRACKER[symbol][side]
     tracker.append((timestamp, price_f, volume))
-    cutoff = timestamp - _DRIFT_WINDOW_SEC
+
+    # ── Volume Clock windowing (primary) vs time-based (fallback) ──
+    vclock = _VOLUME_CLOCKS[symbol]
+    if vclock.warm:
+        # Drift uses 5× bucket multiplier (between iceberg 3× and 10×)
+        drift_ticks_back = 5
+        avg_bucket_sec = vclock.get_avg_bucket_duration()
+        if avg_bucket_sec > 0:
+            approx_sec = drift_ticks_back * avg_bucket_sec
+            cutoff = timestamp - approx_sec
+        else:
+            cutoff = timestamp - _DRIFT_WINDOW_SEC
+    else:
+        cutoff = timestamp - _DRIFT_WINDOW_SEC
+
     recent = [(t, p, v) for t, p, v in tracker if t >= cutoff]
     if len(recent) < drift_min_fills:
         return None
@@ -710,31 +996,221 @@ def _update_level_memory(symbol: str, price_str: str, iceberg_result: dict):
 
 
 def _record_iceberg_completion(symbol: str, price: float, side: str,
-                                ts: float, size_rank: str, confidence: str):
-    """Schedule outcome checks for post-iceberg prediction."""
-    _ICE_PENDING[symbol].append({
+                                ts: float, size_rank: str, confidence: str,
+                                state_vector: dict = None):
+    """Schedule outcome checks for post-iceberg prediction.
+    state_vector: snapshot of detection-time features for JSONL logging.
+    """
+    # ── Phase 6 Alpha Filters (universal choke point) ──
+    # NOTE: Kill combos were reset after discovering direction inversion bug.
+    # Old combos were calibrated on inverted PnL — they were killing WINNING signals.
+    # With correct direction semantics:
+    #   side="s" = bid iceberg → LONG  (buyer wall absorbing sellers)
+    #   side="b" = ask iceberg → SHORT (seller wall absorbing buyers)
+    # Fresh kill combos will be re-derived from corrected OOS data.
+    _KILL_COMBOS: set = set()  # cleared — re-calibrate after 10+ sessions with correct direction
+    current_regime = _CURRENT_REGIME
+    if state_vector:
+        current_regime = state_vector.get('regime', _CURRENT_REGIME)
+    if (current_regime, side) in _KILL_COMBOS:
+        return  # suppress toxic combo entirely
+
+    # CV Gate: low Kalman CV = noise, not signal
+    # Re-evaluate threshold after collecting corrected-direction OOS data.
+    kalman = _KALMAN_CV.get(symbol)
+    if kalman and kalman._n > 250 and kalman.state < 0.04:
+        return  # suppress noise-regime signals
+
+    # ── Directional Gate: Cross-Asset Consensus ──
+    # Iceberg gives +6.6 pts entry alpha but no directional edge.
+    # GEX/MM/0DTE from EdgeDetector provides the directional bias.
+    # BLOCK when cross-asset signals contradict iceberg direction.
+    #
+    # Direction semantics (corrected):
+    #   side="s" (sell aggressor hitting bid) → bid iceberg → buyer wall → LONG
+    #   side="b" (buy aggressor lifting ask) → ask iceberg → seller wall → SHORT
+    if _cross_asset_provider:
+        try:
+            ctx = _cross_asset_provider(symbol)
+            if ctx:
+                iceberg_is_long = (side != 'b')  # side="s" → LONG, side="b" → SHORT
+
+                # MM withdrawal direction: -1=bearish (pulled bids), +1=bullish, 0=neutral
+                mm_bias = ctx.get('mm_pull_bias', 0)
+                gex_zone = ctx.get('gex_zone', 'NO_DATA')
+                gex_factor = ctx.get('gex_factor', 1.0)
+
+                # HARD BLOCK: MM consensus directly contradicts iceberg direction
+                # AND GEX structure confirms the contra-move
+                #   LONG iceberg + MM bearish + below gamma flip = likely steamrolled
+                #   SHORT iceberg + MM bullish + above gamma flip = likely short-squeezed
+                if iceberg_is_long and mm_bias == -1:
+                    # MMs pulling bids → bearish. Is GEX also against us?
+                    gex_contra = gex_zone in (
+                        'AT_PUT_WALL_BREAKOUT',  # near put wall breaking down
+                        'SHORT_GAMMA_ZONE',       # below flip → amplified downside
+                        'AT_GAMMA_FLIP',          # at flip → volatile, direction unclear
+                    )
+                    if gex_contra or gex_factor < 0.8:
+                        log.info(
+                            f"[DIRECTIONAL-GATE] BLOCKED LONG iceberg @ {price}: "
+                            f"MM={mm_bias} GEX={gex_zone}({gex_factor:.2f})"
+                        )
+                        return
+
+                elif not iceberg_is_long and mm_bias == 1:
+                    # MMs pulling asks → bullish. Is GEX also against us?
+                    gex_contra = gex_zone in (
+                        'AT_CALL_WALL_BREAKOUT',  # near call wall breaking up
+                        'LONG_GAMMA_ZONE',         # above flip → dampened downside
+                    )
+                    if gex_contra or gex_factor < 0.8:
+                        log.info(
+                            f"[DIRECTIONAL-GATE] BLOCKED SHORT iceberg @ {price}: "
+                            f"MM={mm_bias} GEX={gex_zone}({gex_factor:.2f})"
+                        )
+                        return
+
+                # Log cross-asset context for all passed trades (for future analysis)
+                if state_vector is not None:
+                    state_vector['mm_bias_at_detect'] = mm_bias
+                    state_vector['gex_zone_at_detect'] = gex_zone
+                    state_vector['gex_factor_at_detect'] = gex_factor
+        except Exception as e:
+            log.debug(f"[DIRECTIONAL-GATE] Cross-asset check error: {e}")
+            # Don't block if cross-asset data is unavailable
+
+    pending = {
         "side": side, "price": price, "ts": ts,
         "size_rank": size_rank, "confidence": confidence,
         "check_10s": ts + 10, "check_30s": ts + 30, "check_60s": ts + 60,
         "outcome_10s": None, "outcome_30s": None, "outcome_60s": None,
-    })
+        # Intra-window MAE/MFE tracking
+        "mfe": 0.0, "mae": 0.0,     # Current running MFE/MAE
+        "mfe_10s": None, "mae_10s": None,
+        "mfe_30s": None, "mae_30s": None,
+        "mfe_60s": None, "mae_60s": None,
+    }
+    if state_vector:
+        pending.update(state_vector)
+    _ICE_PENDING[symbol].append(pending)
 
 
 def _check_pending_outcomes(symbol: str, current_price: float, current_ts: float):
-    """Resolve pending post-iceberg outcome checks."""
+    """Resolve pending post-iceberg outcome checks and track intra-window MFE/MAE.
+    Phase 7: Also tracks dynamic SL = max(3.0, CV*100) exit simulation.
+
+    DIRECTION SEMANTICS (critical):
+      p["side"] is the AGGRESSOR side — who is hitting the iceberg.
+      side="s" (sell aggressor repeatedly hitting bid) → BID ICEBERG → buyer's wall → LONG
+      side="b" (buy aggressor repeatedly lifting ask) → ASK ICEBERG → seller's wall → SHORT
+      Therefore: direction = -1 if side=="b" else 1
+      (Trade WITH the iceberg, AGAINST the aggressor.)
+    """
     still_pending = []
     for p in _ICE_PENDING[symbol]:
-        direction = 1 if p["side"] == "b" else -1
+        direction = -1 if p["side"] == "b" else 1   # FIXED: was 1 if "b" else -1 (inverted)
+        pnl = round((current_price - p["price"]) * direction, 2)
+
+        # Continually update MFE/MAE while trade is active
+        p["mfe"] = max(p["mfe"], pnl)
+        p["mae"] = min(p["mae"], pnl)
+
+        # Phase 7: Track dynamic SL hit (computed once at entry)
+        if "dynamic_sl" not in p:
+            cv = _KALMAN_CV[symbol].state if symbol in _KALMAN_CV else 0.05
+            p["dynamic_sl"] = round(max(3.0, cv * 100), 2)
+            p["dynamic_sl_hit"] = False
+            p["dynamic_sl_hit_ts"] = None
+            p["dynamic_sl_pnl"] = None
+
+        if not p["dynamic_sl_hit"] and pnl <= -p["dynamic_sl"]:
+            p["dynamic_sl_hit"] = True
+            p["dynamic_sl_hit_ts"] = current_ts
+            p["dynamic_sl_pnl"] = round(-p["dynamic_sl"], 2)
+
         if p["outcome_10s"] is None and current_ts >= p["check_10s"]:
-            p["outcome_10s"] = round((current_price - p["price"]) * direction, 2)
+            p["outcome_10s"] = pnl
+            p["mfe_10s"] = p["mfe"]
+            p["mae_10s"] = p["mae"]
+            
         if p["outcome_30s"] is None and current_ts >= p["check_30s"]:
-            p["outcome_30s"] = round((current_price - p["price"]) * direction, 2)
+            p["outcome_30s"] = pnl
+            p["mfe_30s"] = p["mfe"]
+            p["mae_30s"] = p["mae"]
+            
         if p["outcome_60s"] is None and current_ts >= p["check_60s"]:
-            p["outcome_60s"] = round((current_price - p["price"]) * direction, 2)
+            p["outcome_60s"] = pnl
+            p["mfe_60s"] = p["mfe"]
+            p["mae_60s"] = p["mae"]
             _ICE_OUTCOMES[symbol].append(p)
+            # ── Persist to JSONL ──
+            _persist_iceberg_outcome(symbol, p)
             continue
+            
         still_pending.append(p)
     _ICE_PENDING[symbol] = still_pending
+
+
+def _persist_iceberg_outcome(symbol, outcome):
+    """Append completed iceberg outcome to JSONL log file."""
+    try:
+        import os, json
+        log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "iceberg_outcomes.jsonl")
+
+        # State vector for future RL training
+        kalman = _KALMAN_CV[symbol]
+        vclock = _VOLUME_CLOCKS[symbol]
+        bucket_ma = sum(vclock._interval_volumes) / max(len(vclock._interval_volumes), 1) \
+                    if vclock._interval_volumes else vclock.bucket_size
+        bucket_ratio = round(vclock.bucket_size / max(bucket_ma, 1), 3)
+
+        record = {
+            "symbol": symbol,
+            "side": outcome["side"],
+            "price": outcome["price"],
+            "ts": outcome["ts"],
+            "ts_human": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(outcome["ts"])),
+            "size_rank": outcome.get("size_rank", ""),
+            "confidence": outcome.get("confidence", ""),
+            "outcome_10s": outcome["outcome_10s"],
+            "outcome_30s": outcome["outcome_30s"],
+            "outcome_60s": outcome["outcome_60s"],
+            "win_10s": outcome["outcome_10s"] is not None and outcome["outcome_10s"] > 0,
+            "win_30s": outcome["outcome_30s"] is not None and outcome["outcome_30s"] > 0,
+            "win_60s": outcome["outcome_60s"] is not None and outcome["outcome_60s"] > 0,
+            # Sub-window Excursion Tracking (MAE/MFE)
+            "mfe_10s": outcome.get("mfe_10s", 0),
+            "mae_10s": outcome.get("mae_10s", 0),
+            "mfe_30s": outcome.get("mfe_30s", 0),
+            "mae_30s": outcome.get("mae_30s", 0),
+            "mfe_60s": outcome.get("mfe_60s", 0),
+            "mae_60s": outcome.get("mae_60s", 0),
+            # State-Space Engine: state vector (s_t for SAC training)
+            # Use detection-time snapshot to avoid T+60s lookahead bias
+            "kalman_cv": outcome.get("kalman_cv_at_detect", round(kalman.state, 4)),
+            "kalman_P": outcome.get("kalman_P_at_detect", round(kalman.P, 6)),
+            "psi": outcome.get("psi", 0),
+            "vclock_bucket": vclock.bucket_size,
+            "bucket_ratio": bucket_ratio,
+            "regime": outcome.get("regime", _CURRENT_REGIME),
+            "stickiness": outcome.get("stickiness", 0),
+            "absorption_ratio": outcome.get("absorption_ratio", 0),
+            "urgency": outcome.get("urgency", 0),
+            # VPIN Toxicity
+            "vpin": round(_VPIN_ENGINES[symbol].vpin, 4) if _VPIN_ENGINES and symbol in _VPIN_ENGINES else 0,
+            "vpin_regime": _VPIN_ENGINES[symbol].get_regime_modifier() if _VPIN_ENGINES and symbol in _VPIN_ENGINES else 'NEUTRAL',
+            # Phase 7: Dynamic Exit Simulation
+            "dynamic_sl": outcome.get("dynamic_sl", 0),
+            "dynamic_sl_hit": outcome.get("dynamic_sl_hit", False),
+            "dynamic_sl_pnl": outcome.get("dynamic_sl_pnl"),
+        }
+        with open(log_path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception as e:
+        print(f"[ICE] Outcome persist error: {e}")
 
 
 def _get_prediction(symbol: str, side: str):
@@ -820,37 +1296,59 @@ def _detect_iceberg(symbol: str, price_str: str, volume: int,
         return None
 
 
-    # Track this fill at this price
+    # Track this fill at this price (with volume-clock tag)
+    vclock = _VOLUME_CLOCKS[symbol]
+    current_tau = vclock.tau
     tracker = _ICE_TRACKER[symbol][price_str]
     tracker.append((timestamp, volume, side))
 
-    # Prune oldest fills beyond widest window
-    max_window = _ICE_WINDOWS[-1][0]  # 60s
-    cutoff_prune = timestamp - max_window
+    # Also store in volume-tagged tracker
+    vtag_tracker = _ICE_TRACKER_VTAG[symbol][price_str]
+    vtag_tracker.append((timestamp, volume, side, current_tau))
+
+    # Prune oldest fills beyond widest window (both time and volume)
+    max_window_sec = _ICE_WINDOWS[-1][0]  # 60s
+    cutoff_prune = timestamp - max_window_sec
     while tracker and tracker[0][0] < cutoff_prune:
         tracker.popleft()
+    # Volume-based prune: keep fills within widest volume window (multiplier + 2 margin)
+    max_window_mult = _ICE_WINDOWS[-1][1]  # widest multiplier (10)
+    vol_cutoff_tau = max(0, current_tau - max_window_mult - 2)
+    while vtag_tracker and vtag_tracker[0][3] < vol_cutoff_tau:
+        vtag_tracker.popleft()
 
     # ── ZONE DETECTION: collect fills from adjacent ±N ticks ──
     tick_size = TICK_SIZES.get(symbol, DEFAULT_TICK_SIZE)
     zone_fills_all = []
+    zone_fills_vtag = []  # volume-tagged zone fills
     zone_levels_hit = set()
 
     for offset in range(-_ICE_ZONE_TICKS, _ICE_ZONE_TICKS + 1):
         adj_price = round(price_f + offset * tick_size, 2)
         adj_key = str(adj_price)
         adj_fills = _ICE_TRACKER[symbol].get(adj_key, [])
+        adj_vtag = _ICE_TRACKER_VTAG[symbol].get(adj_key, [])
         if adj_fills:
             zone_levels_hit.add(adj_key)
             zone_fills_all.extend(adj_fills)
+            zone_fills_vtag.extend(adj_vtag)
 
     is_zone = len(zone_levels_hit) > 1
 
     # Try each window tier from tightest to widest
-    for window_sec, confidence in _ICE_WINDOWS:
-        window_cutoff = timestamp - window_sec
+    for window_sec, window_vol, confidence in _ICE_WINDOWS:
 
-        raw_fills = zone_fills_all if is_zone else list(tracker)
-        fills_in_window = [f for f in raw_fills if f[0] >= window_cutoff]
+        # ── Volume Clock windowing (primary) vs time-based (fallback) ──
+        if vclock.warm:
+            # window_vol is the multiplier (1, 3, 10): look back that many buckets
+            tau_cutoff = max(0, current_tau - window_vol)
+            raw_vtag = zone_fills_vtag if is_zone else list(vtag_tracker)
+            fills_in_window = [(t, v, s) for t, v, s, tau in raw_vtag if tau >= tau_cutoff]
+        else:
+            # Time-based fallback
+            window_cutoff = timestamp - window_sec
+            raw_fills = zone_fills_all if is_zone else list(tracker)
+            fills_in_window = [f for f in raw_fills if f[0] >= window_cutoff]
 
         # ── σ-adaptive thresholds (falls back to hardcoded during warmup) ──
         fill_sides = [f[2] for f in fills_in_window]
@@ -942,21 +1440,51 @@ def _detect_iceberg(symbol: str, price_str: str, volume: int,
             )
             if total_mkt_vol > 0:
                 stickiness = round(visible_total / max(total_mkt_vol, 1), 3)
-            # Override absorbing from stickiness if strong
-            if stickiness > 0.3:
+            # Empirical stickiness: track distribution and flag above P75
+            _STICKINESS_DIST[symbol].append(stickiness)
+            stick_vals = list(_STICKINESS_DIST[symbol])
+            if len(stick_vals) >= 30:
+                stick_vals_sorted = sorted(stick_vals)
+                p75_idx = int(len(stick_vals_sorted) * 0.75)
+                stickiness_threshold = stick_vals_sorted[p75_idx]
+            else:
+                stickiness_threshold = 0.3  # fallback during warmup
+            # Override absorbing from stickiness if empirically extreme
+            if stickiness > stickiness_threshold:
                 absorbing = True
 
 
         # ── Opposition volume & absorption ratio ──
         opp_side = "s" if fill_sides[0] == "b" else "b"
         opposition_vol = 0
+        # Split into bid-side and ask-side absorption for Ψ coefficient
+        bid_absorbed = 0  # Volume consumed at bid with no price decline
+        ask_absorbed = 0  # Volume consumed at ask with no price advance
         for offset in range(-_ICE_ZONE_TICKS, _ICE_ZONE_TICKS + 1):
             adj_price = round(price_f + offset * tick_size, 2)
             adj_key = str(adj_price)
             for ts_o, vol_o, s_o in _ICE_TRACKER[symbol].get(adj_key, []):
                 if s_o == opp_side and ts_o >= window_cutoff:
                     opposition_vol += vol_o
+                # Ψ calculation: classify absorbed volume by side
+                if ts_o >= window_cutoff:
+                    # Check if price moved after this fill
+                    future_prices = [p for t, p in _ICE_PRICE_HISTORY[symbol]
+                                     if ts_o < t <= ts_o + 2.0]
+                    if future_prices:
+                        price_after = future_prices[-1]
+                        if s_o == "b" and price_after <= adj_price:
+                            bid_absorbed += vol_o  # Buy absorbed, no advance
+                        elif s_o == "s" and price_after >= adj_price:
+                            ask_absorbed += vol_o  # Sell absorbed, no decline
         absorption_ratio = round(opposition_vol / max(visible_total, 1), 2)
+
+        # ── Dark Pool Absorption Coefficient (Ψ) — from State-Space spec ──
+        # Ψ = Σ V_bid(no decline) / Σ V_ask(no advance)
+        # Ψ > 1.0 → buy-side absorption dominance (passive institutional buying)
+        # Ψ < 1.0 → sell-side absorption dominance (passive institutional selling)
+        # Ψ ≈ 1.0 → balanced flow (no conviction)
+        psi = round(bid_absorbed / max(ask_absorbed, 1), 3)
 
         # ── Size rank (σ distance) ──
         size_rank = "retail"
@@ -972,13 +1500,51 @@ def _detect_iceberg(symbol: str, price_str: str, volume: int,
             elif sigma >= 1.0:
                 size_rank = "professional"
 
-        # ── Urgency score (0-1 composite) ──
+        # ── Prediction (Elite #6 — feeds into urgency) ──
+        prediction = _get_prediction(symbol, fill_sides[0])
+
+        # ── Urgency score (0-1 composite, outcome-weighted) ──
         time_factor = min(fill_rate / 2.0, 1.0)
         size_factor = min(avg_clip / max(avg_trade, 1), 1.0)
         remaining_factor = 1.0 - fill_pct
-        urgency = round(time_factor * 0.4 + size_factor * 0.3 + remaining_factor * 0.3, 3)
+        base_urgency = time_factor * 0.4 + size_factor * 0.3 + remaining_factor * 0.3
 
-        # ── Pressure signal (decision tree) ──
+        # Outcome-weighted adjustment: if historical win rate is known,
+        # boost urgency for high-accuracy sides, reduce for low-accuracy
+        outcome_modifier = 1.0
+        if prediction and prediction.get('sample_size', 0) >= 10:
+            wr = prediction.get('win_rate', 50.0)
+            if wr >= 65.0:
+                outcome_modifier = 1.15  # historically profitable side
+            elif wr <= 35.0:
+                outcome_modifier = 0.80  # historically losing side
+
+        # Cross-asset modifier: boost if GEX/MM/stop cluster aligns
+        cross_asset_modifier = 1.0
+        cross_context = None
+        if _cross_asset_provider:
+            try:
+                cross_context = _cross_asset_provider(symbol)
+                if cross_context:
+                    gex_factor = cross_context.get('gex_factor', 1.0)
+                    cross_asset_modifier *= gex_factor
+                    # If near a stop cluster on our side, boost urgency
+                    if cross_context.get('near_stop_cluster'):
+                        cluster_side = cross_context.get('stop_cluster_side', '')
+                        if (cluster_side == 'SELL' and fill_sides[0] == 's') or \
+                           (cluster_side == 'BUY' and fill_sides[0] == 'b'):
+                            cross_asset_modifier *= 1.2  # iceberg near relevant stop cluster
+                    # If MM withdrawal agrees with our direction, boost
+                    mm_bias = cross_context.get('mm_pull_bias', 0)
+                    if (mm_bias < 0 and fill_sides[0] == 's') or \
+                       (mm_bias > 0 and fill_sides[0] == 'b'):
+                        cross_asset_modifier *= 1.1  # MM consensus agrees
+            except Exception:
+                pass
+
+        urgency = round(min(1.0, base_urgency * outcome_modifier * cross_asset_modifier), 3)
+
+        # ── Pressure signal (decision tree + outcome-informed) ──
         if decay == "exhausting" and fill_pct > 0.5:
             pressure = "wall_exhausted"
         elif decay == "exhausting" and not absorbing:
@@ -991,6 +1557,13 @@ def _detect_iceberg(symbol: str, price_str: str, volume: int,
             pressure = "wall_fresh"
         else:
             pressure = "wall_active"
+
+        # Outcome-informed pressure override: if this side has <35% win rate,
+        # downgrade to "low_edge" regardless of other signals
+        if prediction and prediction.get('sample_size', 0) >= 15:
+            wr = prediction.get('win_rate', 50.0)
+            if wr <= 35.0 and pressure not in ('wall_exhausted', 'wall_breaking'):
+                pressure = 'low_edge_' + pressure
 
         # ── DOM cross-validation (Elite #1) ──
         dom_conf, dom_refill = _dom_cross_validate(symbol, price_str, volume, side)
@@ -1021,9 +1594,6 @@ def _detect_iceberg(symbol: str, price_str: str, volume: int,
         level_ice_count = level_mem.get("count", 0)
         level_avg_size = int(level_mem.get("avg_size", 0))
 
-        # ── Prediction (Elite #6) ──
-        prediction = _get_prediction(symbol, fill_sides[0])
-
         # ── Update wall state for gone detection ──
         wall_st = _ICE_WALL_STATE[symbol][price_str]
         wall_st["last_refill_ts"] = timestamp
@@ -1040,6 +1610,7 @@ def _detect_iceberg(symbol: str, price_str: str, volume: int,
             "cv": round(cv, 3),
             "confidence": final_confidence,
             "side": fill_sides[0],
+            "size_rank": size_rank,
             # Notional dollar value (real: clips × avg_clip × price × $20 NQ multiplier)
             "notional": round(visible_total * price_f * 20, 0),
             # Zone
@@ -1053,26 +1624,103 @@ def _detect_iceberg(symbol: str, price_str: str, volume: int,
             "stickiness": stickiness,
             "opposition_vol": opposition_vol,
             "absorption_ratio": absorption_ratio,
+            "psi": psi,  # Dark Pool Absorption Coefficient (Ψ)
             # DOM cross-validation (Elite #1)
             "dom_confirmed": dom_conf,
             "dom_refill": dom_refill,
             # Inter-fill timing (Elite #2)
             "gap_cv": gap_cv_val,
             "timing": timing_conf,
+            # Urgency + Pressure (now outcome-weighted)
+            "urgency": urgency,
+            "pressure": pressure,
+            "outcome_modifier": round(outcome_modifier, 2),
+            "cross_asset_modifier": round(cross_asset_modifier, 2),
             # Level memory (Elite #5)
             "level_ice_count": level_ice_count,
             "level_avg_size": level_avg_size,
-            # Prediction (Elite #6)
+            # Prediction (Elite #6 — now feeds back into urgency)
             "prediction": prediction,
+            # Cross-asset context (from EdgeDetector)
+            "cross_context": cross_context,
             # Regime + adaptive thresholds
             "regime": _CURRENT_REGIME,
             "adaptive": _rt.get("_adaptive", False),
             "adaptive_cv_threshold": _rt.get("ice_cv"),
             "adaptive_fill_threshold": _rt.get("ice_refill_count"),
+            # State-Space Engine: Kalman + Volume Clock
+            "kalman_cv": round(_KALMAN_CV[symbol].state, 4),
+            "kalman_P": round(_KALMAN_CV[symbol].P, 6),
+            "vclock_bucket": _VOLUME_CLOCKS[symbol].bucket_size,
+            "vclock_tau": _VOLUME_CLOCKS[symbol].tau,
+            # VPIN Toxicity
+            "vpin": round(_VPIN_ENGINES[symbol].vpin, 4) if _VPIN_ENGINES and symbol in _VPIN_ENGINES else 0,
+            "vpin_regime": _VPIN_ENGINES[symbol].get_regime_modifier() if _VPIN_ENGINES and symbol in _VPIN_ENGINES else 'NEUTRAL',
         }
-
-
         _update_level_memory(symbol, price_str, result)
+
+        # Record outcome at detection time — HIGH confidence only (audit: med/unknown = negative EV)
+        # + Dynamic directional filter: Volume Clock-scaled (replaces static 5-pt threshold)
+        if final_confidence == "high":
+            recent_prices = _ICE_PRICE_HISTORY[symbol]
+            counter_trend = False
+            if len(recent_prices) >= 10:
+                prices_30s = [(ts, px) for ts, px in recent_prices if timestamp - ts <= 30]
+                if len(prices_30s) >= 5:
+                    trend_move = prices_30s[-1][1] - prices_30s[0][1]
+
+                    # Dynamic threshold: scale with Volume Clock stress
+                    # When volume spikes (bucket_ratio > 1), threshold TIGHTENS
+                    # (less price movement needed to confirm trend)
+                    vclock = _VOLUME_CLOCKS[symbol]
+                    bucket_ma = sum(vclock._interval_volumes) / max(len(vclock._interval_volumes), 1) \
+                                if vclock._interval_volumes else vclock.bucket_size
+                    bucket_ratio = vclock.bucket_size / max(bucket_ma, 1)
+                    dynamic_threshold = 5.0 / max(bucket_ratio, 0.5)  # 5pt base, tighter when hot
+
+                    if abs(trend_move) > dynamic_threshold:
+                        trending_up = trend_move > 0
+                        signal_is_long = (side == "b")
+                        counter_trend = (trending_up and not signal_is_long) or \
+                                        (not trending_up and signal_is_long)
+
+            if not counter_trend:
+                # ── Phase 6 Alpha Filters ──
+                # Kill Filter: reset — previous combos calibrated on inverted direction.
+                # With corrected direction (side="s"→LONG, side="b"→SHORT), all prior
+                # combo PnL figures are sign-flipped. Re-derive from corrected OOS data.
+                _KILL_COMBOS: set = set()  # cleared pending recalibration
+                current_regime = result.get("regime", _CURRENT_REGIME)
+                if (current_regime, side) in _KILL_COMBOS:
+                    log.debug(f"[ALPHA-FILTER] KILLED {current_regime}+{side} "
+                              f"(negative EV combo)")
+                    return result
+
+                # CV Gate: low Kalman CV = noise — re-evaluate threshold with corrected data.
+                kalman_cv = _KALMAN_CV[symbol].state
+                if kalman_cv < 0.04 and _KALMAN_CV[symbol]._n > 250:
+                    log.debug(f"[ALPHA-FILTER] CV_GATE blocked (cv={kalman_cv:.4f} < 0.04)")
+                    return result
+
+                # Snapshot state vector at detection time for JSONL persistence
+                # CRITICAL: These must be captured NOW, not at persist time (T+60s)
+                sv = {
+                    "psi": result.get("psi", 0),
+                    "stickiness": result.get("stickiness", 0),
+                    "absorption_ratio": result.get("absorption_ratio", 0),
+                    "urgency": result.get("urgency", 0),
+                    "regime": result.get("regime", _CURRENT_REGIME),
+                    # Snapshot at detection time to avoid T+60s lookahead bias
+                    "kalman_cv_at_detect": round(_KALMAN_CV[symbol].state, 4),
+                    "kalman_P_at_detect": round(_KALMAN_CV[symbol].P, 6),
+                    "vclock_bucket_at_detect": _VOLUME_CLOCKS[symbol].bucket_size,
+                }
+                _record_iceberg_completion(
+                    symbol, price_f, side, timestamp,
+                    size_rank,
+                    final_confidence,
+                    state_vector=sv,
+                )
 
         return result
 
@@ -1539,8 +2187,8 @@ def _feed_candle(symbol: str, price: float, volume: int, timestamp: float,
                         }
                         try:
                             _socketio.emit("candle_update", candle_data, namespace="/")
-                        except Exception:
-                            pass  # don't let emit errors break the candle engine
+                        except Exception as e:
+                            logger.warning("candle_update emit failed: %s", e)
 
 
 def _freeze_candle(candle: dict) -> dict:
@@ -1598,6 +2246,9 @@ def get_candles(symbol: str, tf: str) -> list:
         cur = _CURRENT_CANDLE.get(symbol, {}).get(tf)
         if cur:
             closed.append(_freeze_candle(cur))
+    # Crucial: the gap-fill fetches in reverse chronological order (Today, Yesterday, etc)
+    # Lightweight Charts strictly requires chronological data.
+    closed.sort(key=lambda c: c["t"])
     return closed
 
 # ── Shared signal store (read by server.py /api/l2 endpoint) ─────────────────
@@ -1978,6 +2629,7 @@ def get_l2_state() -> dict:
             "absorption":    {k: dict(v) for k, v in L2_STATE["absorption"].items()},
             "signals":       dict(L2_STATE["signals"]),
             "last_update":   float(L2_STATE["last_update"]),
+            "volume_clock":  {sym: vc.get_stats() for sym, vc in _VOLUME_CLOCKS.items()},
         }
     try:
         return _json.loads(_json.dumps(raw, default=str))
@@ -2042,7 +2694,9 @@ def on_dom_update(symbol: str, dom: dict):
         _reynolds.update(price=mid, spread=spr, volume=float(tot))
 
     with _L2_LOCK:
-        L2_STATE["dom"][symbol]        = dom
+        # Deep copy to prevent connector thread from mutating nested bids/asks
+        import copy as _copy
+        L2_STATE["dom"][symbol]        = _copy.deepcopy(dom)
         L2_STATE["imbalance"][symbol]  = imb
         L2_STATE["mid_prices"][symbol] = mid
         L2_STATE["last_update"]        = time.time()
@@ -2109,7 +2763,20 @@ def on_trade(symbol: str, trade: dict):
             ts = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
         except Exception:
             ts = time.time()
+    elif isinstance(ts, (int, float)):
+        # If it's a millisecond timestamp (e.g., from TopStepX JS JSON)
+        if ts > 20000000000:
+            ts = ts / 1000.0
     if price > 0:
+        # Track last trade timestamp for reconnect gap-fill
+        _LAST_TRADE_TS[symbol] = ts
+
+        # ── Volume Clock: tick on every trade (self-calibrating) ──
+        _VOLUME_CLOCKS[symbol].tick(vol, ts)
+
+        # ── VPIN: feed every trade for toxicity tracking ──
+        if _VPIN_ENGINES and symbol in ('NQ', '/NQ'):
+            _VPIN_ENGINES[symbol].on_trade(symbol, vol, side if side in ('b', 's') else 'n', ts)
         # ── Tick classification ──
         # Use the CME native aggressor flag from TopStepX's GatewayTrade event.
         # The exchange knows who initiated the trade — this is 100% accurate.
@@ -2151,6 +2818,12 @@ def on_trade(symbol: str, trade: dict):
                         if "icebergs" not in cur:
                             cur["icebergs"] = {}
                         cur["icebergs"][qp] = ice_hit
+            # Forward to EdgeDetector
+            if _detection_callback:
+                try:
+                    _detection_callback('iceberg', ice_hit, symbol)
+                except Exception:
+                    pass
 
         # Drifting iceberg detection (Elite #4)
         drift_hit = _detect_drifting_iceberg(symbol, price, vol, ts, side)
@@ -2160,6 +2833,12 @@ def on_trade(symbol: str, trade: dict):
                     cur = _CURRENT_CANDLE[symbol].get(tf)
                     if cur:
                         cur["drifting_iceberg"] = drift_hit
+            # Forward to EdgeDetector
+            if _detection_callback:
+                try:
+                    _detection_callback('drifting_iceberg', drift_hit, symbol)
+                except Exception:
+                    pass
 
         # Wall Gone detection (Elite #3)
         wall_gone_alerts = _check_wall_gone(symbol, ts)
@@ -2171,6 +2850,13 @@ def on_trade(symbol: str, trade: dict):
                         if "wall_gone" not in cur:
                             cur["wall_gone"] = []
                         cur["wall_gone"].extend(wall_gone_alerts)
+            # Forward each wall_gone alert to EdgeDetector
+            if _detection_callback:
+                for wg in wall_gone_alerts:
+                    try:
+                        _detection_callback('wall_gone', wg, symbol)
+                    except Exception:
+                        pass
 
         # Sweep detection
         sweep_hit = _detect_sweep(symbol, price, vol, ts, side)
@@ -2182,6 +2868,12 @@ def on_trade(symbol: str, trade: dict):
                         if "sweeps" not in cur:
                             cur["sweeps"] = []
                         cur["sweeps"].append(sweep_hit)
+            # Forward to EdgeDetector
+            if _detection_callback:
+                try:
+                    _detection_callback('sweep', sweep_hit, symbol)
+                except Exception:
+                    pass
 
         # Momentum Ignition detection
         ign_hit = _detect_ignition(symbol, price, vol, ts, side)
@@ -2223,13 +2915,22 @@ def on_trade(symbol: str, trade: dict):
     # ── Emit trade tick via Socket.IO ──
     if _socketio is not None and price > 0:
         try:
+            from datetime import datetime
+            iso_ts = datetime.utcfromtimestamp(ts).isoformat() + "Z"
             _socketio.emit("trade_tick", {
                 "symbol": symbol,
                 "price": price,
                 "volume": vol,
                 "side": side,
-                "timestamp": ts,
+                "timestamp": iso_ts,
             }, namespace="/")
+        except Exception:
+            pass
+
+    # ── Score trade for tape glow (EdgeDetector regime-adaptive percentile) ──
+    if _trade_score_callback is not None and price > 0 and vol > 0:
+        try:
+            _trade_score_callback(symbol, vol, side, price, ts)
         except Exception:
             pass
 
@@ -2297,6 +2998,55 @@ def _heavy_compute_loop():
             log.warning("Heavy compute loop error: %s", e)
 
 
+# ── L2 State WebSocket Push (replaces frontend REST polling) ────────────────
+_L2_PUSH_INTERVAL = 0.4  # 400ms — faster than old 500ms REST poll
+
+def _l2_push_loop():
+    """Push L2 state via Socket.IO every 400ms.
+    Only sends data NOT already covered by other WS events:
+    - DOM bids/asks → covered by dom_snapshot (don't duplicate)
+    - trades → covered by trade_tick (don't duplicate)
+    - absorption → covered by dom_snapshot (don't duplicate)
+    We DO send: dom metadata (mid/best_bid/ask/imbalance), signals, connected status."""
+    import json as _json
+    import time as _time
+    while True:
+        _time.sleep(_L2_PUSH_INTERVAL)
+        if _socketio is None:
+            continue
+        try:
+            with _L2_LOCK:
+                # Build a LEAN state — only what other events don't cover
+                dom_meta = {}
+                for k, v in L2_STATE["dom"].items():
+                    if isinstance(v, dict):
+                        dom_meta[k] = {
+                            "bids": dict(v.get("bids", {})) if isinstance(v.get("bids"), dict) else {},
+                            "asks": dict(v.get("asks", {})) if isinstance(v.get("asks"), dict) else {},
+                            "best_bid": v.get("best_bid", 0),
+                            "best_ask": v.get("best_ask", 0),
+                            "mid_price": v.get("mid_price", 0),
+                            "spread": v.get("spread", 0),
+                            "bid_total": v.get("bid_total", 0),
+                            "ask_total": v.get("ask_total", 0),
+                            "imbalance": v.get("imbalance", 0),
+                        }
+                state = {
+                    "connected":     bool(L2_STATE["connected"]),
+                    "dom":           dom_meta,
+                    "imbalance":     {k: float(v) for k, v in L2_STATE["imbalance"].items()},
+                    "mid_prices":    {k: float(v) for k, v in L2_STATE["mid_prices"].items()},
+                    "absorption":    {},  # covered by dom_snapshot
+                    "signals":       dict(L2_STATE["signals"]),
+                    "last_update":   float(L2_STATE["last_update"]),
+                }
+                # JSON round-trip inside the lock = thread-safe deep copy
+                payload = _json.loads(_json.dumps(state, default=str))
+            _socketio.emit("l2_update", payload, namespace="/")
+        except Exception as e:
+            log.debug("l2_push_loop emit error: %s", e)
+
+
 # ── Public API ───────────────────────────────────────────────────────────────
 
 _connector: TopStepXConnector = None
@@ -2330,6 +3080,116 @@ def start_l2_worker() -> TopStepXConnector:
         on_quote=on_quote,
     )
 
+    # Store reference for gap-fill access
+    global _connector_ref
+    _connector_ref = _connector
+
+    # ── Gap-fill function: called after reconnect to fill missed candles ──
+    def _gap_fill_candles(connector, symbols):
+        """Fetch missed candles from TopStepX history API and insert into candle engine.
+        Called after TopStepX WebSocket reconnects to fill any gap from the disconnect."""
+        import traceback
+        from datetime import datetime, timezone
+        for sym in symbols:
+            last_ts = _LAST_TRADE_TS.get(sym, 0)
+            if last_ts == 0:
+                continue  # no trades ever recorded, skip
+            gap_seconds = time.time() - last_ts
+            if gap_seconds < 10:
+                continue  # gap too small, nothing to fill
+            if gap_seconds > 3600:
+                gap_seconds = 3600  # cap at 1 hour to avoid huge requests
+            cid = connector._symbol_to_contract.get(sym)
+            if not cid:
+                log.warning("Gap-fill: no contract ID for %s — skipping", sym)
+                continue
+            start_iso = datetime.fromtimestamp(last_ts, tz=timezone.utc).isoformat()
+            log.info("Gap-fill: %s fetching bars from %s (%.0fs gap)...",
+                     sym, start_iso, gap_seconds)
+            try:
+                bars = connector.retrieve_bars(
+                    cid, start_time=start_iso,
+                    unit=2, unit_number=1, limit=500
+                )
+                if not bars:
+                    log.info("Gap-fill: %s — no bars returned", sym)
+                    continue
+                inserted = 0
+                for bar in bars:
+                    ts_str = bar.get("t", "")
+                    try:
+                        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                        if dt.tzinfo is None:
+                            from datetime import timezone
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        ts = dt.timestamp()
+                    except Exception:
+                        continue
+                    o = float(bar.get("o", 0))
+                    h = float(bar.get("h", 0))
+                    l = float(bar.get("l", 0))
+                    c = float(bar.get("c", 0))
+                    v = int(bar.get("v", 0))
+                    if o <= 0:
+                        continue
+                    # Only insert bars AFTER our last known trade
+                    boundary_1m = _candle_boundary(ts, 60)
+                    if boundary_1m <= _candle_boundary(last_ts, 60):
+                        continue  # we already have this candle
+                    with _CANDLE_LOCK:
+                        _CANDLES[sym]["1m"].append({
+                            "t": boundary_1m,
+                            "o": o, "h": h, "l": l, "c": c, "v": v
+                        })
+                        # Also aggregate into larger timeframes
+                        for tf, secs in CANDLE_TIMEFRAMES.items():
+                            if tf == "1m" or secs < 60:
+                                continue
+                            boundary = _candle_boundary(ts, secs)
+                            cur = _CURRENT_CANDLE[sym].get(tf)
+                            if cur is None or cur["t"] != boundary:
+                                if cur is not None:
+                                    _CANDLES[sym][tf].append(dict(cur))
+                                _CURRENT_CANDLE[sym][tf] = {
+                                    "t": boundary, "o": o, "h": h,
+                                    "l": l, "c": c, "v": v
+                                }
+                            else:
+                                cur["h"] = max(cur["h"], h)
+                                cur["l"] = min(cur["l"], l)
+                                cur["c"] = c
+                                cur["v"] += v
+                    inserted += 1
+                    # Update last trade TS so next gap-fill starts from here
+                    _LAST_TRADE_TS[sym] = max(_LAST_TRADE_TS.get(sym, 0), ts)
+                log.info("Gap-fill: %s ✓ inserted %d bars (of %d fetched)",
+                         sym, inserted, len(bars))
+                # Push updated candles to frontend
+                if _socketio is not None:
+                    try:
+                        candles_1m = list(_CANDLES[sym]["1m"])
+                        _socketio.emit("candle_history", {
+                            "symbol": sym, "tf": "1m",
+                            "candles": candles_1m[-50:]  # send last 50 to refresh view
+                        }, namespace="/")
+                        log.info("Gap-fill: %s pushed %d candles to frontend",
+                                 sym, min(50, len(candles_1m)))
+                    except Exception as e:
+                        log.warning("Gap-fill: emit failed: %s", e)
+            except Exception as e:
+                log.warning("Gap-fill: %s FAILED: %s\n%s", sym, e, traceback.format_exc())
+
+    # Register reconnect callback on the connector
+    _original_on_open = _connector._on_open
+    def _on_reconnect_with_gapfill(contract_ids):
+        _original_on_open(contract_ids)
+        # Run gap-fill in a separate thread to avoid blocking WebSocket
+        def _do_gapfill():
+            time.sleep(3)  # wait for connection to stabilize
+            _gap_fill_candles(_connector, SYMBOLS)
+        threading.Thread(target=_do_gapfill, daemon=True, name="GapFill").start()
+    _connector._on_open = _on_reconnect_with_gapfill
+
     try:
         _connector.start(symbols=SYMBOLS)
         with _L2_LOCK:
@@ -2342,6 +3202,13 @@ def start_l2_worker() -> TopStepXConnector:
         )
         _heavy_thread.start()
         log.info("L2 worker: heavy framework pre-compute loop started (60s interval)")
+
+        # Start L2 state WebSocket push loop (replaces frontend REST polling)
+        _l2_push_thread = threading.Thread(
+            target=_l2_push_loop, daemon=True, name="L2Push"
+        )
+        _l2_push_thread.start()
+        log.info("L2 worker: WebSocket push loop started (%.0fms interval)", _L2_PUSH_INTERVAL * 1000)
 
         # Backfill price history + candle chart from retrieveBars API
         def _backfill():
@@ -2439,8 +3306,12 @@ def start_l2_worker() -> TopStepXConnector:
                     for bar in bars:
                         ts_str = bar.get("t", "")
                         try:
-                            ts = dt.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
-                        except Exception:
+                            dt_obj = dt.fromisoformat(ts_str.replace("Z", "+00:00"))
+                            if dt_obj.tzinfo is None:
+                                from datetime import timezone
+                                dt_obj = dt_obj.replace(tzinfo=timezone.utc)
+                            ts = dt_obj.timestamp()
+                        except Exception as e:
                             continue
                         o = float(bar.get("o", 0))
                         h = float(bar.get("h", 0))

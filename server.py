@@ -649,6 +649,47 @@ def _schwab_refresh():
     print("[Schwab] Token refreshed OK")
 
 
+# ── Background auto-refresh thread ──────────────────────────────────────────
+# Proactively refreshes every 25 min (5 min before 30-min expiry).
+# Keeps the refresh token chain alive — Schwab issues a new refresh token on
+# each successful refresh, so the 7-day refresh token never goes stale.
+def _schwab_auto_refresh_loop():
+    """Background daemon: refresh Schwab tokens every 25 minutes."""
+    import time as _t
+    INTERVAL = 25 * 60  # 25 minutes
+    RETRY_INTERVAL = 2 * 60  # retry after 2 min on failure
+    # Initial delay: wait 30s for server startup to settle
+    _t.sleep(30)
+    while True:
+        try:
+            with _schwab_lock:
+                tokens = _schwab_load_tokens()
+                expiry = tokens.get("token_expiry", 0)
+                # Only refresh if we actually have tokens
+                if tokens.get("refresh_token"):
+                    # Refresh if within 5 min of expiry or already expired
+                    if _t.time() > expiry - 300:
+                        _schwab_refresh()
+                        print(f"[Schwab] ⟳ Auto-refresh OK at {_t.strftime('%H:%M:%S')}")
+                    else:
+                        remaining = int(expiry - _t.time())
+                        print(f"[Schwab] Token still valid ({remaining}s remaining), skipping refresh")
+        except Exception as e:
+            print(f"[Schwab] ⚠ Auto-refresh failed: {e}")
+            # Retry sooner on failure
+            _t.sleep(RETRY_INTERVAL)
+            try:
+                with _schwab_lock:
+                    _schwab_refresh()
+                print(f"[Schwab] ⟳ Auto-refresh retry OK at {_t.strftime('%H:%M:%S')}")
+            except Exception as e2:
+                print(f"[Schwab] ❌ Auto-refresh retry also failed: {e2}")
+        _t.sleep(INTERVAL)
+
+_schwab_refresh_thread = threading.Thread(target=_schwab_auto_refresh_loop, daemon=True)
+_schwab_refresh_thread.start()
+
+
 def _schwab_get(endpoint, params=None):
     """Authenticated GET to Schwab API with auto-refresh."""
     import requests as _req
@@ -686,19 +727,24 @@ def _schwab_quote(ticker):
 
 
 def _schwab_expirations(ticker):
-    """Get options expirations from Schwab. Returns list of date strings."""
+    """Get options expirations from Schwab. Returns list of date strings.
+    Filters out expired dates (before today) to avoid 400 errors."""
+    from datetime import date as _date
     data = _schwab_get("/marketdata/v1/expirationchain", {"symbol": ticker})
     raw = data.get("expirationList", [])
+    today_str = _date.today().isoformat()  # e.g. '2026-04-01'
     result = []
     for exp in raw:
         d = exp.get("expirationDate")
-        if d:
+        if d and d >= today_str:  # only keep today or future
             result.append(d)
     return result
 
 
 def _schwab_chain_raw(ticker, exp_date):
-    """Get options chain from Schwab for one expiration. Returns flattened list of option dicts."""
+    """Get options chain from Schwab for one expiration. Returns flattened list of option dicts.
+    Enriched with: mark, high, low, open, theoreticalOptionValue, theoreticalVolatility,
+    markChange, tradeTimeInLong for institutional-grade analysis."""
     data = _schwab_get("/marketdata/v1/chains", {
         "symbol": ticker,
         "contractType": "ALL",
@@ -730,6 +776,15 @@ def _schwab_chain_raw(ticker, exp_date):
                         "in_the_money":   c.get("inTheMoney", False),
                         "dte":            c.get("daysToExpiration", 0),
                         "symbol":         c.get("symbol", ""),
+                        # ── Enriched fields (Phase 2) ──
+                        "mark":             c.get("mark", 0),              # Schwab-computed fair mark
+                        "high":             c.get("highPrice", 0),         # Intraday high
+                        "low":              c.get("lowPrice", 0),          # Intraday low
+                        "open":             c.get("openPrice", 0),         # Day's open
+                        "theo_value":       c.get("theoreticalOptionValue", 0),  # Model price
+                        "theo_vol":         c.get("theoreticalVolatility", 0),   # Model IV
+                        "mark_change":      c.get("markChange", 0),        # Premium change
+                        "trade_time":       c.get("tradeTimeInLong", 0),   # Last trade epoch ms
                     })
     return options, data.get("underlyingPrice", 0)
 
@@ -778,7 +833,9 @@ def api_chain():
             futures_mid = get_l2_state().get("mid_prices", {}).get("NQ", 0)
         except Exception:
             futures_mid = 0
-        ratio = futures_mid / spot if (futures_mid > 0 and spot > 0) else 40.0  # NQ/QQQ ≈ 40
+        ratio = futures_mid / spot if (futures_mid > 0 and spot > 0) else 0
+        if ratio <= 0:
+            print(f"[api/chain] ⚠️ No live NQ/QQQ ratio — NQ$ mapping disabled")
 
         # ── Get active iceberg levels from L2 detection ──
         active_iceberg_levels = set()
@@ -864,6 +921,13 @@ def api_chain():
                 "pc_ratio": pc_ratio,
                 "gex":      gex,
                 "iceberg":  ice_active,
+                # ── Enriched fields (Phase 2) ──
+                "mark":        round(float(opt.get("mark") or 0), 4),
+                "high":        round(float(opt.get("high") or 0), 4),
+                "low":         round(float(opt.get("low") or 0), 4),
+                "theo":        round(float(opt.get("theo_value") or 0), 4),
+                "mark_chg":    round(float(opt.get("mark_change") or 0), 4),
+                "mispriced":   abs(float(opt.get("mark") or 0) - float(opt.get("theo_value") or 0)) > 0.05 * max(float(opt.get("theo_value") or 1), 0.01) if opt.get("theo_value") else False,
             })
 
         # ── Top GEX levels (for gamma wall lines on chart) ──
@@ -909,6 +973,11 @@ def api_chain():
         return jsonify({"error": str(e)}), 500
 
 
+_walls_cache = {}
+_walls_locks = {}
+_walls_meta_lock = _threading.Lock()
+_WALLS_TTL = 28
+
 @app.route("/api/walls")
 def api_walls():
     """Put/call wall + max pain — supports NQ (via QQQ) and GC (via GLD).
@@ -926,6 +995,27 @@ def api_walls():
     futures_sym = request.args.get("symbol", "NQ").upper()
     FUTURES_TO_UNDERLYING = {"NQ": "QQQ", "GC": "GLD"}
     ticker = request.args.get("ticker", FUTURES_TO_UNDERLYING.get(futures_sym, "QQQ")).upper()
+
+    cache_key = f"{ticker}_{futures_sym}"
+    with _walls_meta_lock:
+        cached = _walls_cache.get(cache_key)
+        if cached and _t.time() - cached[1] < _WALLS_TTL:
+            return jsonify(cached[0])
+        evt = _walls_locks.get(cache_key)
+        if evt is None:
+            evt = _threading.Event()
+            _walls_locks[cache_key] = evt
+            leader = True
+        else:
+            leader = False
+
+    if not leader:
+        evt.wait(timeout=30)
+        with _walls_meta_lock:
+            cached = _walls_cache.get(cache_key)
+        if cached:
+            return jsonify(cached[0])
+        # If it timed out or failed, we fall through and fetch it anyway
 
     try:
         import numpy as np
@@ -960,7 +1050,14 @@ def api_walls():
         agg_put_oi  = {}
         all_strikes = set()
         spot = 0
-        r = 0.05
+        # Risk-free rate — use live 13-week T-bill yield ($IRX.X), never hardcode
+        r = 0.045  # sensible init; overwritten below if live data available
+        try:
+            irx_price = _schwab_quote("$IRX")
+            if irx_price and irx_price > 0:
+                r = irx_price / 100.0  # $IRX quotes in % (e.g. 4.5 → 0.045)
+        except Exception:
+            pass  # keep sensible init if quote fails
         all_ivs = []
 
         # Per-strike greek accumulators (weighted)
@@ -1020,11 +1117,8 @@ def api_walls():
                 otype = opt["option_type"]
                 all_strikes.add(strike)
 
-                # 0DTE volume hybrid: intraday volume IS today's positioning
-                if dte <= 1:
-                    effective_oi = oi + (vol * 0.5)
-                else:
-                    effective_oi = float(oi)
+                # Pure OI — no made-up volume adjustment factor
+                effective_oi = float(oi)
 
                 w_oi = effective_oi * w
 
@@ -1167,11 +1261,16 @@ def api_walls():
                 ratio = _cached_ratio[futures_sym]
                 conversion_tier = 3
 
-        # Tier 4: Hardcoded fallback
-        DEFAULT_RATIOS = {"NQ": 41.5, "GC": 14.0}
+        # Tier 4: No data available — refuse to guess
         if ratio == 0:
-            ratio = DEFAULT_RATIOS.get(futures_sym, 1.0)
-            conversion_tier = 4
+            print(f"[api/walls] ❌ No live ratio data for {futures_sym} — cannot convert levels")
+            with _walls_meta_lock:
+                _walls_locks.pop(cache_key, None)
+            try:
+                evt.set()
+            except Exception:
+                pass
+            return jsonify({"error": f"No live NQ/QQQ ratio available. Tiers 1-3 all failed."}), 503
 
         # Cache successful ratio for tier 3 future fallback
         if conversion_tier <= 2:
@@ -1223,13 +1322,26 @@ def api_walls():
             "qqq_max_pain":          underlying_max_pain if ticker == "QQQ" else None,
             "nq_mid":                futures_mid if futures_sym == "NQ" else None,
         }
-        tier_names = {1: 'L2+Chain', 2: 'NDX bridge', 3: 'cached', 4: 'fallback'}
+        tier_names = {1: 'L2+Chain', 2: 'NDX bridge', 3: 'cached'}  # no tier 4 — we refuse, not guess
         print(f"[api/walls] {ticker} PW={underlying_put_wall} CW={underlying_call_wall} "
               f"MP={underlying_max_pain} GF={underlying_gamma_flip:.1f} | "
               f"{futures_sym} r={ratio:.2f} T{conversion_tier}({tier_names.get(conversion_tier,'?')}) | "
               f"{len(exp_dates)} expirations | {freshness} {data_age:.1f}s")
+        with _walls_meta_lock:
+            _walls_cache[cache_key] = (result, _t.time())
+            _walls_locks.pop(cache_key, None)
+        try:
+            evt.set()
+        except Exception:
+            pass
         return jsonify(result)
     except Exception as e:
+        with _walls_meta_lock:
+            _walls_locks.pop(cache_key, None)
+        try:
+            evt.set()
+        except Exception:
+            pass
         import traceback
         print(f"[api/walls] Error: {e}\n{traceback.format_exc()}")
         return jsonify({"error": str(e)}), 500
@@ -1297,48 +1409,31 @@ def api_data():
         if nq_mid > 0 and qqq_spot > 0:
             ratio = nq_mid / qqq_spot
         else:
-            ratio = 40.0  # fallback approximation
+            # No live ratio data — refuse to guess
+            ratio = 0
+            print(f"[api/data] ⚠️ No live NQ/QQQ ratio — wall conversion skipped")
         # Preserve QQQ values for toolbar display
         result["qqq_spot"] = qqq_spot
         result["qqq_put_wall"] = result["put_wall"]
         result["qqq_call_wall"] = result["call_wall"]
         result["qqq_max_pain"] = result["max_pain"]
         result["nq_mid"] = nq_mid
-        result["ratio"] = round(ratio, 4)
-        # Overwrite wall prices with NQ-equivalent for chart lines
-        result["put_wall"] = round(result["qqq_put_wall"] * ratio, 2)
-        result["call_wall"] = round(result["qqq_call_wall"] * ratio, 2)
-        result["max_pain"] = round(result["qqq_max_pain"] * ratio, 2)
+        result["ratio"] = round(ratio, 4) if ratio > 0 else 0
+        # Overwrite wall prices with NQ-equivalent ONLY if live ratio available
+        if ratio > 0:
+            result["put_wall"] = round(result["qqq_put_wall"] * ratio, 2)
+            result["call_wall"] = round(result["qqq_call_wall"] * ratio, 2)
+            result["max_pain"] = round(result["qqq_max_pain"] * ratio, 2)
     except Exception as e:
         print(f"[api/data] NQ conversion warning: {e}")
 
-    # ── Update iceberg detection regime from options data ──
-    try:
-        from background_engine.l2_worker import update_regime
-        # Total net GEX from all strikes
-        total_gex = sum(data["gex"]["net_gex"].values())
-        # Gamma flip: find where cumulative net GEX crosses zero
-        net_gex = data["gex"]["net_gex"]
-        sorted_strikes = sorted(net_gex.keys())
-        gamma_flip = data["spot"]  # default to spot if no flip found
-        for i in range(1, len(sorted_strikes)):
-            s0, s1 = sorted_strikes[i-1], sorted_strikes[i]
-            if net_gex[s0] * net_gex[s1] < 0:  # sign change
-                ratio_gf = abs(net_gex[s0]) / (abs(net_gex[s0]) + abs(net_gex[s1]))
-                gamma_flip = s0 + ratio_gf * (s1 - s0)
-                break
-        # Use NQ-equivalent if available, otherwise QQQ
-        nq_ratio = result.get("ratio", 1.0)
-        update_regime(
-            spot=result.get("nq_mid", data["spot"]) or data["spot"],
-            gamma_flip=gamma_flip * nq_ratio,
-            total_gex=total_gex,
-            call_wall=result.get("call_wall", data["gex"]["call_wall"] * nq_ratio),
-            put_wall=result.get("put_wall", data["gex"]["put_wall"] * nq_ratio),
-        )
-    except Exception as e:
-        print(f"[api/data] Regime update warning: {e}")
+    # ── Regime update: handled by schwab_bridge WS (single source of truth) ──
+    # Previously this path computed gamma_flip from data["gex"]["net_gex"] which
+    # differs from the schwab_bridge WS computation → regime contradiction.
+    # Now schwab_bridge calls update_regime() every time zones are emitted,
+    # so l2_worker and edge_detector share the same flip level.
     return jsonify(result)
+
 
 @app.route("/api/vol_skew_multi")
 def api_vol_skew_multi():
@@ -1618,6 +1713,47 @@ def api_volatility():
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route("/api/flow")
+def api_flow():
+    """Real-time flow classification scores from FlowClassifier (L2 book analysis)."""
+    try:
+        from background_engine.schwab_bridge import _flow_classifier
+        if _flow_classifier is None:
+            return jsonify({"error": "Flow classifier not initialized"}), 503
+        reports = _flow_classifier.get_all_reports()
+        return jsonify(reports)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+
+@app.route("/api/edge")
+def api_edge():
+    """EdgeDetector rolling distribution stats."""
+    try:
+        from background_engine.schwab_bridge import _edge_detector
+        if _edge_detector is None:
+            return jsonify({"error": "Edge detector not initialized"}), 503
+        return jsonify(_edge_detector.get_stats_report())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/mm")
+def api_mm():
+    """MMTracker venue report."""
+    try:
+        import background_engine.schwab_bridge as sb
+        if getattr(sb, '_mm_tracker', None) is None:
+            return jsonify({"error": "MM tracker not initialized"}), 503
+        return jsonify({
+            "report": sb._mm_tracker.get_venue_report("QQQ"),
+            "stats": sb._mm_tracker.get_stats_report()
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route("/api/vol_stats")
 def api_vol_stats():
@@ -2226,16 +2362,149 @@ def api_l2_status():
         return jsonify({"error": str(e)}), 500
 
 
+# ── Alpha Engine Dashboard API ────────────────────────────────────────────────
+@app.route("/api/alpha")
+def api_alpha():
+    """Phase 7 Alpha Engine — real-time stats from iceberg_outcomes.jsonl."""
+    import json as _json, time as _t
+    try:
+        from background_engine.l2_worker import (
+            _KALMAN_CV, _VOLUME_CLOCKS, _CURRENT_REGIME, _ICE_PENDING
+        )
+
+        log_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "logs", "iceberg_outcomes.jsonl"
+        )
+
+        signals = []
+        if os.path.exists(log_path):
+            lines = open(log_path).readlines()
+            for line in lines[-500:]:
+                if line.strip() and line.startswith('{'):
+                    try:
+                        signals.append(_json.loads(line))
+                    except:
+                        pass
+
+        nq_high = [s for s in signals
+                    if s.get('symbol') == 'NQ'
+                    and s.get('confidence') == 'high'
+                    and s.get('mfe_30s') is not None]
+
+        total = len(nq_high)
+        wins = sum(1 for s in nq_high if s.get('outcome_30s', 0) > 0)
+        net_pnl = round(sum(s.get('outcome_30s', 0) for s in nq_high), 2)
+        gross_win = sum(s.get('outcome_30s', 0) for s in nq_high if s.get('outcome_30s', 0) > 0)
+        gross_loss = abs(sum(s.get('outcome_30s', 0) for s in nq_high if s.get('outcome_30s', 0) < 0))
+        pf = round(gross_win / max(gross_loss, 0.01), 2)
+        wr = round(wins / max(total, 1) * 100, 1)
+        avg_mfe = round(sum(abs(s.get('mfe_30s', 0)) for s in nq_high) / max(total, 1), 2)
+        avg_mae = round(sum(abs(s.get('mae_30s', 0)) for s in nq_high) / max(total, 1), 2)
+
+        KILL_COMBOS = {
+            ('long_gamma_stable', 's'), ('transition', 'b'), ('short_gamma_volatile', 'b')
+        }
+        killed_count = sum(1 for s in signals
+                          if (s.get('regime', ''), s.get('side', '')) in KILL_COMBOS)
+        cv_blocked = sum(1 for s in nq_high if s.get('kalman_cv', 1) < 0.04)
+
+        regime_stats = {}
+        for s in nq_high:
+            r = s.get('regime', 'unknown')
+            if r not in regime_stats:
+                regime_stats[r] = {'count': 0, 'wins': 0, 'pnl': 0}
+            regime_stats[r]['count'] += 1
+            if s.get('outcome_30s', 0) > 0:
+                regime_stats[r]['wins'] += 1
+            regime_stats[r]['pnl'] = round(regime_stats[r]['pnl'] + s.get('outcome_30s', 0), 2)
+        for r in regime_stats:
+            regime_stats[r]['wr'] = round(
+                regime_stats[r]['wins'] / max(regime_stats[r]['count'], 1) * 100, 1)
+
+        nq_cv = round(_KALMAN_CV['NQ'].state, 4) if 'NQ' in _KALMAN_CV else 0
+        nq_cv_n = _KALMAN_CV['NQ']._n if 'NQ' in _KALMAN_CV else 0
+        current_dsl = round(max(3.0, nq_cv * 100), 2)
+        pending_count = len(_ICE_PENDING.get('NQ', []))
+
+        vpin_val = 0
+        vpin_regime = 'N/A'
+        try:
+            from background_engine.l2_worker import _VPIN_ENGINES
+            if 'NQ' in _VPIN_ENGINES:
+                vpin_val = round(_VPIN_ENGINES['NQ'].vpin, 4)
+                vpin_regime = _VPIN_ENGINES['NQ'].get_regime_modifier()
+        except:
+            pass
+
+        recent = []
+        for s in nq_high[-15:]:
+            recent.append({
+                'ts': s.get('ts_human', ''),
+                'side': 'LONG' if s.get('side') == 'b' else 'SHORT',
+                'price': s.get('price', 0),
+                'outcome': s.get('outcome_30s', 0),
+                'mfe': round(abs(s.get('mfe_30s', 0)), 2),
+                'mae': round(abs(s.get('mae_30s', 0)), 2),
+                'regime': s.get('regime', ''),
+                'cv': s.get('kalman_cv', 0),
+                'dsl': s.get('dynamic_sl', 0),
+                'dsl_hit': s.get('dynamic_sl_hit', False),
+                'win': s.get('outcome_30s', 0) > 0,
+            })
+
+        dsl_pnl = 0
+        dsl_wins = 0
+        for s in nq_high:
+            mae = abs(s.get('mae_30s', 0))
+            cv = s.get('kalman_cv', 0.05)
+            sl = max(3.0, cv * 100)
+            if mae >= sl:
+                dsl_pnl += -sl
+            else:
+                outcome = s.get('outcome_30s', 0)
+                dsl_pnl += outcome
+                if outcome > 0:
+                    dsl_wins += 1
+        dsl_pnl = round(dsl_pnl, 2)
+        dsl_wr = round(dsl_wins / max(total, 1) * 100, 1)
+
+        return jsonify({
+            'engine': 'Phase 7 — Alpha Engine v2',
+            'regime': _CURRENT_REGIME,
+            'kalman_cv': nq_cv,
+            'kalman_n': nq_cv_n,
+            'kalman_warm': nq_cv_n > 250,
+            'dynamic_sl': current_dsl,
+            'vpin': vpin_val,
+            'vpin_regime': vpin_regime,
+            'pending_trades': pending_count,
+            'stats': {
+                'total': total, 'wins': wins, 'win_rate': wr,
+                'net_pnl': net_pnl, 'profit_factor': pf,
+                'avg_mfe': avg_mfe, 'avg_mae': avg_mae,
+            },
+            'dynamic_sl_sim': {'pnl': dsl_pnl, 'win_rate': dsl_wr},
+            'filters': {'killed_combos': killed_count, 'cv_blocked': cv_blocked},
+            'regime_breakdown': regime_stats,
+            'recent_trades': list(reversed(recent)),
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+
 # ── Background workers (run under BOTH gunicorn and direct execution) ─────────
 import threading as _startup_threading
 
 _workers_started = False
+_startup_lock = _startup_threading.Lock()
 
 def _start_workers():
     global _workers_started
-    if _workers_started:
-        return
-    _workers_started = True
+    with _startup_lock:
+        if _workers_started:
+            return
+        _workers_started = True
 
     # Pre-warm options cache
     def _prewarm():

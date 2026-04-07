@@ -8,3 +8,4 @@ yfinance>=0.2.40
 python-dotenv>=1.0.0
 signalrcore>=0.9.5
 websocket-client>=1.6.0
+aiohttp>=3.9.0
