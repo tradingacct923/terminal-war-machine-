@@ -32,6 +32,13 @@ _gex_dirty = False       # Flag: has GEX data changed since last emit?
 _last_zone_emit = 0.0    # Timestamp of last zone_update emission
 _ndx_option_symbols = [] # List of subscribed NDX option symbols
 
+# ── Dealer session flow tracking ────────────────────────────────────────────
+_session_dealer_buys = 0.0
+_session_dealer_sells = 0.0
+_prev_nq_for_hedge = 0.0
+_hedge_wave_count = 0
+_last_hedge_dir = 0       # +1 buying, -1 selling, 0 neutral
+
 
 def set_socketio(sio):
     """Inject the Flask-SocketIO instance from server.py."""
@@ -82,6 +89,7 @@ def _run_bridge():
         _streamer.on('CHART_FUTURES', _on_chart_candle)
         _streamer.on('CHART_EQUITY', _on_chart_candle)
         _streamer.on('NASDAQ_BOOK', _on_nasdaq_book)
+        _streamer.on('NYSE_BOOK', _on_nyse_book)
         _streamer.on('SCREENER_OPTION', _on_screener_option)
 
         # Initialize FlowClassifier — attaches to NASDAQ_BOOK/OPTIONS_BOOK callbacks
@@ -167,6 +175,10 @@ def _run_bridge():
         # Subscribe to QQQ equity L2 book (NASDAQ_BOOK)
         _streamer.subscribe_nasdaq_book(['QQQ'])
         print("[SCHWAB-BRIDGE] Subscribed to NASDAQ_BOOK for QQQ")
+
+        # Subscribe to SPY equity L2 book (NYSE_BOOK) — cross-market divergence
+        _streamer.subscribe_nyse_book(['SPY'])
+        print("[SCHWAB-BRIDGE] Subscribed to NYSE_BOOK for SPY")
 
         # Subscribe to options screener (volume-based unusual activity)
         try:
@@ -267,6 +279,19 @@ _tick_count = 0
 _nq_price_history = []  # [(timestamp, price)] — for intraday realized vol
 _nq_rv_last_sample = 0.0  # timestamp of last RV sample
 _nq_realized_vol = 0.0    # current intraday RV (annualized %)
+_last_option_update_ts = 0.0  # timestamp of most recent option quote from Schwab
+
+
+def _get_nq_mid():
+    """Get best available NQ price: TopStepX L2 (fastest) → Schwab futures → 0."""
+    try:
+        from background_engine.l2_worker import L2_STATE
+        nq = L2_STATE["mid_prices"].get("NQ", 0)
+        if nq > 0:
+            return nq
+    except Exception:
+        pass
+    return _latest_nq if _latest_nq > 0 else 0
 
 
 def _on_futures_quote(data):
@@ -392,6 +417,35 @@ def _on_equity_quote(data):
             except Exception:
                 pass
 
+    # Emit venue-tagged equity trade for tape routing
+    # Layer 3: "604.63 x6 SELL executed at BATS | bid was ARCX | ask was XNAS"
+    # Schwab streaming only sends changed fields, so bid_mic/ask_mic/last_mic
+    # may arrive without last_size. Cache the latest MIC codes per symbol.
+    if _socketio and symbol in ('QQQ', 'SPY'):
+        _eq_mic = getattr(_on_equity_quote, '_eq_mic', {})
+        sym_mic = _eq_mic.setdefault(symbol, {'bid': '', 'ask': '', 'last': '', 'size': 0})
+        # Update cached values only when present (streaming sends deltas)
+        raw_bid = data.get('bid_mic', '')
+        raw_ask = data.get('ask_mic', '')
+        raw_last = data.get('last_mic', '')
+        if raw_bid:  sym_mic['bid']  = str(raw_bid)
+        if raw_ask:  sym_mic['ask']  = str(raw_ask)
+        if raw_last: sym_mic['last'] = str(raw_last)
+        if data.get('last_size'): sym_mic['size'] = int(data['last_size'])
+        _on_equity_quote._eq_mic = _eq_mic
+
+        if sym_mic['bid'] or sym_mic['ask'] or sym_mic['last']:
+            _socketio.emit('equity_tape', {
+                'symbol':   symbol,
+                'price':    round(last, 2),
+                'size':     sym_mic['size'],
+                'side':     'b' if bid > 0 and last >= ask else ('s' if ask > 0 and last <= bid else ''),
+                'exec_mic': sym_mic['last'],
+                'bid_mic':  sym_mic['bid'],
+                'ask_mic':  sym_mic['ask'],
+                'ts':       time.time(),
+            })
+
     # Emit spot_update
     _socketio.emit('spot_update', {
         'ticker': symbol,
@@ -406,34 +460,70 @@ def _on_options_quote(data):
     Now captures enriched fields: security_status, quote_time, trade_time,
     mark_change, mark_pct_change, theoretical_value, indicative_bid/ask.
     """
-    global _gex_dirty
+    global _gex_dirty, _last_option_update_ts
+    _last_option_update_ts = time.time()
+
     strike = data.get('strike', 0)
-    gamma = data.get('gamma', 0)
-    delta = data.get('delta', 0)
-    oi = data.get('open_interest', 0)
-    vol = data.get('total_volume', data.get('volume', 0))
     contract_type = data.get('contract_type', '')
-    mark = data.get('mark', data.get('last', 0))  # option premium
-    iv = data.get('implied_vol', 0)                # implied volatility
-    theta = data.get('theta', 0)                   # time decay per day
-    vega = data.get('vega', 0)                     # vol sensitivity
-    rho = data.get('rho', 0)                       # rate sensitivity
-    dte = data.get('dte', 0)                       # days to expiry
-    underlying_price = data.get('underlying_price', 0)  # QQQ spot from options feed
+
+    # ── Schwab delta-update fallback ──────────────────────────────
+    # Schwab sends delta-only updates: strike/contract_type only in initial snapshot.
+    # Parse from symbol (format: "QQQ   YYMMDDTSSSSSSSS") as fallback.
+    if (not strike or strike <= 0 or not contract_type):
+        sym = data.get('symbol', '')
+        if len(sym) >= 15:
+            try:
+                # Strip underlying padding, last 9 chars = T + 8-digit strike*1000
+                tail = sym.rstrip()  # e.g. "QQQ   260410P00567000"
+                ct_char = tail[-9]   # 'C' or 'P'
+                strike_raw = int(tail[-8:]) / 1000.0
+                if strike_raw > 0:
+                    if not strike or strike <= 0:
+                        strike = strike_raw
+                    if not contract_type:
+                        contract_type = ct_char
+            except (ValueError, IndexError):
+                pass
+
+    # ── Per-symbol cache: merge delta fields with prior full snapshot ──
+    _sym_cache = getattr(_on_options_quote, '_sym_cache', {})
+    _on_options_quote._sym_cache = _sym_cache
+    sym_key = data.get('symbol', '')
+    if sym_key:
+        cached = _sym_cache.get(sym_key, {})
+        # Store any new fields from this update
+        for k, v in data.items():
+            if v is not None and v != 0 and v != '':
+                cached[k] = v
+        _sym_cache[sym_key] = cached
+    else:
+        cached = {}
+
+    gamma = data.get('gamma', cached.get('gamma', 0))
+    delta = data.get('delta', cached.get('delta', 0))
+    oi = data.get('open_interest', cached.get('open_interest', 0))
+    vol = data.get('total_volume', data.get('volume', cached.get('total_volume', 0)))
+    mark = data.get('mark', data.get('last', cached.get('mark', 0)))
+    iv = data.get('implied_vol', cached.get('implied_vol', 0))
+    theta = data.get('theta', cached.get('theta', 0))
+    vega = data.get('vega', cached.get('vega', 0))
+    rho = data.get('rho', cached.get('rho', 0))
+    dte = data.get('dte', cached.get('dte', 0))
+    underlying_price = data.get('underlying_price', cached.get('underlying_price', 0))
 
     # ── Enriched fields (Phase 1) ──────────────────────────────────
-    security_status = data.get('security_status', '')     # Trading halt detection
-    quote_time = data.get('quote_time', 0)                # Quote timestamp (ms)
-    trade_time = data.get('trade_time', 0)                # Last trade timestamp (ms)
-    mark_change = data.get('mark_change', 0)              # Premium change from yesterday
-    mark_pct_change = data.get('mark_pct_change', 0)      # Premium % change
-    theoretical_value = data.get('theoretical_value', 0)  # Schwab model price
-    intrinsic_value = data.get('intrinsic_value', 0)      # Schwab-computed intrinsic
-    open_price = data.get('open', 0)                      # Day's opening price
-    indicative_bid = data.get('indicative_bid', 0)        # Pre/post-market bid
-    indicative_ask = data.get('indicative_ask', 0)        # Pre/post-market ask
-    exercise_type = data.get('exercise_type', '')          # American vs European
-    exp_type = data.get('exp_type', '')                    # Expiration type
+    security_status = data.get('security_status', '')
+    quote_time = data.get('quote_time', 0)
+    trade_time = data.get('trade_time', cached.get('trade_time', 0))
+    mark_change = data.get('mark_change', cached.get('mark_change', 0))
+    mark_pct_change = data.get('mark_pct_change', 0)
+    theoretical_value = data.get('theoretical_value', 0)
+    intrinsic_value = data.get('intrinsic_value', 0)
+    open_price = data.get('open', 0)
+    indicative_bid = data.get('indicative_bid', 0)
+    indicative_ask = data.get('indicative_ask', 0)
+    exercise_type = data.get('exercise_type', '')
+    exp_type = data.get('exp_type', '')
 
     # ── Halt detection: skip halted contracts ──────────────────────
     if security_status and security_status not in ('Normal', 'normal', ''):
@@ -512,13 +602,61 @@ def _on_options_quote(data):
         except Exception:
             pass
 
+    # ── Emit option_mark_update for dealer_hedge_monitor ───────────
+    # Emit on any options update with valid strike/iv. Schwab streaming sends
+    # delta-only updates — mark may be absent. Fall back to cached mark.
+    # Throttled: max once per 500ms per contract key to avoid socket flood.
+    _emit_mark = mark
+    if not _emit_mark and strike in _live_gex:
+        side_key = 'call_mark' if contract_type in ('C', 'CALL', 'call') else 'put_mark'
+        _emit_mark = _live_gex[strike].get(side_key, 0)
+    if _socketio and (_emit_mark or iv):
+        try:
+            _opt_emit_last = getattr(_on_options_quote, '_emit_ts', {})
+            contract_key = f"{strike}{'C' if contract_type in ('C','CALL','call') else 'P'}"
+            now_t = time.time()
+            if now_t - _opt_emit_last.get(contract_key, 0) >= 0.5:
+                _opt_emit_last[contract_key] = now_t
+                _on_options_quote._emit_ts = _opt_emit_last
+                import math
+                _payload = {
+                    'strike':       float(strike or 0),
+                    'side':         'C' if contract_type in ('C','CALL','call') else 'P',
+                    'mark':         round(float(_emit_mark or 0), 4),
+                    'mark_change':  round(float(mark_change or 0), 4),
+                    'vol':          int(vol or 0),
+                    'oi':           int(oi or 0),
+                    'delta':        round(float(delta or 0), 5),
+                    'gamma':        round(float(gamma or 0), 6),
+                    'iv':           round(float(iv or 0), 4),
+                    'theta':        round(float(theta or 0), 5),
+                    'dte':          int(dte or 0),
+                    'underlying':   round(float(underlying_price or _latest_qqq or 0), 4),
+                    'trade_time':   int(trade_time or 0),
+                    'dollar_gex':   round(float(dollar_gex or 0) / 1e6, 4),
+                }
+                # Sanitize NaN/Inf which break JSON serialization
+                for _k, _v in _payload.items():
+                    if isinstance(_v, float) and (math.isnan(_v) or math.isinf(_v)):
+                        _payload[_k] = 0.0
+                _socketio.emit('option_mark_update', _payload)
+        except Exception:
+            pass
+
 
 def _maybe_emit_zones():
     """Recalculate and emit GEX zones if data has changed (max every 5s)."""
     global _gex_dirty, _last_zone_emit
 
-    if not _gex_dirty or not _socketio:
+    if not _socketio:
         return
+    # If option stream stopped (after-hours) but we have valid GEX data
+    # and NQ is still moving (from TopStepX), re-emit every 30s with stale data
+    if not _gex_dirty:
+        if _live_gex and len(_live_gex) >= 3 and time.time() - _last_zone_emit >= 30.0:
+            _gex_dirty = True  # force re-emit with existing option data
+        else:
+            return
     if time.time() - _last_zone_emit < 5.0:
         return
     if not _live_gex:
@@ -532,20 +670,34 @@ def _maybe_emit_zones():
         if len(sorted_strikes) < 3:
             return
 
-        # QQQ spot for zone computation — MUST be live, never approximate
+        # NQ price — TopStepX L2 is PRIMARY (fastest, 24/5), Schwab is secondary
+        nq_live = _get_nq_mid()
+        if nq_live <= 0:
+            print("[SCHWAB-BRIDGE] ⚠️ No NQ from TopStepX or Schwab — skipping zone emit")
+            return
+
+        # Update Schwab's NQ cache so ratio stays current even if Schwab stream drops
+        if nq_live > 0 and _latest_nq <= 0:
+            globals()['_latest_nq'] = nq_live
+
+        # QQQ spot — live Schwab preferred, derive from NQ if equity stream is down
         if _latest_qqq > 0:
             ndx_spot = _latest_qqq
             ratio_source = "LIVE_QQQ"
         elif _latest_ndx > 0:
             ndx_spot = _latest_ndx
             ratio_source = "LIVE_NDX"
+        elif nq_live > 0 and _nq_qqq_ratio > 0:
+            # After hours: derive QQQ from NQ/ratio (TopStepX NQ keeps this alive)
+            ndx_spot = nq_live / _nq_qqq_ratio
+            ratio_source = "DERIVED_QQQ"
         else:
-            print("[SCHWAB-BRIDGE] ⚠️ No live QQQ or NDX spot — skipping zone emit")
+            print("[SCHWAB-BRIDGE] ⚠️ No QQQ/NDX and no cached ratio — skipping zone emit")
             return
 
         # NQ/QQQ ratio — MUST be computed from live feeds
-        if _latest_nq > 0 and ndx_spot > 0:
-            ratio = _latest_nq / ndx_spot
+        if nq_live > 0 and ndx_spot > 0:
+            ratio = nq_live / ndx_spot
         elif _nq_qqq_ratio > 0:
             ratio = _nq_qqq_ratio  # cached from last live computation
             ratio_source = f"CACHED_RATIO({_nq_qqq_ratio:.4f})"
@@ -833,6 +985,71 @@ def _maybe_emit_zones():
         _last_zone_emit = time.time()
         _gex_dirty = False
 
+        # ── Dealer session hedge flow computation ────────────────────────
+        # Uses aggregate GEX to estimate NQ hedging per zone cycle.
+        # GEX > 0 = dealer long gamma: price UP → SELL, price DN → BUY (dampening)
+        # GEX < 0 = dealer short gamma: price UP → BUY, price DN → SELL (amplifying)
+        global _session_dealer_buys, _session_dealer_sells, _prev_nq_for_hedge
+        global _hedge_wave_count, _last_hedge_dir
+        nq_now = nq_live if nq_live > 0 else 0  # nq_live already has TopStepX fallback
+        _ratio = zone_data.get('ratio', 41.39) or 41.39
+        spot_qqq = _latest_qqq if _latest_qqq > 0 else (nq_now / _ratio if _ratio > 0 else 0)
+
+        # Compute total GEX from dealer_net_gex (in scope from zone computation)
+        _total_gex = sum(dealer_net_gex.get(k, 0) for k in sorted_strikes)
+        _total_gex_m = round(_total_gex / 1e6, 2)
+        _total_dex_m = round(total_net_dex / 1e6, 2)
+
+        # Determine gamma regime from flip position
+        _flip_nq = zone_data.get('gamma_flip', 0)
+        if nq_now > 0 and _flip_nq > 0:
+            if nq_now > _flip_nq:
+                _gamma_regime = 'LONG_GAMMA'
+            elif nq_now < _flip_nq:
+                _gamma_regime = 'SHORT_GAMMA'
+            else:
+                _gamma_regime = 'AT_FLIP'
+        else:
+            _gamma_regime = 'UNKNOWN'
+
+        if _prev_nq_for_hedge > 0 and nq_now > 0 and spot_qqq > 0 and abs(nq_now - _prev_nq_for_hedge) > 0.5:
+            move_qqq = (nq_now - _prev_nq_for_hedge) / _ratio
+            divisor = spot_qqq * 20 * _ratio
+            cycle_nq = abs(_total_gex * move_qqq) / divisor if divisor > 0 else 0
+
+            if _total_gex > 0:  # Long gamma (dampening)
+                if move_qqq > 0:
+                    _session_dealer_sells += cycle_nq
+                else:
+                    _session_dealer_buys += cycle_nq
+            else:  # Short gamma (amplifying)
+                if move_qqq > 0:
+                    _session_dealer_buys += cycle_nq
+                else:
+                    _session_dealer_sells += cycle_nq
+
+            cur_dir = 1 if move_qqq > 0 else -1
+            if cur_dir != _last_hedge_dir and _last_hedge_dir != 0:
+                _hedge_wave_count += 1
+            _last_hedge_dir = cur_dir
+        _prev_nq_for_hedge = nq_now
+
+        net_pos = _session_dealer_buys - _session_dealer_sells
+        _opt_age = round(time.time() - _last_option_update_ts, 1) if _last_option_update_ts > 0 else -1
+        _socketio.emit('dealer_session_flow', {
+            'session_buys': round(_session_dealer_buys, 1),
+            'session_sells': round(_session_dealer_sells, 1),
+            'net_position': round(net_pos, 1),
+            'hedge_wave_count': _hedge_wave_count,
+            'gamma_regime': _gamma_regime,
+            'net_gex_m': _total_gex_m,
+            'net_dex_m': _total_dex_m,
+            'flip_strike': _flip_nq,
+            'nq_source': 'topstepx' if _get_nq_mid() != _latest_nq else 'schwab',
+            'option_age_s': _opt_age,  # seconds since last Schwab option update
+            'ts': time.time(),
+        })
+
         # Forward zone data to EdgeDetector for GEX-weighted signals
         if _edge_detector:
             try:
@@ -847,7 +1064,7 @@ def _maybe_emit_zones():
         # while edge_detector got it from here (WS, real-time) → contradiction.
         try:
             from background_engine.l2_worker import update_regime
-            nq_spot = _latest_nq if _latest_nq > 0 else 0
+            nq_spot = nq_live if nq_live > 0 else 0
             if nq_spot > 0:
                 total_gex = sum(
                     -call_dollar_gex.get(k, 0) + put_dollar_gex.get(k, 0)
@@ -865,7 +1082,9 @@ def _maybe_emit_zones():
             print(f"[SCHWAB-BRIDGE] ⚠️ Regime sync error: {e}")
 
     except Exception as e:
+        import traceback
         print(f"[SCHWAB-BRIDGE] ⚠️ Zone emit error: {e}")
+        traceback.print_exc()
 
 
 def _on_chart_candle(data):
@@ -902,11 +1121,69 @@ def _on_chart_candle(data):
     })
 
 
+# ── Venue taxonomy: slow-cancel (real depth) vs fast-cancel (HFT, evaporate on sweep) ──
+# SLOW venues: NASDAQ, ARCA, PHLX, CBOE — institutional, survive aggressive sweeps
+# FAST venues: EDGX, BATX, MEMX, EDGA, BATY, IEXG — HFT, pull quotes in <1ms on sweep
+_SLOW_VENUES = frozenset({'NSDQ', 'arcx', 'phlx', 'cinn', 'cboe', 'bos', 'NYSE'})
+_FAST_VENUES = frozenset({'edgx', 'batx', 'memx', 'edga', 'baty', 'iexg', 'drctedge'})
+
+def _analyze_book_level(lvl):
+    """Compute microstructure quality metrics for a single NASDAQ_BOOK price level.
+    
+    Returns a dict with:
+      price         : float — price level
+      size          : int   — total contracts
+      mm_count      : int   — number of venues/MMs quoting this level
+      avg_lot_size  : float — size / mm_count (high = institutional block)
+      venue_conc    : float — 1/mm_count (high = single venue = thin/HFT)
+      slow_venues   : int   — count of slow-cancel institutional venues
+      fast_venues   : int   — count of fast-cancel HFT venues
+      has_primary   : bool  — NSDQ or arcx present (slow venue = depth survives sweep)
+      depth_quality : float — 0.0–1.0 quality score (high = institutional, low = HFT noise)
+      venues        : list  — venue MPID strings
+    """
+    price    = lvl.get('price', 0)
+    size     = lvl.get('size', 0)
+    mm_count = max(lvl.get('mm_count', 1), 1)
+    mms      = lvl.get('market_makers', [])
+    ids      = [m.get('id', '').lower() for m in mms]
+    
+    slow_count = sum(1 for v in ids if v in _SLOW_VENUES or v.upper() in _SLOW_VENUES)
+    fast_count = sum(1 for v in ids if v in _FAST_VENUES or v.upper() in _FAST_VENUES)
+    has_primary = any(v in ('nsdq', 'arcx') or v.upper() in ('NSDQ', 'ARCX') for v in ids)
+    
+    avg_lot  = round(size / mm_count, 1)
+    v_conc   = round(1.0 / mm_count, 3)
+    
+    # Quality score: penalize HFT-only levels, reward primary exchange presence
+    # slow_ratio: fraction of venues that are institutional
+    slow_ratio = slow_count / mm_count if mm_count > 0 else 0
+    # size_score: larger avg lot = more institutional conviction
+    size_score = min(avg_lot / 500.0, 1.0)  # caps at 500 shares avg
+    # Primary bonus: NSDQ or arcx = this quote will NOT evaporate on sweep
+    primary_bonus = 0.3 if has_primary else 0.0
+    depth_quality = round(min((slow_ratio * 0.4 + size_score * 0.3 + primary_bonus), 1.0), 3)
+    
+    return {
+        'price':         price,
+        'size':          size,
+        'mm_count':      mm_count,
+        'avg_lot_size':  avg_lot,
+        'venue_conc':    v_conc,
+        'slow_venues':   slow_count,
+        'fast_venues':   fast_count,
+        'has_primary':   has_primary,
+        'depth_quality': depth_quality,
+        'venues':        [m.get('id', '?') for m in mms[:8]],
+    }
+
+
 _book_logged = False
+_last_book_ms_emit = 0.0  # throttle microstructure emit to 2Hz
 
 def _on_nasdaq_book(data):
     """Handle NASDAQ Level 2 book updates for QQQ — push to frontend + feed EdgeDetector."""
-    global _book_logged
+    global _book_logged, _last_book_ms_emit
     if not _socketio:
         return
     symbol = data.get('symbol', 'UNKNOWN')
@@ -923,6 +1200,65 @@ def _on_nasdaq_book(data):
                 ids = [m.get('id', '?') for m in mms[:8]]
                 print(f"  {side_label} {lvl.get('price')}: size={lvl.get('size')} mm_count={lvl.get('mm_count')} MMs={ids}")
 
+    # ── Book Microstructure Analysis ──────────────────────────────────────────
+    # Compute quality metrics per level and aggregate into BBO-level signals.
+    # Throttled to 2Hz to avoid flooding the frontend.
+    now_ms = time.time()
+    if now_ms - _last_book_ms_emit >= 0.5:
+        _last_book_ms_emit = now_ms
+        
+        bid_levels = [_analyze_book_level(lvl) for lvl in bids[:10]]
+        ask_levels = [_analyze_book_level(lvl) for lvl in asks[:10]]
+        
+        # BBO quality (best bid / best ask)
+        bbo_bid = bid_levels[0] if bid_levels else {}
+        bbo_ask = ask_levels[0] if ask_levels else {}
+        
+        # Aggregate quality: weighted by size (larger levels matter more)
+        def _weighted_quality(levels):
+            total_size = sum(l['size'] for l in levels) or 1
+            return round(sum(l['depth_quality'] * l['size'] / total_size for l in levels), 3)
+        
+        bid_q = _weighted_quality(bid_levels) if bid_levels else 0
+        ask_q = _weighted_quality(ask_levels) if ask_levels else 0
+        
+        # HFT ratio: fraction of BBO dominated by fast-cancel venues only
+        bbo_hft = (bbo_bid.get('fast_venues', 0) > 0 and bbo_bid.get('slow_venues', 0) == 0) or                   (bbo_ask.get('fast_venues', 0) > 0 and bbo_ask.get('slow_venues', 0) == 0)
+        
+        # Quality-adjusted imbalance: size * quality (filters HFT phantom depth)
+        bid_q_size = sum(l['size'] * l['depth_quality'] for l in bid_levels)
+        ask_q_size = sum(l['size'] * l['depth_quality'] for l in ask_levels)
+        total_q = bid_q_size + ask_q_size
+        qa_imbalance = round((bid_q_size - ask_q_size) / total_q, 3) if total_q > 0 else 0.0
+        # +1.0 = all quality depth on bid side (strong buy wall)
+        # -1.0 = all quality depth on ask side (strong sell wall)
+        
+        _socketio.emit('book_microstructure', {
+            'symbol':       symbol,
+            'ts':           now_ms,
+            # BBO quality
+            'bbo_bid':      bbo_bid,
+            'bbo_ask':      bbo_ask,
+            'bbo_hft_only': bbo_hft,  # True = BBO quotes will evaporate on any sweep
+            # Aggregate depth quality
+            'bid_quality':  bid_q,
+            'ask_quality':  ask_q,
+            # Quality-adjusted imbalance: the REAL order flow signal (not phantom HFT depth)
+            'qa_imbalance': qa_imbalance,
+            # Top levels with full venue detail
+            'bid_levels':   bid_levels[:5],
+            'ask_levels':   ask_levels[:5],
+        })
+        
+        # Forward quality-adjusted imbalance to EdgeDetector
+        if _edge_detector:
+            try:
+                _edge_detector.on_book_microstructure(symbol, qa_imbalance, bid_q, ask_q, bbo_hft)
+            except AttributeError:
+                pass  # EdgeDetector may not have this method yet
+            except Exception:
+                pass
+
     # Emit raw book data for the Equity Book panel
     _socketio.emit('eq_book_update', {
         'symbol': symbol,
@@ -932,6 +1268,99 @@ def _on_nasdaq_book(data):
     })
 
     # Forward to MMTracker for market maker withdrawal detection
+    if _mm_tracker:
+        try:
+            _mm_tracker.update(data)
+        except Exception:
+            pass
+
+
+# ── NYSE_BOOK handler for SPY — same analysis pipeline, separate throttle ──
+_last_nyse_ms_emit = 0.0
+_nyse_book_logged = False
+# Latest SPY microstructure for cross-market divergence
+_spy_ms = {'qa_imbalance': 0.0, 'bid_quality': 0.0, 'ask_quality': 0.0,
+           'bbo_hft_only': False, 'ts': 0.0}
+
+def _on_nyse_book(data):
+    """Handle NYSE Level 2 book updates for SPY — same analysis as QQQ NASDAQ_BOOK."""
+    global _nyse_book_logged, _last_nyse_ms_emit
+    if not _socketio:
+        return
+    symbol = data.get('symbol', 'UNKNOWN')
+    bids = data.get('bids', [])
+    asks = data.get('asks', [])
+
+    if not _nyse_book_logged and bids:
+        _nyse_book_logged = True
+        print(f"[SCHWAB-BRIDGE] NYSE_BOOK sample ({symbol}):")
+        for side_label, levels in [('BID', bids[:3]), ('ASK', asks[:3])]:
+            for lvl in levels:
+                mms = lvl.get('market_makers', [])
+                ids = [m.get('id', '?') for m in mms[:8]]
+                print(f"  {side_label} {lvl.get('price')}: size={lvl.get('size')} "
+                      f"mm_count={lvl.get('mm_count')} MMs={ids}")
+
+    now_ms = time.time()
+    if now_ms - _last_nyse_ms_emit >= 0.5:
+        _last_nyse_ms_emit = now_ms
+
+        bid_levels = [_analyze_book_level(lvl) for lvl in bids[:10]]
+        ask_levels = [_analyze_book_level(lvl) for lvl in asks[:10]]
+
+        bbo_bid = bid_levels[0] if bid_levels else {}
+        bbo_ask = ask_levels[0] if ask_levels else {}
+
+        def _weighted_quality(levels):
+            total_size = sum(l['size'] for l in levels) or 1
+            return round(sum(l['depth_quality'] * l['size'] / total_size for l in levels), 3)
+
+        bid_q = _weighted_quality(bid_levels) if bid_levels else 0
+        ask_q = _weighted_quality(ask_levels) if ask_levels else 0
+
+        bbo_hft = ((bbo_bid.get('fast_venues', 0) > 0 and bbo_bid.get('slow_venues', 0) == 0) or
+                   (bbo_ask.get('fast_venues', 0) > 0 and bbo_ask.get('slow_venues', 0) == 0))
+
+        bid_q_size = sum(l['size'] * l['depth_quality'] for l in bid_levels)
+        ask_q_size = sum(l['size'] * l['depth_quality'] for l in ask_levels)
+        total_q = bid_q_size + ask_q_size
+        qa_imbalance = round((bid_q_size - ask_q_size) / total_q, 3) if total_q > 0 else 0.0
+
+        # Cache for divergence computation
+        _spy_ms['qa_imbalance'] = qa_imbalance
+        _spy_ms['bid_quality'] = bid_q
+        _spy_ms['ask_quality'] = ask_q
+        _spy_ms['bbo_hft_only'] = bbo_hft
+        _spy_ms['ts'] = now_ms
+
+        # Emit SPY microstructure on same event (symbol-tagged)
+        _socketio.emit('book_microstructure', {
+            'symbol':       symbol,
+            'ts':           now_ms,
+            'bbo_bid':      bbo_bid,
+            'bbo_ask':      bbo_ask,
+            'bbo_hft_only': bbo_hft,
+            'bid_quality':  bid_q,
+            'ask_quality':  ask_q,
+            'qa_imbalance': qa_imbalance,
+            'bid_levels':   bid_levels[:5],
+            'ask_levels':   ask_levels[:5],
+        })
+
+        if _edge_detector:
+            try:
+                _edge_detector.on_book_microstructure(symbol, qa_imbalance, bid_q, ask_q, bbo_hft)
+            except (AttributeError, Exception):
+                pass
+
+    # Raw book for frontend
+    _socketio.emit('eq_book_update', {
+        'symbol': symbol,
+        'timestamp': data.get('timestamp', 0),
+        'bids': bids[:15],
+        'asks': asks[:15],
+    })
+
     if _mm_tracker:
         try:
             _mm_tracker.update(data)
@@ -998,14 +1427,17 @@ def _safe_num(val):
 def _log_stats():
     """Periodic stats logging."""
     global _tick_count
+    nq_topstep = _get_nq_mid()
+    nq_schwab = _latest_nq
+    opts_count = len(_live_gex)
+    opt_age = round(time.time() - _last_option_update_ts, 0) if _last_option_update_ts > 0 else -1
+    src = "TSX" if nq_topstep > 0 and nq_topstep != nq_schwab else "SCH"
+    nq_show = nq_topstep if nq_topstep > 0 else nq_schwab
     if _streamer and _streamer.is_connected:
-        nq = _streamer.get_latest('LEVELONE_FUTURES', '/NQ')
-        nq_price = nq.get('last', 0) if nq else 0
-        opts_count = len(_live_gex)
-        print(f"[SCHWAB-BRIDGE] 📊 {_tick_count} ticks | NQ={nq_price:.2f} | "
-              f"ratio={_nq_qqq_ratio:.2f} | options_strikes={opts_count} | connected=True")
+        print(f"[SCHWAB-BRIDGE] 📊 {_tick_count} ticks | NQ={nq_show:.2f}({src}) | "
+              f"ratio={_nq_qqq_ratio:.2f} | strikes={opts_count} | opt_age={opt_age}s")
     else:
-        print(f"[SCHWAB-BRIDGE] ⚠️  {_tick_count} ticks | connected=False (reconnecting...)")
+        print(f"[SCHWAB-BRIDGE] ⚠️  {_tick_count} ticks | NQ={nq_show:.2f}({src}) | connected=False (reconnecting...)")
     _tick_count = 0
 
 

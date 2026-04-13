@@ -58,6 +58,7 @@
                 if (window.AltarisEvents) {
                     window.AltarisEvents.emit('data:zone:update', data);
                 }
+                if (typeof VolSurfacePane !== 'undefined') VolSurfacePane.onZoneUpdate(data);
             });
 
             window._sio.on('tape_alert', (data) => {
@@ -104,6 +105,36 @@
                 if (window.AltarisEvents) {
                     window.AltarisEvents.emit('data:screener:update', data);
                 }
+            });
+
+            // ── book_microstructure: QQQ NASDAQ L2 venue quality + QA imbalance ──
+            // Emitted at 2Hz. Contains per-level venue taxonomy (HFT vs institutional),
+            // quality-adjusted imbalance (filters phantom HFT depth), and BBO quality scores.
+            window._sio.on('book_microstructure', (data) => {
+                window._latestBookMs = data;
+                if (window.AltarisEvents) {
+                    window.AltarisEvents.emit('data:book:microstructure', data);
+                }
+                // Update book microstructure HUD immediately
+                if (typeof BookMsHUD !== 'undefined') BookMsHUD.update(data);
+                // Cross-market divergence pane
+                if (typeof CrossDivergencePane !== 'undefined') CrossDivergencePane.onBookMs(data);
+            });
+
+            // ── equity_tape: Venue-tagged equity trades (MIC routing) ──
+            window._sio.on('equity_tape', (data) => {
+                if (typeof EquityTapePane !== 'undefined') EquityTapePane.onTick(data);
+            });
+
+            // ── option_mark_update: Live options mark/IV/Greeks per contract ──
+            window._sio.on('option_mark_update', (data) => {
+                if (typeof OptionsFlowPane !== 'undefined') OptionsFlowPane.onOptionMark(data);
+                if (typeof VolSurfacePane !== 'undefined') VolSurfacePane.onOptionMark(data);
+            });
+
+            // ── dealer_session_flow: Dealer hedge session stats ──
+            window._sio.on('dealer_session_flow', (data) => {
+                if (typeof DealerFlowPane !== 'undefined') DealerFlowPane.onDealerFlow(data);
             });
 
             // ── candle_history: Backfill candle data from l2_worker ──

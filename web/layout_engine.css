@@ -40,6 +40,17 @@
 #pane-grid[data-layout="oc-desk"]{grid-template-columns:minmax(0,1fr) minmax(0,1fr);grid-template-rows:minmax(0,1.2fr) minmax(0,1fr)}
 #pane-grid[data-layout="hedge"]{grid-template-columns:minmax(0,1.3fr) minmax(0,1fr) minmax(0,1fr);grid-template-rows:minmax(0,1fr)}
 #pane-grid[data-layout="oc-scan"]{grid-template-columns:minmax(0,1fr) minmax(0,1fr);grid-template-rows:minmax(0,1fr)}
+/* ── Pro (chart 65% | ladder 18% | tape 17%) ── */
+#pane-grid[data-layout="pro"]{grid-template-columns:minmax(0,3.6fr) minmax(0,1fr) minmax(0,.95fr);grid-template-rows:minmax(0,1fr)}
+/* ── Market Maker ── */
+#pane-grid[data-layout="maker"]{grid-template-columns:minmax(0,2.4fr) minmax(0,1fr) minmax(0,.6fr);grid-template-rows:minmax(0,1fr)}
+/* ── God Mode (chart wide top, 3 bottom) ── */
+#pane-grid[data-layout="god-mode"]{grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(0,1fr);grid-template-rows:minmax(0,1.3fr) minmax(0,1fr)}
+#pane-grid[data-layout="god-mode"] .pane[data-slot="0"]{grid-column:1/3}
+/* ── Dealer Desk ── */
+#pane-grid[data-layout="dealer-desk"]{grid-template-columns:minmax(0,1.6fr) minmax(0,1fr);grid-template-rows:minmax(0,1fr) minmax(0,1fr)}
+/* ── War Room ── */
+#pane-grid[data-layout="war-room"]{grid-template-columns:minmax(0,1.4fr) minmax(0,1fr) minmax(0,1fr);grid-template-rows:minmax(0,1fr) minmax(0,1fr)}
 /* ── Full Station ── */
 #pane-grid[data-layout="recon"]{grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(0,1fr);grid-template-rows:minmax(0,1fr) minmax(0,1fr)}
 
@@ -47,15 +58,17 @@
 #pane-grid[data-layout="intel"] .pane[data-slot="0"]{grid-row:1/3}
 
 /* ═══ Pane ═══ */
-.pane{position:relative;overflow:hidden;min-width:0;min-height:0;background:#070a14;border:1px solid rgba(255,255,255,.03);transition:border-color .1s;display:flex;flex-direction:column;contain:layout style}
-.pane.active{border-color:rgba(124,90,247,.28)}
+.pane{position:relative;overflow:hidden;min-width:0;min-height:0;background:#070a14;border:1px solid rgba(255,255,255,.04);transition:border-color .15s,box-shadow .15s;display:flex;flex-direction:column;contain:layout style}
+.pane.active{border-color:rgba(124,90,247,.35);box-shadow:inset 0 0 0 1px rgba(124,90,247,.06)}
 .pane.hidden{display:none!important}
 
 /* Pane header */
-.pane-hdr{position:relative;height:20px;flex-shrink:0;display:flex;align-items:center;justify-content:space-between;padding:0 5px;background:rgba(6,8,18,.92);z-index:10;pointer-events:auto}
+.pane-hdr{position:relative;height:22px;flex-shrink:0;display:flex;align-items:center;justify-content:space-between;padding:0 6px;background:linear-gradient(180deg,rgba(10,14,28,.95),rgba(6,8,18,.98));border-bottom:1px solid rgba(255,255,255,.03);z-index:10;pointer-events:auto}
+.pane.active .pane-hdr{border-bottom-color:rgba(124,90,247,.12)}
 .pane-hdr-tag{display:flex;align-items:center;gap:4px}
-.pane-hdr-icon{font-size:8px;opacity:.5}
-.pane-hdr-label{font-family:'JetBrains Mono',monospace;font-size:8px;font-weight:600;letter-spacing:.08em;color:rgba(140,160,200,.5)}
+.pane-hdr-icon{font-size:8px;opacity:.45}
+.pane-hdr-label{font-family:'JetBrains Mono',monospace;font-size:8.5px;font-weight:600;letter-spacing:.1em;color:rgba(140,160,200,.45);text-transform:uppercase}
+.pane.active .pane-hdr-label{color:rgba(196,181,253,.7)}
 .pane-hdr-ctrls{display:flex;gap:2px;opacity:0;transition:opacity .1s}
 .pane:hover .pane-hdr-ctrls{opacity:1}
 .pane-ctrl{width:15px;height:15px;display:flex;align-items:center;justify-content:center;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.05);border-radius:2px;color:rgba(140,160,200,.4);cursor:pointer;font-size:7px;transition:all .1s}
@@ -71,7 +84,7 @@
 
 /* Pane slot (where renderers mount) — GPU-composited for smooth rendering */
 .pane-slot{flex:1;position:relative;overflow:hidden;min-height:0;min-width:0;contain:layout style paint;will-change:contents}
-.pane-slot canvas{width:100%!important;height:100%!important;will-change:transform}
+.pane-slot canvas{will-change:transform}
 .pane-slot .tv-lightweight-charts{width:100%!important;height:100%!important}
 .pane-dims{position:absolute;bottom:3px;right:5px;font-family:'JetBrains Mono',monospace;font-size:7px;color:rgba(140,160,200,.2);pointer-events:none;z-index:5}
 
@@ -91,6 +104,11 @@
 /* ═══ Status Bar ═══ */
 #status-bar{height:20px;flex-shrink:0;display:flex;align-items:center;padding:0 14px;gap:10px;background:linear-gradient(180deg,rgba(8,10,22,.85),rgba(6,7,12,.95));border-top:1px solid rgba(124,90,247,.08);font-family:var(--font-hud,'Share Tech Mono','JetBrains Mono',monospace);font-size:8px;color:rgba(140,160,200,.35);backdrop-filter:blur(8px);letter-spacing:.06em}
 .s-dot{width:5px;height:5px;border-radius:50%;background:#2ee88a;box-shadow:0 0 6px rgba(46,232,138,.5),0 0 12px rgba(46,232,138,.2)}
+.s-div{color:rgba(124,90,247,.15);user-select:none}
+.s-data{color:rgba(140,160,200,.5);font-variant-numeric:tabular-nums}
+.s-data.s-pos{color:rgba(46,232,138,.65)}
+.s-data.s-neg{color:rgba(224,48,96,.65)}
+.sb-spacer{flex:1}
 
 /* ═══ Custom Layout Builder ═══ */
 .cl-section{border-top:1px solid rgba(255,255,255,.04);margin-top:4px;padding-top:6px}
@@ -123,3 +141,9 @@
 .cl-save-btn{padding:3px 10px;background:rgba(46,232,138,.1);border:1px solid rgba(46,232,138,.3);border-radius:3px;color:rgba(46,232,138,.7);font-family:'JetBrains Mono',monospace;font-size:7px;font-weight:600;cursor:pointer;transition:all .1s}
 .cl-save-btn:hover{background:rgba(46,232,138,.2);color:rgba(46,232,138,.9)}
 .cl-cancel-btn{padding:3px 8px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08);border-radius:3px;color:rgba(140,160,200,.4);font-family:'JetBrains Mono',monospace;font-size:7px;cursor:pointer}
+
+/* ── Overlay Toggle Toolbar (per-pane chart overlay controls) ── */
+.overlay-toolbar{position:absolute;top:4px;right:60px;z-index:20;display:flex;gap:2px;padding:2px 4px;background:rgba(10,12,24,.75);border:1px solid rgba(255,255,255,.06);border-radius:4px;backdrop-filter:blur(6px)}
+.ov-btn{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);color:rgba(140,160,200,.35);font-family:'JetBrains Mono',monospace;font-size:8px;font-weight:600;padding:1px 5px;border-radius:3px;cursor:pointer;transition:all .12s;line-height:1.3}
+.ov-btn:hover{background:rgba(124,90,247,.1);border-color:rgba(124,90,247,.25);color:rgba(140,160,200,.6)}
+.ov-btn.active{background:rgba(124,90,247,.15);border-color:rgba(124,90,247,.35);color:#c4b5fd}

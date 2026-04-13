@@ -450,9 +450,9 @@ def _build_max_pain(oi_data, spot):
 def _build_iv_surface(ticker, spot, expirations):
     """Build IV surface from real chain data."""
     exps_to_use = expirations[:int(_cfg().get("max_expirations", 3)) + 4]
-    strike_step = 5
-    center = round(spot / strike_step) * strike_step
-    strikes = [float(s) for s in range(center - 60, center + 65, strike_step)]
+    strike_step = 1
+    center = round(spot)
+    strikes = [float(s) for s in range(center - 30, center + 31, strike_step)]
 
     def _extract_iv(opt):
         """Try multiple IV fields in priority order."""

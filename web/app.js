@@ -296,6 +296,7 @@ function _setupDataEvents() {
     window.AltarisEvents.on('data:screener:update', (data) => {
         if (!data) return;
         window._latestScreenerData = data;
+        _renderScreenerAlerts(data);
     });
 
     // ── l2_update: Full L2 state via WebSocket (replaces /api/l2 REST poll) ──
@@ -305,18 +306,95 @@ function _setupDataEvents() {
         window._l2WsLastTs = Date.now();
         _l2Render(data);
     });
+
+    // ── candle_history: WS push of full candle history (with bp) on connect ──
+    // Server pushes this immediately on Socket.IO connect (server.py handle_connect)
+    // and on subscribe. Without this handler, bp data was silently dropped and
+    // volume bubbles would never render until REST polling accumulated enough data.
+    window.AltarisEvents.on('data:candles:history', (data) => {
+        if (!data || !data.candles || data.candles.length === 0) return;
+        if (data.symbol !== _l2ChartSymbol || data.tf !== _l2ChartTF) return;
+        // Buffer if chart not ready yet — replay from chart:ready handler
+        if (typeof ChartCore === 'undefined' || ChartCore.getInstances().length === 0) {
+            window._pendingCandleHistory = data;
+            return;
+        }
+
+        const candles = data.candles;
+        const ohlc = candles.map(c => ({
+            time: _utcToET(c.time), open: c.open, high: c.high, low: c.low, close: c.close
+        }));
+        const vol = candles.map(c => ({
+            time: _utcToET(c.time), value: c.volume || 0,
+            color: c.close >= c.open ? 'rgba(38,166,154,.25)' : 'rgba(239,83,80,.25)'
+        }));
+
+        const instances = ChartCore.getInstances();
+        instances.forEach(inst => {
+            inst.candleSeries.setData(ohlc);
+            if (inst.volumeSeries) inst.volumeSeries.setData(vol);
+
+            if (inst.feature === 'chart' && inst.bubbleSeries) {
+                const bubbleData = candles.map(c => ({
+                    time: _utcToET(c.time), close: c.close, bp: c.bp || null,
+                    icebergs: c.icebergs || null, sweeps: c.sweeps || null,
+                    delta_div: c.delta_div || null, ignition: c.ignition || null,
+                    spoofs: c.spoofs || null, drifting_iceberg: c.drifting_iceberg || null,
+                    wall_gone: c.wall_gone || null
+                }));
+                inst.bubbleSeries.setData(bubbleData);
+            }
+
+            if (inst.feature === 'heatmap') {
+                const _hChart = inst.chart;
+                setTimeout(() => {
+                    _hChart.timeScale().applyOptions({ barSpacing: 20, rightOffset: 3 });
+                    _hChart.timeScale().scrollToPosition(-3, false);
+                    _hChart.priceScale('right').applyOptions({
+                        scaleMargins: { top: 0.05, bottom: 0.05 },
+                        autoScale: true,
+                    });
+                }, 100);
+            } else {
+                inst.chart.timeScale().fitContent();
+                // Deferred re-fit in case layout hasn't fully settled
+                setTimeout(() => {
+                    try { inst.chart.timeScale().fitContent(); } catch(e) {}
+                }, 250);
+            }
+        });
+
+        // ── Seam marker: first candle with bp = live data start ──
+        _l2SeamTime = 0;
+        for (const c of candles) {
+            if (c.bp && Object.keys(c.bp).length > 0) {
+                _l2SeamTime = _utcToET(c.time);
+                break;
+            }
+        }
+        if (_l2SeamTime > 0) {
+            ChartCore.getInstances().forEach(inst => {
+                inst.candleSeries.setMarkers([{
+                    time: _l2SeamTime, position: 'belowBar', color: 'rgba(124,90,247,.8)',
+                    shape: 'arrowUp', text: 'LIVE ▸'
+                }]);
+            });
+        }
+
+        // Cache for layout switches + update poll cursor
+        _l2CandleDataCache = { ohlc, vol };
+        _l2LastCandleTime = candles[candles.length - 1].time;
+
+        // Dismiss welcome screen on first data
+        if (window._dismissWelcome) window._dismissWelcome();
+    });
 }
 
-// ── Timezone helper: UTC epoch → Eastern Time epoch ──
-// LWC treats the time field as UTC, so we offset it to ET
-// to make the x-axis show ET hours. Handles EST/EDT automatically.
+// ── Timezone helper ──
+// Server sends raw UTC epoch seconds. LWC uses them as-is.
+// ET display is handled by _applyETLabelFormatter in chart_core.js.
 function _utcToET(utcEpoch) {
-    // FIX: Lightweight Charts natively requires raw UTC Unix Seconds for intraday.
-    // Manually offsetting this shifts the candles out of the visible screen area.
-    // Convert ET epoch seconds to UTC epoch seconds for chart consumption.
-    // Data from API is in Eastern Time; Lightweight Charts expects UTC.
-    const offsetHours = 4; // EDT offset (UTC-4)
-    return utcEpoch + offsetHours * 3600;
+    return utcEpoch;
 }
 
 const SIG_META = {
@@ -754,7 +832,8 @@ function _l2RenderTape(trades) {
         for (const t of [...trades[sym]].reverse()) {
             hasNewTrades = true;
             const entry = { ...t, sym };
-            _l2TapeAll.push(entry);  // push to end (O(1)) — render from tail
+            _l2TapeAll.push(entry);
+            if (_l2TapeAll.length > 2000) _l2TapeAll = _l2TapeAll.slice(-1500);
             // Feed delta accumulator
             const side = t.side || (t.spin > 0 ? 'buy' : 'sell');
             const vol = t.volume || t.v || 1;
@@ -889,6 +968,378 @@ function _l2RenderSignals(signals) {
     }).join('');
 }
 
+// ── OC HEAT: Options Chain GEX Heatmap (Canvas2D) ──
+function _drawOcHeat(canvas, ocData) {
+    if (!canvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = canvas.clientWidth;
+    const cssH = canvas.clientHeight;
+    if (cssW < 10 || cssH < 10) return;
+    if (canvas.width !== Math.round(cssW * dpr) || canvas.height !== Math.round(cssH * dpr)) {
+        canvas.width = Math.round(cssW * dpr);
+        canvas.height = Math.round(cssH * dpr);
+    }
+    const ctx = canvas.getContext('2d');
+    ctx.save();
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    ctx.fillStyle = '#070a14';
+    ctx.fillRect(0, 0, cssW, cssH);
+
+    // Collect strikes and DTEs
+    const allStrikes = new Set();
+    const dteKeys = Object.keys(ocData).map(Number).sort((a, b) => a - b);
+    for (const dte of dteKeys) {
+        for (const entry of Object.values(ocData[dte])) allStrikes.add(entry.strike);
+    }
+    const strikes = Array.from(allStrikes).sort((a, b) => a - b);
+
+    if (strikes.length < 2 || dteKeys.length < 1) {
+        ctx.fillStyle = 'rgba(140,160,200,.3)';
+        ctx.font = '11px "JetBrains Mono", monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('Waiting for options data...', cssW / 2, cssH / 2);
+        ctx.restore();
+        return;
+    }
+
+    // Bucket DTEs — only keep buckets with data
+    const dteBucketDef = [{max:0,label:'0DTE'},{max:3,label:'1-3d'},{max:7,label:'4-7d'},{max:14,label:'8-14d'},{max:30,label:'15-30d'},{max:Infinity,label:'30d+'}];
+    const dteBuckets = [];
+    for (const def of dteBucketDef) {
+        const lo = dteBuckets.length > 0 ? dteBucketDef[dteBuckets.length - 1].max : -1;
+        const matching = dteKeys.filter(d => d <= def.max && d > lo);
+        if (matching.length > 0) dteBuckets.push({ ...def, dtes: matching });
+    }
+    if (dteBuckets.length === 0) { ctx.restore(); return; }
+
+    // Layout
+    const headerH = 28;
+    const padL = 46, padR = 12, padT = headerH + 4, padB = 22;
+    const plotW = cssW - padL - padR;
+    const plotH = cssH - padT - padB;
+    const cellW = plotW / strikes.length;
+    const cellH = Math.min(plotH / dteBuckets.length, 80); // cap row height
+    const usedH = cellH * dteBuckets.length;
+    const yOffset = padT + (plotH - usedH) / 2; // vertically center
+
+    // Max |GEX| for normalization
+    let maxGex = 0.001;
+    for (const dte of dteKeys) {
+        for (const entry of Object.values(ocData[dte])) {
+            if (Math.abs(entry.gex) > maxGex) maxGex = Math.abs(entry.gex);
+        }
+    }
+
+    // (spot marker uses ATM strike midpoint below)
+
+    // ── Header bar ──
+    ctx.fillStyle = 'rgba(255,255,255,.04)';
+    ctx.fillRect(0, 0, cssW, headerH);
+    ctx.fillStyle = 'rgba(180,190,220,.7)';
+    ctx.font = 'bold 10px "JetBrains Mono", monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText('GEX HEATMAP', 8, 18);
+    ctx.fillStyle = 'rgba(140,160,200,.4)';
+    ctx.font = '9px "JetBrains Mono", monospace';
+    ctx.fillText(`${strikes.length} strikes \u00b7 ${dteKeys.length} DTE`, 100, 18);
+    // Legend
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#1fd17a';
+    ctx.fillRect(cssW - 120, 10, 10, 10);
+    ctx.fillStyle = 'rgba(180,190,220,.5)';
+    ctx.fillText('+\u0393 Long', cssW - 66, 18);
+    ctx.fillStyle = '#e03060';
+    ctx.fillRect(cssW - 60, 10, 10, 10);
+    ctx.fillStyle = 'rgba(180,190,220,.5)';
+    ctx.fillText('\u2212\u0393 Short', cssW - 6, 18);
+
+    // ── Draw cells ──
+    for (let bi = 0; bi < dteBuckets.length; bi++) {
+        const bucket = dteBuckets[bi];
+        // Row separator line
+        ctx.strokeStyle = 'rgba(255,255,255,.04)';
+        ctx.beginPath();
+        ctx.moveTo(padL, yOffset + bi * cellH);
+        ctx.lineTo(cssW - padR, yOffset + bi * cellH);
+        ctx.stroke();
+
+        for (let si = 0; si < strikes.length; si++) {
+            const K = strikes[si];
+            let totalGex = 0;
+            for (const dte of bucket.dtes) {
+                const cEntry = ocData[dte] ? ocData[dte][K + '_C'] : null;
+                const pEntry = ocData[dte] ? ocData[dte][K + '_P'] : null;
+                if (cEntry) totalGex += cEntry.gex;
+                if (pEntry) totalGex += pEntry.gex;
+            }
+            if (totalGex === 0) continue;
+
+            const x = padL + si * cellW;
+            const y = yOffset + bi * cellH;
+            const norm = Math.min(Math.abs(totalGex) / maxGex, 1.0);
+            const t = Math.pow(norm, 0.5);
+
+            if (totalGex > 0) {
+                const g = Math.round(80 + t * 175);
+                ctx.fillStyle = `rgba(10, ${g}, ${Math.round(50 + t * 70)}, ${0.2 + t * 0.75})`;
+            } else {
+                const r = Math.round(80 + t * 175);
+                ctx.fillStyle = `rgba(${r}, ${Math.round(15 + t * 35)}, ${Math.round(30 + t * 60)}, ${0.2 + t * 0.75})`;
+            }
+            ctx.fillRect(x + 0.5, y + 0.5, Math.max(cellW - 1, 1), cellH - 1);
+
+            // Value label in roomy cells
+            if (cellW > 28 && cellH > 16 && t > 0.15) {
+                ctx.fillStyle = `rgba(255,255,255,${0.3 + t * 0.6})`;
+                ctx.font = '7px "JetBrains Mono", monospace';
+                ctx.textAlign = 'center';
+                ctx.fillText(totalGex.toFixed(1), x + cellW / 2, y + cellH / 2 + 3);
+            }
+        }
+    }
+
+    // ── Y-axis: DTE labels ──
+    ctx.fillStyle = 'rgba(160,175,210,.6)';
+    ctx.font = '9px "JetBrains Mono", monospace';
+    ctx.textAlign = 'right';
+    for (let bi = 0; bi < dteBuckets.length; bi++) {
+        ctx.fillText(dteBuckets[bi].label, padL - 4, yOffset + bi * cellH + cellH / 2 + 3);
+    }
+
+    // ── X-axis: strike labels ──
+    ctx.fillStyle = 'rgba(140,160,200,.45)';
+    ctx.font = '8px "JetBrains Mono", monospace';
+    ctx.textAlign = 'center';
+    const step = Math.max(1, Math.floor(strikes.length / 14));
+    for (let si = 0; si < strikes.length; si += step) {
+        ctx.fillText(strikes[si].toFixed(0), padL + si * cellW + cellW / 2, yOffset + usedH + 14);
+    }
+
+    // ── Spot price vertical marker ──
+    if (strikes.length > 1) {
+        // Find nearest strike to ATM (use middle of range as proxy)
+        const midStrike = strikes[Math.floor(strikes.length / 2)];
+        const spotIdx = strikes.findIndex(s => s >= midStrike);
+        if (spotIdx >= 0) {
+            const sx = padL + spotIdx * cellW + cellW / 2;
+            ctx.strokeStyle = 'rgba(255,220,40,.35)';
+            ctx.setLineDash([3, 3]);
+            ctx.beginPath();
+            ctx.moveTo(sx, yOffset);
+            ctx.lineTo(sx, yOffset + usedH);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.fillStyle = 'rgba(255,220,40,.5)';
+            ctx.font = '7px "JetBrains Mono", monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText('ATM', sx, yOffset - 3);
+        }
+    }
+
+    ctx.restore();
+}
+
+// ── KINETIC FALLBACK: Canvas2D trade heat ladder (when WebGL2 unavailable) ──
+function _drawKineticFallback(canvas, heatMap) {
+    if (!canvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = canvas.clientWidth;
+    const cssH = canvas.clientHeight;
+    if (cssW < 10 || cssH < 10) return;
+    if (canvas.width !== Math.round(cssW * dpr) || canvas.height !== Math.round(cssH * dpr)) {
+        canvas.width = Math.round(cssW * dpr);
+        canvas.height = Math.round(cssH * dpr);
+    }
+    const ctx = canvas.getContext('2d');
+    ctx.save();
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    ctx.fillStyle = '#070a14';
+    ctx.fillRect(0, 0, cssW, cssH);
+
+    const hmData = window._latestHeatmapData;
+    const l2 = hmData ? hmData.domData : null;
+    if (!l2 || !l2.mid_price) {
+        ctx.fillStyle = 'rgba(140,160,200,.3)';
+        ctx.font = '11px "JetBrains Mono", monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('Waiting for L2 data...', cssW / 2, cssH / 2);
+        ctx.restore();
+        return;
+    }
+
+    const mid = l2.mid_price;
+    const bestBid = l2.best_bid || 0;
+    const bestAsk = l2.best_ask || 0;
+    const spread = bestAsk && bestBid ? (bestAsk - bestBid).toFixed(2) : '?';
+    const bids = l2.bids || {};
+    const asks = l2.asks || {};
+    const tick = 0.25;
+    const headerH = 26;
+    const rowH = 17;
+    const bodyH = cssH - headerH;
+    const numRows = Math.floor(bodyH / rowH);
+    const halfRows = Math.floor(numRows / 2);
+    const now = Date.now();
+
+    // Max depth & vol
+    let maxDepth = 1, bidTotal = 0, askTotal = 0;
+    for (const v of Object.values(bids)) { if (v > maxDepth) maxDepth = v; bidTotal += v; }
+    for (const v of Object.values(asks)) { if (v > maxDepth) maxDepth = v; askTotal += v; }
+    let maxVol = 1;
+    for (const h of Object.values(heatMap)) if (h.vol > maxVol) maxVol = h.vol;
+
+    // ── Header ──
+    ctx.fillStyle = 'rgba(255,255,255,.04)';
+    ctx.fillRect(0, 0, cssW, headerH);
+    ctx.font = 'bold 10px "JetBrains Mono", monospace';
+    ctx.fillStyle = 'rgba(180,190,220,.7)';
+    ctx.textAlign = 'left';
+    ctx.fillText('DEPTH LADDER', 8, 17);
+    ctx.font = '9px "JetBrains Mono", monospace';
+    ctx.fillStyle = 'rgba(255,220,40,.8)';
+    ctx.fillText(`MID ${mid.toFixed(2)}`, 110, 17);
+    ctx.fillStyle = 'rgba(140,160,200,.5)';
+    ctx.fillText(`SPR ${spread}`, 210, 17);
+    // Imbalance bar
+    const total = bidTotal + askTotal || 1;
+    const bidPct = bidTotal / total;
+    const barX = cssW - 130, barW = 80, barY = 8, barH = 10;
+    ctx.fillStyle = 'rgba(255,255,255,.06)';
+    ctx.fillRect(barX, barY, barW, barH);
+    ctx.fillStyle = 'rgba(0,200,120,.5)';
+    ctx.fillRect(barX, barY, barW * bidPct, barH);
+    ctx.fillStyle = 'rgba(220,40,80,.5)';
+    ctx.fillRect(barX + barW * bidPct, barY, barW * (1 - bidPct), barH);
+    ctx.fillStyle = 'rgba(180,190,220,.5)';
+    ctx.font = '7px "JetBrains Mono", monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText(`${(bidPct * 100).toFixed(0)}%`, barX - 2, barY + 8);
+    ctx.textAlign = 'left';
+    ctx.fillText(`${((1 - bidPct) * 100).toFixed(0)}%`, barX + barW + 2, barY + 8);
+
+    // Column headers
+    ctx.font = '8px "JetBrains Mono", monospace';
+    ctx.fillStyle = 'rgba(0,200,120,.5)';
+    ctx.textAlign = 'right';
+    ctx.fillText('BID', cssW * 0.35 - 4, headerH + 10);
+    ctx.fillStyle = 'rgba(160,170,200,.4)';
+    ctx.textAlign = 'center';
+    ctx.fillText('PRICE', cssW * 0.5, headerH + 10);
+    ctx.fillStyle = 'rgba(220,50,80,.5)';
+    ctx.textAlign = 'left';
+    ctx.fillText('ASK', cssW * 0.65 + 4, headerH + 10);
+    const ladderTop = headerH + 16;
+
+    ctx.font = '10px "JetBrains Mono", monospace';
+    for (let i = -halfRows; i <= halfRows; i++) {
+        const price = Math.round((mid + i * tick) / tick) * tick;
+        const y = ladderTop + (halfRows - i) * rowH;
+        if (y < ladderTop || y > cssH) continue;
+
+        const pk2 = price.toFixed(2);
+        const pk1 = price.toFixed(1);
+        const pk = price.toString();
+        const bidSz = bids[pk2] || bids[pk1] || bids[pk] || 0;
+        const askSz = asks[pk2] || asks[pk1] || asks[pk] || 0;
+
+        // Alternating row background
+        if (Math.abs(i) % 2 === 0) {
+            ctx.fillStyle = 'rgba(255,255,255,.012)';
+            ctx.fillRect(0, y - rowH / 2, cssW, rowH);
+        }
+
+        // Trade heat glow
+        const heat = heatMap[pk2];
+        if (heat && (now - heat.ts) < 5000) {
+            const age = (now - heat.ts) / 5000;
+            const hNorm = (heat.vol / maxVol) * (1 - age);
+            if (hNorm > 0.01) {
+                ctx.fillStyle = heat.side === 'bid'
+                    ? `rgba(0, 220, 120, ${hNorm * 0.35})`
+                    : `rgba(220, 40, 80, ${hNorm * 0.35})`;
+                ctx.fillRect(0, y - rowH / 2, cssW, rowH);
+            }
+        }
+
+        // Mid price highlight
+        const isMid = Math.abs(price - mid) < tick * 0.6;
+        if (isMid) {
+            ctx.fillStyle = 'rgba(255, 220, 0, 0.08)';
+            ctx.fillRect(0, y - rowH / 2, cssW, rowH);
+            // Yellow border
+            ctx.strokeStyle = 'rgba(255,220,40,.25)';
+            ctx.strokeRect(0, y - rowH / 2, cssW, rowH);
+        }
+
+        // Bid bar
+        if (bidSz > 0) {
+            const norm = Math.min(bidSz / maxDepth, 1.0);
+            const sqN = Math.sqrt(norm); // boost small values
+            const barW = sqN * (cssW * 0.33);
+            ctx.fillStyle = `rgba(0, 180, 100, ${0.12 + sqN * 0.4})`;
+            ctx.fillRect(cssW * 0.35 - barW, y - rowH / 2 + 1, barW, rowH - 2);
+            ctx.fillStyle = `rgba(0, 220, 130, ${0.5 + norm * 0.5})`;
+            ctx.textAlign = 'right';
+            ctx.fillText(bidSz.toString(), cssW * 0.35 - 4, y + 4);
+        }
+
+        // Price label
+        ctx.fillStyle = isMid ? 'rgba(255, 220, 40, 0.95)' : 'rgba(160, 170, 200, 0.55)';
+        ctx.textAlign = 'center';
+        ctx.font = isMid ? 'bold 11px "JetBrains Mono", monospace' : '10px "JetBrains Mono", monospace';
+        ctx.fillText(pk2, cssW * 0.5, y + 4);
+        ctx.font = '10px "JetBrains Mono", monospace';
+
+        // Ask bar
+        if (askSz > 0) {
+            const norm = Math.min(askSz / maxDepth, 1.0);
+            const sqN = Math.sqrt(norm);
+            const barW = sqN * (cssW * 0.33);
+            ctx.fillStyle = `rgba(180, 30, 60, ${0.12 + sqN * 0.4})`;
+            ctx.fillRect(cssW * 0.65, y - rowH / 2 + 1, barW, rowH - 2);
+            ctx.fillStyle = `rgba(220, 50, 80, ${0.5 + norm * 0.5})`;
+            ctx.textAlign = 'left';
+            ctx.fillText(askSz.toString(), cssW * 0.65 + 4, y + 4);
+        }
+    }
+
+    // Decay old heat entries
+    for (const [k, h] of Object.entries(heatMap)) {
+        if (now - h.ts > 10000) delete heatMap[k];
+    }
+
+    ctx.restore();
+}
+
+function _renderScreenerAlerts(data) {
+    const grid = document.getElementById('l2-signals-grid');
+    if (!grid) return;
+    const alerts = data.alerts || [];
+    if (alerts.length === 0) {
+        grid.innerHTML = '<div style="color:rgba(140,160,200,.4);padding:30px;text-align:center;grid-column:1/-1;font-family:\'JetBrains Mono\',monospace;font-size:.75rem">No unusual options activity detected</div>';
+        return;
+    }
+    grid.innerHTML = alerts.map(a => {
+        const pct = a.percentChange || 0;
+        const clr = pct >= 0 ? '#1fd17a' : '#e03060';
+        const vol = (a.volume || 0).toLocaleString();
+        const price = typeof a.lastPrice === 'number' ? a.lastPrice.toFixed(2) : '—';
+        return `<div style="background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);border-radius:6px;padding:10px;font-family:'JetBrains Mono',monospace">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+                <span style="font-size:11px;font-weight:700;color:#e0e6f0">${a.symbol || '?'}</span>
+                <span style="font-size:10px;font-weight:600;color:${clr}">${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%</span>
+            </div>
+            <div style="font-size:8px;color:rgba(140,160,200,.5);margin-bottom:6px;line-height:1.3">${a.description || ''}</div>
+            <div style="display:flex;justify-content:space-between;font-size:9px">
+                <span style="color:rgba(180,190,220,.7)">$${price}</span>
+                <span style="color:rgba(140,160,200,.5)">${vol} vol</span>
+            </div>
+        </div>`;
+    }).join('');
+}
+
 window._l2PendingElements = window._l2PendingElements || [];
 function _l2InitCandleChart(container, featureKey) {
     if (!container) {
@@ -933,9 +1384,8 @@ function _l2InitCandleChart(container, featureKey) {
                     _l2VolumeSeries = data.volumeSeries;
                     _l2BubbleSeries = data.bubbleSeries;
 
-                    // WallLines — only on chart panes
+                    // WallLines init + first fetch (attachment now handled by ChartCore)
                     if (typeof WallLines !== 'undefined') {
-                        WallLines.attachToSeries(data.candleSeries);
                         WallLines.update();
                     }
                     // OptionsChain — only on chart panes
@@ -975,6 +1425,15 @@ function _l2InitCandleChart(container, featureKey) {
                         data.chart.timeScale().fitContent();
                     }
                 }
+
+                // Replay buffered candle_history if it arrived before chart was ready
+                if (window._pendingCandleHistory) {
+                    const pending = window._pendingCandleHistory;
+                    window._pendingCandleHistory = null;
+                    setTimeout(() => {
+                        if (window.AltarisEvents) window.AltarisEvents.emit('data:candles:history', pending);
+                    }, 100);
+                }
             });
             window.AltarisEvents.on('chart:scroll', () => {
                 if (typeof ThermalFlare !== 'undefined') requestAnimationFrame(() => ThermalFlare.render());
@@ -991,23 +1450,31 @@ function _l2InitCandleChart(container, featureKey) {
         ChartCore.init(container, _l2ChartSymbol, featureKey);
     }
 
-    // ── Symbol buttons (old tab layout) — delegate to unified handler ──
-    document.querySelectorAll('#l2-chart-symbols .l2-tf-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-            document.querySelectorAll('#l2-chart-symbols .l2-tf-btn').forEach(b => b.classList.remove('active'));
+    // ── Symbol buttons (old tab layout) — use event delegation to avoid listener stacking ──
+    const symBar = document.getElementById('l2-chart-symbols');
+    if (symBar && !symBar._delegated) {
+        symBar._delegated = true;
+        symBar.addEventListener('click', (e) => {
+            const btn = e.target.closest('.l2-tf-btn');
+            if (!btn) return;
+            symBar.querySelectorAll('.l2-tf-btn').forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
             _l2SwitchSymbol(btn.dataset.sym);
         });
-    });
+    }
 
-    // ── Timeframe buttons (old tab layout) — delegate to unified handler ──
-    document.querySelectorAll('#l2-chart-tfs .l2-tf-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-            document.querySelectorAll('#l2-chart-tfs .l2-tf-btn').forEach(b => b.classList.remove('active'));
+    // ── Timeframe buttons (old tab layout) — use event delegation to avoid listener stacking ──
+    const tfBar = document.getElementById('l2-chart-tfs');
+    if (tfBar && !tfBar._delegated) {
+        tfBar._delegated = true;
+        tfBar.addEventListener('click', (e) => {
+            const btn = e.target.closest('.l2-tf-btn');
+            if (!btn) return;
+            tfBar.querySelectorAll('.l2-tf-btn').forEach(b => b.classList.remove('active'));
             btn.classList.add('active');
             _l2SwitchTimeframe(btn.dataset.tf);
         });
-    });
+    }
 
     // Initial fetch — full history with setData()
     _l2FetchCandles(true);
@@ -1236,6 +1703,8 @@ function _l2FetchCandles(fullRedraw, _retryCount) {
                             }, 100);
                         } else {
                             inst.chart.timeScale().fitContent();
+                            // Deferred fitContent in case layout hasn't settled yet
+                            setTimeout(() => inst.chart.timeScale().fitContent(), 200);
                         }
 
                         // ── VOLUME BUBBLE DATA — only for 'chart' feature ──
@@ -1352,6 +1821,32 @@ function _l2Render(data) {
         ).join('');
     }
 
+    // ── Status Bar live data ──
+    const symDom = (data.dom || {})[_l2ChartSymbol] || {};
+    const sMid = document.getElementById('s-mid');
+    const sSpread = document.getElementById('s-spread');
+    const sImbal = document.getElementById('s-imbal');
+    const sBidAsk = document.getElementById('s-bidask');
+    if (sMid) {
+        const mp = symDom.mid_price || (data.mid_prices || {})[_l2ChartSymbol] || 0;
+        sMid.textContent = mp ? 'MID ' + mp.toFixed(2) : 'MID —';
+    }
+    if (sSpread) {
+        const sp = symDom.spread || (symDom.best_ask && symDom.best_bid ? symDom.best_ask - symDom.best_bid : 0);
+        sSpread.textContent = sp ? 'SPR ' + sp.toFixed(2) : 'SPR —';
+    }
+    if (sImbal) {
+        const imb = symDom.imbalance || (data.imbalance || {})[_l2ChartSymbol] || 0;
+        const pct = (imb * 100).toFixed(0);
+        sImbal.textContent = 'IMB ' + (imb ? pct + '%' : '—');
+        sImbal.className = 's-data' + (imb > 0.1 ? ' s-pos' : imb < -0.1 ? ' s-neg' : '');
+    }
+    if (sBidAsk) {
+        const bt = symDom.bid_total || 0;
+        const at = symDom.ask_total || 0;
+        sBidAsk.textContent = bt || at ? 'B/A ' + bt + '/' + at : 'B/A —';
+    }
+
     _l2RenderImbalance(data);
     _l2RenderDOM(data.dom);
     // NOTE: Tape is driven by real-time trade_tick WS events (Path A).
@@ -1372,29 +1867,22 @@ function _l2Render(data) {
         const st = window._latestHeatmapData;
         // Ensure heatmap rendering only proceeds when ChartCore and the renderer are ready.
         if (!st) return;
-        if (typeof ChartCore === 'undefined' || typeof renderDomHeatmap2D !== 'function') {
-            // Defer rendering until ChartCore becomes available – retry on next animation frame.
-            requestAnimationFrame(() => window._forceRenderHeatmap());
-            return;
-        }
-        // Guard against missing chart instances.
+        if (typeof ChartCore === 'undefined' || typeof renderDomHeatmap2D !== 'function') return;
         const instances = ChartCore.getInstances();
-        if (!instances || instances.length === 0) {
-            requestAnimationFrame(() => window._forceRenderHeatmap());
-            return;
-        }
+        if (!instances || instances.length === 0) return;
         instances.forEach(inst => {
             if (inst.feature === 'heatmap' && inst.heatmapCanvas && st.hasDom) {
                 // Use candleSeries if present, otherwise fall back to chart's priceScale
                 const priceToY = price => {
-                    if (inst.candleSeries && typeof inst.candleSeries.priceToCoordinate === 'function') {
-                        return inst.candleSeries.priceToCoordinate(price);
-                    }
-                    // Fallback: use chart's priceScale (always available)
-                    const ps = inst.chart && inst.chart.priceScale && typeof inst.chart.priceScale().priceToCoordinate === 'function'
-                        ? inst.chart.priceScale()
-                        : null;
-                    return ps ? ps.priceToCoordinate(price) : null;
+                    try {
+                        if (inst.candleSeries && typeof inst.candleSeries.priceToCoordinate === 'function') {
+                            return inst.candleSeries.priceToCoordinate(price);
+                        }
+                        const ps = inst.chart && inst.chart.priceScale && typeof inst.chart.priceScale().priceToCoordinate === 'function'
+                            ? inst.chart.priceScale()
+                            : null;
+                        return ps ? ps.priceToCoordinate(price) : null;
+                    } catch(e) { return null; }
                 };
                 renderDomHeatmap2D(inst.heatmapCanvas, priceToY, st.mid_price);
             }
@@ -1408,9 +1896,10 @@ function _l2Render(data) {
     if (_useCanvasLadder && typeof KineticText !== 'undefined' && KineticText.programValid) {
         const domData = (data.dom || {})[_l2ChartSymbol] || {};
         // Only feed NEW trades (use cursor to avoid duplicate shocks)
-        const newTradeCount = _l2TapeAll.length - (_l2KineticCursor || 0);
+        const cursor = _l2KineticCursor || 0;
+        const newTradeCount = _l2TapeAll.length - cursor;
         if (newTradeCount > 0) {
-            const newTrades = _l2TapeAll.slice(0, newTradeCount);
+            const newTrades = _l2TapeAll.slice(cursor);
             KineticText.processTrades(newTrades, domData.bids || {}, domData.asks || {});
             _l2KineticCursor = _l2TapeAll.length;
         }
@@ -1530,6 +2019,52 @@ document.addEventListener('DOMContentLoaded', () => {
         wallsBtn.addEventListener('click', () => WallLines.toggle());
     }
 
+    // ── Metrics Ribbon toggle ──
+    const metricsBtn = document.getElementById('t-metrics-toggle');
+    const metricsRibbon = document.getElementById('t-metrics-ribbon');
+    if (metricsBtn && metricsRibbon) {
+        metricsBtn.addEventListener('click', () => {
+            const terminal = document.querySelector('.terminal');
+            terminal.classList.toggle('metrics-collapsed');
+            const collapsed = terminal.classList.contains('metrics-collapsed');
+            metricsBtn.classList.toggle('active', !collapsed);
+        });
+    }
+
+    // ── Settings Panel Mutual Exclusion ──
+    window.closeAllSettingsPanels = function(exceptId) {
+        ['vp-settings-panel', 'hm-settings-panel', 'tf-settings-panel'].forEach(id => {
+            if (id === exceptId) return;
+            const el = document.getElementById(id);
+            if (el) { if (id === 'tf-settings-panel') el.remove(); else el.style.display = 'none'; }
+        });
+    };
+
+    // ── Toolbar: Volume Profile toggles ──
+    const vpToggle = document.getElementById('t-vp-toggle');
+    if (vpToggle) {
+        vpToggle.addEventListener('click', () => {
+            if (typeof VolumeProfileOverlay === 'undefined') return;
+            const vis = VolumeProfileOverlay.toggleVisibility();
+            vpToggle.classList.toggle('active', vis);
+        });
+    }
+    document.querySelectorAll('#t-vp-modes .t-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            if (typeof VolumeProfileOverlay === 'undefined') return;
+            const mode = btn.dataset.vp;
+            btn.classList.toggle('active');
+            const active = [...document.querySelectorAll('#t-vp-modes .t-btn.active')].map(b => b.dataset.vp);
+            VolumeProfileOverlay.setActiveProfiles(active);
+        });
+    });
+    const vpSettingsBtn = document.getElementById('vp-settings-btn');
+    if (vpSettingsBtn) {
+        vpSettingsBtn.addEventListener('click', () => {
+            if (typeof VolumeProfileOverlay !== 'undefined') VolumeProfileOverlay.openSettings();
+        });
+    }
+
     // ── Toolbar: Timeframe buttons — delegate to unified handler ──
     document.querySelectorAll('#t-timeframes .t-btn').forEach(btn => {
         btn.addEventListener('click', () => _l2SwitchTimeframe(btn.dataset.tf));
@@ -1545,159 +2080,52 @@ document.addEventListener('DOMContentLoaded', () => {
                 
                 if (['chart', 'heatmap'].includes(featureKey)) {
                     // Track which feature controls the render mode
-                    _activeChartFeature = featureKey;
-                    window._activeChartFeature = featureKey;
-                    
+                    _activeChartFeature = featureKey === 'heatmap' ? 'heatmap' : 'chart';
+                    window._activeChartFeature = _activeChartFeature;
+
+                    const chartFK = featureKey === 'heatmap' ? 'heatmap' : 'chart';
+
                     const wrap = document.createElement('div');
                     wrap.id = 't-l2-candle-chart-' + paneIdx;
-                    wrap.dataset.feature = featureKey;
-                    wrap.style.cssText = 'width:100%;height:100%';
+                    wrap.dataset.feature = chartFK;
+                    wrap.style.cssText = 'width:100%;height:100%;position:relative';
                     slotEl.appendChild(wrap);
-                    
-                    _l2InitCandleChart(wrap, featureKey);
-                } else if (featureKey === 'gex' || featureKey === 'dex') {
-                    // ── GEX / DEX Bar Chart Pane ──
-                    // Creates a dedicated Chart.js bar chart showing per-strike exposure
-                    const canvasId = 'pane-' + featureKey + '-bar-' + paneIdx;
-                    slotEl.innerHTML = `
-                      <div style="width:100%;height:100%;overflow-y:auto;background:#070a14;padding:4px 0">
-                        <div style="padding:4px 8px;font-family:'JetBrains Mono',monospace;font-size:.6rem;font-weight:700;letter-spacing:.1em;color:${featureKey === 'gex' ? 'rgba(0,220,150,.7)' : 'rgba(0,180,255,.7)'};text-transform:uppercase">
-                          ${featureKey === 'gex' ? 'γ GEX — GAMMA EXPOSURE BY STRIKE' : 'Δ DEX — DELTA EXPOSURE BY STRIKE'}
-                        </div>
-                        <div style="width:100%;height:calc(100% - 22px);position:relative">
-                          <canvas id="${canvasId}"></canvas>
-                        </div>
-                      </div>`;
 
-                    // Fetch and render immediately, then refresh every 30s
-                    const _renderPaneBar = () => {
-                        authFetch('/api/data').then(r => r.json()).then(data => {
-                            if (!data || data.error) return;
-                            const barData = featureKey === 'gex' ? data.gex_bar : data.dex_bar;
-                            const spot = data.spot;
-                            if (!barData) return;
-                            const cPos = featureKey === 'gex' ? 'rgba(0,220,150,.88)' : 'rgba(0,180,255,.88)';
-                            const cNeg = featureKey === 'gex' ? 'rgba(255,50,90,.88)' : 'rgba(255,160,20,.88)';
-                            if (typeof buildNetBar === 'function') {
-                                buildNetBar(canvasId, barData, spot, cPos, cNeg);
+                    // ── Per-pane overlay toggle toolbar (chart only, not heatmap) ──
+                    if (chartFK === 'chart') {
+                        const toolbar = document.createElement('div');
+                        toolbar.className = 'overlay-toolbar';
+                        toolbar.innerHTML = [
+                            ['bubbles', 'BUB', 'Trade Bubbles'],
+                            ['flare',   'FLR', 'Options DEX Flare'],
+                            ['cumlDelta','CΔ',  'Cumulative Delta'],
+                            ['iceberg', 'ICE', 'Iceberg & Sweep'],
+                            ['vp',      'VP',  'Volume Profile'],
+                            ['walls',   'LVL', 'Options Levels'],
+                        ].map(([key, label, title]) =>
+                            `<button class="ov-btn active" data-ov="${key}" title="${title}">${label}</button>`
+                        ).join('');
+                        wrap.appendChild(toolbar);
+
+                        // Wire toggle clicks — each button controls its overlay independently
+                        toolbar.addEventListener('click', (e) => {
+                            const btn = e.target.closest('.ov-btn');
+                            if (!btn) return;
+                            const key = btn.dataset.ov;
+                            const cfg = wrap._overlayConfig;
+                            if (!cfg) return;
+                            cfg[key] = !cfg[key];
+                            btn.classList.toggle('active', cfg[key]);
+                            // Walls use price lines — need immediate clear/redraw
+                            if (key === 'walls' && typeof WallLines !== 'undefined') {
+                                WallLines.update();
                             }
-                        }).catch(e => console.warn('[Pane ' + featureKey + '] fetch error:', e));
-                    };
-                    // Wait for Chart.js to be available
-                    const _waitAndRender = () => {
-                        if (typeof Chart !== 'undefined' && typeof buildNetBar === 'function') {
-                            _renderPaneBar();
-                        } else {
-                            setTimeout(_waitAndRender, 300);
-                        }
-                    };
-                    _waitAndRender();
-                    // Store interval for cleanup
-                    slotEl._paneRefreshTimer = setInterval(_renderPaneBar, 30000);
-
-                } else if (featureKey === 'ivskew') {
-                    // ── IV Skew / Vol Surface Pane ──
-                    const surfaceId = 'pane-iv-surface-' + paneIdx;
-                    const skewId = 'pane-iv-skew-' + paneIdx;
-                    slotEl.innerHTML = `
-                      <div style="width:100%;height:100%;display:flex;flex-direction:column;background:#070a14">
-                        <div style="padding:4px 8px;font-family:'JetBrains Mono',monospace;font-size:.6rem;font-weight:700;letter-spacing:.1em;color:rgba(100,165,250,.7);text-transform:uppercase">
-                          🌊 IV SKEW — VOLATILITY SURFACE
-                        </div>
-                        <div id="${surfaceId}" style="flex:1;min-height:0"></div>
-                        <div style="height:140px;padding:0 4px;flex-shrink:0;position:relative">
-                          <canvas id="${skewId}"></canvas>
-                        </div>
-                      </div>`;
-
-                    const _renderIVPane = () => {
-                        // Fetch vol surface data from /api/volatility
-                        authFetch('/api/volatility').then(r => r.json()).then(data => {
-                            if (!data || data.error || !data.surface?.length) return;
-                            // Render Plotly 3D surface into the pane div
-                            const surfEl = document.getElementById(surfaceId);
-                            if (!surfEl || typeof Plotly === 'undefined') return;
-
-                            const surface = data.surface;
-                            const spot = data.spot || 0;
-                            const strikes = data.strikes;
-                            const x = strikes.map(s => ((s / spot) * 100).toFixed(1));
-                            const y = data.expirations.map(e => e.dte);
-                            const z = surface.map(e => e.ivs.map(v => {
-                                const pct = +(v * 100).toFixed(2);
-                                return (pct > 1 && pct <= 75) ? pct : 20; // clamp bad values
-                            }));
-
-                            Plotly.react(surfaceId, [{
-                                type: 'surface', x, y, z,
-                                colorscale: [[0,'rgb(10,10,60)'],[0.25,'rgb(30,70,200)'],[0.5,'rgb(60,180,220)'],[0.75,'rgb(255,200,60)'],[1,'rgb(255,60,60)']],
-                                opacity: 0.92,
-                                contours: { z: { show: true, usecolormap: true, project: { z: false } } },
-                                showscale: false,
-                            }], {
-                                paper_bgcolor: '#070a14', plot_bgcolor: '#070a14',
-                                margin: { l: 0, r: 0, t: 10, b: 0 },
-                                scene: {
-                                    bgcolor: '#070a14',
-                                    xaxis: { title: 'Moneyness %', gridcolor: 'rgba(50,70,120,.3)', tickfont: { size: 9, color: '#4a6a9a' } },
-                                    yaxis: { title: 'DTE', gridcolor: 'rgba(50,70,120,.3)', tickfont: { size: 9, color: '#4a6a9a' } },
-                                    zaxis: { title: 'IV %', gridcolor: 'rgba(50,70,120,.3)', tickfont: { size: 9, color: '#4a6a9a' } },
-                                    camera: { eye: { x: -1.5, y: -2.0, z: 0.8 } },
-                                },
-                                autosize: true,
-                            }, { displayModeBar: false, responsive: true });
-
-                            // Render 2D IV skew line (nearest expiry)
-                            if (typeof Chart !== 'undefined') {
-                                const nearest = surface[0];
-                                const ivPct = nearest.ivs.map(v => +(v * 100).toFixed(2));
-                                const skewCanvas = document.getElementById(skewId);
-                                if (!skewCanvas) return;
-                                const existingChart = Chart.getChart(skewCanvas);
-                                if (existingChart) existingChart.destroy();
-                                new Chart(skewCanvas.getContext('2d'), {
-                                    type: 'line',
-                                    data: {
-                                        labels: strikes.map(s => '$' + s),
-                                        datasets: [{
-                                            label: nearest.label + ' IV',
-                                            data: ivPct,
-                                            borderColor: 'rgba(100,165,250,.9)',
-                                            backgroundColor: 'rgba(100,165,250,.08)',
-                                            borderWidth: 1.5, pointRadius: 0, tension: 0.3, fill: true,
-                                        }]
-                                    },
-                                    options: {
-                                        responsive: true, maintainAspectRatio: false,
-                                        plugins: { legend: { display: false } },
-                                        scales: {
-                                            x: { ticks: { color: '#3a5070', font: { size: 8 }, maxTicksLimit: 10 }, grid: { color: 'rgba(255,255,255,.03)' } },
-                                            y: { ticks: { color: '#3a5070', font: { size: 8 }, callback: v => v + '%' }, grid: { color: 'rgba(255,255,255,.03)' } },
-                                        }
-                                    }
-                                });
-                            }
-                        }).catch(e => console.warn('[Pane ivskew] fetch error:', e));
-                    };
-                    // Lazy-load Plotly then render
-                    if (typeof window._ensurePlotly === 'function') {
-                        window._ensurePlotly(_renderIVPane);
-                    } else if (typeof Plotly !== 'undefined') {
-                        _renderIVPane();
+                        });
                     }
-                    slotEl._paneRefreshTimer = setInterval(_renderIVPane, 60000);
 
-                } else if (['alpha', 'opscr'].includes(featureKey)) {
-                    _activeChartFeature = featureKey;
-                    window._activeChartFeature = featureKey;
-                    
-                    const wrap = document.createElement('div');
-                    wrap.id = 't-l2-candle-chart-' + paneIdx;
-                    wrap.dataset.feature = featureKey;
-                    wrap.style.cssText = 'width:100%;height:100%';
-                    slotEl.appendChild(wrap);
-                    
-                    _l2InitCandleChart(wrap, featureKey);
+                    // Defer init by one frame so browser lays out the container first
+                    // (prevents 0-width chart creation which makes candles invisible)
+                    requestAnimationFrame(() => _l2InitCandleChart(wrap, chartFK));
                 } else if (featureKey === 'ladder') {
                     // Canvas 2D Depth Ladder + Kinetic Text WebGL overlay
                     slotEl.innerHTML = `
@@ -1759,6 +2187,151 @@ document.addEventListener('DOMContentLoaded', () => {
                     } else {
                         slotEl.innerHTML = `<div style="color:var(--dim);padding:20px;">AlphaDashboard module not loaded.</div>`;
                     }
+                } else if (featureKey === 'pressure') {
+                    slotEl.innerHTML = `
+                      <div style="position:relative;width:100%;height:100%;background:#070a14">
+                        <canvas id="dom-pressure-canvas-${paneIdx}" style="width:100%;height:100%;display:block"></canvas>
+                      </div>`;
+                    requestAnimationFrame(() => {
+                        const pCanvas = document.getElementById('dom-pressure-canvas-' + paneIdx);
+                        if (pCanvas && typeof PressureField !== 'undefined') {
+                            PressureField.init(pCanvas);
+                            if (!PressureField._ready) {
+                                // WebGL2 not available — show fallback
+                                slotEl.querySelector('div').innerHTML = `
+                                  <div style="display:flex;align-items:center;justify-content:center;height:100%;color:rgba(140,160,200,.4);font-family:'JetBrains Mono',monospace;font-size:.7rem">
+                                    Pressure Field requires WebGL2 (open in Chrome with GPU)
+                                  </div>`;
+                                return;
+                            }
+                            // Standalone render loop
+                            let _pfRAF;
+                            const _pfLoop = () => {
+                                if (!document.body.contains(pCanvas)) return; // unmounted
+                                if (PressureField._ready) {
+                                    PressureField.update(0.016);
+                                    PressureField.render();
+                                }
+                                _pfRAF = requestAnimationFrame(_pfLoop);
+                            };
+                            _pfRAF = requestAnimationFrame(_pfLoop);
+                            slotEl._pfRAF = _pfRAF;
+
+                            // Wire L2 DOM data → obstacle texture
+                            const _pfL2Handler = (data) => {
+                                if (!PressureField._ready || !document.body.contains(pCanvas)) return;
+                                const symData = (data.dom || {})[_l2ChartSymbol] || {};
+                                const bids = symData.bids || {};
+                                const asks = symData.asks || {};
+                                const mid = symData.mid_price || 0;
+                                if (!mid) return;
+                                // Build visible price range: 40 levels centered on mid (0.25 tick)
+                                const tick = 0.25;
+                                const levels = 40;
+                                const visiblePrices = [];
+                                for (let i = -levels; i <= levels; i++) {
+                                    visiblePrices.push(mid + i * tick);
+                                }
+                                // Compute max depth for normalization
+                                let maxDepth = 1;
+                                for (const k of Object.keys(bids)) { if (bids[k] > maxDepth) maxDepth = bids[k]; }
+                                for (const k of Object.keys(asks)) { if (asks[k] > maxDepth) maxDepth = asks[k]; }
+                                PressureField.updateObstacles(bids, asks, visiblePrices, maxDepth);
+                            };
+                            window.AltarisEvents.on('data:l2:update', _pfL2Handler);
+                            slotEl._pfL2Handler = _pfL2Handler;
+
+                            // Wire trade ticks → force injection
+                            const _pfTradeHandler = (data) => {
+                                if (!PressureField._ready || !document.body.contains(pCanvas)) return;
+                                if (data.symbol !== _l2ChartSymbol) return;
+                                const priceStr = parseFloat(data.price).toFixed(2);
+                                const vol = data.vol || data.volume || data.size || 1;
+                                const side = (data.side === 'sell' || data.side === 's') ? 'ask' : 'bid';
+                                PressureField.injectForce(priceStr, vol, side);
+                            };
+                            window.AltarisEvents.on('data:trades:update', _pfTradeHandler);
+                            slotEl._pfTradeHandler = _pfTradeHandler;
+                        }
+                    });
+                } else if (featureKey === 'kinetic') {
+                    slotEl.innerHTML = `
+                      <div style="position:relative;width:100%;height:100%;background:#070a14">
+                        <canvas id="dom-kinetic-canvas-${paneIdx}" style="width:100%;height:100%;display:block"></canvas>
+                      </div>`;
+                    requestAnimationFrame(() => {
+                        const kCanvas = document.getElementById('dom-kinetic-canvas-' + paneIdx);
+                        if (!kCanvas || typeof KineticText === 'undefined') return;
+                        if (!KineticText.programValid) {
+                            const ok = KineticText.init(kCanvas);
+                            if (!ok) {
+                                // WebGL2 not available — use Canvas2D trade ladder fallback
+                                const _kHeat = {}; // { priceKey: { ts, vol, side } }
+                                const _kTradeHandler = (data) => {
+                                    if (!document.body.contains(kCanvas)) return;
+                                    if (data.symbol !== _l2ChartSymbol) return;
+                                    const pk = parseFloat(data.price).toFixed(2);
+                                    const prev = _kHeat[pk] || { vol: 0 };
+                                    _kHeat[pk] = { ts: Date.now(), vol: prev.vol + (data.vol || data.volume || 1), side: data.side === 'sell' || data.side === 's' ? 'ask' : 'bid' };
+                                };
+                                window.AltarisEvents.on('data:trades:update', _kTradeHandler);
+                                slotEl._kTradeHandler = _kTradeHandler;
+
+                                let _kRAF;
+                                const _kLoop = () => {
+                                    if (!document.body.contains(kCanvas)) return;
+                                    _drawKineticFallback(kCanvas, _kHeat);
+                                    _kRAF = requestAnimationFrame(_kLoop);
+                                };
+                                _kRAF = requestAnimationFrame(_kLoop);
+                                slotEl._kRAF = _kRAF;
+                            }
+                        }
+                    });
+                } else if (featureKey === 'bookms') {
+                    if (typeof BookMsHUD !== 'undefined') BookMsHUD.init(slotEl);
+                } else if (featureKey === 'eqtape') {
+                    if (typeof EquityTapePane !== 'undefined') EquityTapePane.init(slotEl);
+                } else if (featureKey === 'dealer') {
+                    if (typeof DealerFlowPane !== 'undefined') DealerFlowPane.init(slotEl);
+                } else if (featureKey === 'xdiv') {
+                    if (typeof CrossDivergencePane !== 'undefined') CrossDivergencePane.init(slotEl);
+                } else if (featureKey === 'volsurf') {
+                    if (typeof VolSurfacePane !== 'undefined') VolSurfacePane.init(slotEl);
+                } else if (featureKey === 'optflow') {
+                    if (typeof OptionsFlowPane !== 'undefined') OptionsFlowPane.init(slotEl);
+                } else if (featureKey === 'ocheat') {
+                    // Options Chain GEX Heatmap (Canvas2D)
+                    slotEl.innerHTML = `<div style="width:100%;height:100%;background:#070a14;position:relative">
+                        <canvas id="ocheat-canvas-${paneIdx}" style="width:100%;height:100%;display:block"></canvas>
+                    </div>`;
+                    const _ocData = {}; // { dte: { strike: { gex, iv, oi, side } } }
+                    const _ocCanvas = document.getElementById('ocheat-canvas-' + paneIdx);
+                    let _ocDirty = true;
+                    const _ocHandler = (d) => {
+                        if (!d || !d.strike || !d.iv) return;
+                        const dte = d.dte || 0;
+                        if (!_ocData[dte]) _ocData[dte] = {};
+                        const key = d.strike + '_' + d.side;
+                        _ocData[dte][key] = { strike: d.strike, side: d.side, gex: d.dollar_gex || 0, iv: d.iv, oi: d.oi || 0, vol: d.vol || 0 };
+                        _ocDirty = true;
+                    };
+                    // Wire option_mark_update
+                    if (window._sio) window._sio.on('option_mark_update', _ocHandler);
+                    slotEl._ocHandler = _ocHandler;
+
+                    // Render loop
+                    let _ocRAF;
+                    const _ocRender = () => {
+                        if (!document.body.contains(_ocCanvas)) return;
+                        if (_ocDirty) {
+                            _ocDirty = false;
+                            _drawOcHeat(_ocCanvas, _ocData);
+                        }
+                        _ocRAF = requestAnimationFrame(_ocRender);
+                    };
+                    _ocRAF = requestAnimationFrame(_ocRender);
+                    slotEl._ocRAF = _ocRAF;
                 } else if (featureKey.startsWith('oc')) {
                     // Option Chain Panel
                     const ocElem = document.getElementById('t-options');
@@ -1771,32 +2344,26 @@ document.addEventListener('DOMContentLoaded', () => {
 
             // ── Feature Unmount: reset state when a pane feature is removed ──
             AltarisLayout.onFeatureUnmount = (paneIdx, featureKey, slotEl) => {
-                if (featureKey === 'chart' || featureKey === 'heatmap') {
+                if (['chart', 'heatmap'].includes(featureKey)) {
                     if (typeof ChartCore !== 'undefined') {
-                        // Destroy only the chart inside this specific slotEl
                         const chartDiv = slotEl.querySelector('[id^="t-l2-candle-chart"]');
                         if (chartDiv) ChartCore.destroy(chartDiv);
                     }
                 }
-                // Clean up GEX/DEX/IV Skew refresh timers and Chart.js instances
-                if (featureKey === 'gex' || featureKey === 'dex' || featureKey === 'ivskew') {
-                    if (slotEl._paneRefreshTimer) {
-                        clearInterval(slotEl._paneRefreshTimer);
-                        slotEl._paneRefreshTimer = null;
-                    }
-                    // Destroy any Chart.js charts in this pane
-                    if (typeof Chart !== 'undefined') {
-                        slotEl.querySelectorAll('canvas').forEach(c => {
-                            const ch = Chart.getChart(c);
-                            if (ch) ch.destroy();
-                        });
-                    }
-                    // Destroy Plotly surfaces
-                    if (typeof Plotly !== 'undefined') {
-                        slotEl.querySelectorAll('[id^="pane-iv-surface"]').forEach(el => {
-                            try { Plotly.purge(el); } catch(e) {}
-                        });
-                    }
+                if (featureKey === 'pressure') {
+                    if (slotEl._pfRAF) cancelAnimationFrame(slotEl._pfRAF);
+                    if (slotEl._pfL2Handler) window.AltarisEvents.off('data:l2:update', slotEl._pfL2Handler);
+                    if (slotEl._pfTradeHandler) window.AltarisEvents.off('data:trades:update', slotEl._pfTradeHandler);
+                    if (typeof PressureField !== 'undefined') PressureField.destroy();
+                }
+                if (featureKey === 'ocheat') {
+                    if (slotEl._ocRAF) cancelAnimationFrame(slotEl._ocRAF);
+                    if (slotEl._ocHandler && window._sio) window._sio.off('option_mark_update', slotEl._ocHandler);
+                }
+                if (featureKey === 'kinetic') {
+                    if (typeof KineticText !== 'undefined' && KineticText.programValid) KineticText.destroy();
+                    if (slotEl._kRAF) cancelAnimationFrame(slotEl._kRAF);
+                    if (slotEl._kTradeHandler) window.AltarisEvents.off('data:trades:update', slotEl._kTradeHandler);
                 }
                 if (featureKey === 'alpha') {
                     if (typeof window.AlphaDashboard !== 'undefined') {
@@ -1819,10 +2386,33 @@ document.addEventListener('DOMContentLoaded', () => {
                     }
                     _l2KineticCursor = 0;
                 }
+                if (featureKey === 'eqbook') {
+                    _tapeNodesCreated = false;
+                    _l2TapePrevLen = 0;
+                    _deltaStripEl = null;
+                    _deltaLabelEl = null;
+                    _eqCtxCached = false;
+                }
+                if (featureKey === 'bookms' && typeof BookMsHUD !== 'undefined') BookMsHUD.destroy();
+                if (featureKey === 'eqtape' && typeof EquityTapePane !== 'undefined') EquityTapePane.destroy();
+                if (featureKey === 'dealer' && typeof DealerFlowPane !== 'undefined') DealerFlowPane.destroy();
+                if (featureKey === 'xdiv' && typeof CrossDivergencePane !== 'undefined') CrossDivergencePane.destroy();
+                if (featureKey === 'volsurf' && typeof VolSurfacePane !== 'undefined') VolSurfacePane.destroy();
+                if (featureKey === 'optflow' && typeof OptionsFlowPane !== 'undefined') OptionsFlowPane.destroy();
             };
 
             AltarisLayout.triggerInitialMounts();
             _startL2Poll();
+
+            // Safety net: if candles haven't loaded after 4s, force a REST fetch
+            setTimeout(() => {
+                if (!_l2CandleDataCache && typeof ChartCore !== 'undefined' && ChartCore.getInstances().length > 0) {
+                    console.warn('[Safety] No candle data after 4s — force fetching...');
+                    _l2FetchCandles(true).then(() => {
+                        ChartCore.getInstances().forEach(inst => inst.chart.timeScale().fitContent());
+                    });
+                }
+            }, 4000);
         } else {
             // Legacy layout fallback
             _l2InitCandleChart();
@@ -1837,7 +2427,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (typeof WallLines !== 'undefined') WallLines.init();
 
     // ── Metric bridge: update toolbar from old dash metrics ──
-    setInterval(_termUpdateMetrics, 2000);
+    if (window._termMetricsTimer) clearInterval(window._termMetricsTimer);
+    window._termMetricsTimer = setInterval(_termUpdateMetrics, 2000);
 
     // Removed duplicate event listener for #t-heatmap-settings-btn since it conflicts with volume_bubbles.js
 

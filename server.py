@@ -1,5 +1,5 @@
 """""
-Altaris Terminal - Flask Web Server
+Altaris Dev - Flask Web Server
 """
 import sys, os, json, secrets, hashlib, time, threading
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -641,7 +641,7 @@ def _schwab_refresh():
         "access_token":  data["access_token"],
         "refresh_token": data.get("refresh_token", rt),
         "token_expiry":  _t.time() + data.get("expires_in", 1800),
-        "saved_at":      _t.strftime("%Y-%m-%dT%H:%M:%S"),
+        "saved_at":      _t.strftime("%Y-%m-%dT%H:%M:%S", _t.localtime()),
     }
     with open(_SCHWAB_TOKEN_FILE, "w") as f:
         json.dump(new_tokens, f, indent=2)
@@ -2338,6 +2338,281 @@ def api_l2_candles():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/vprofile")
+def api_vprofile():
+    """Volume profile from TopStepX 1m candle bp data.
+    Query params:
+      ?symbol=NQ        (default NQ)
+      ?mode=session     (session|prior_day|rolling_4h|custom)
+      ?from_ts=0        (Unix timestamp — custom mode start)
+      ?to_ts=0          (Unix timestamp — custom mode end)
+      ?row_count=0      (0=auto tick-level, or 50/100/200/500 bucket rows)
+      ?va_pct=0.70      (value area %, 0.50–0.95)
+    Returns JSON: {symbol, mode, poc, vah, val, total_vol, levels_count,
+                   from_ts, to_ts, levels: [{price, buy, sell, total, delta}]}
+    """
+    try:
+        from background_engine.l2_worker import get_candles
+        import time as _t
+        from datetime import datetime
+        import pytz
+
+        symbol = request.args.get("symbol", "NQ").upper()
+        mode = request.args.get("mode", "session")
+        row_count = int(request.args.get("row_count", 0))
+        va_pct = float(request.args.get("va_pct", 0.70))
+        va_pct = max(0.50, min(0.95, va_pct))  # clamp
+        now = _t.time()
+        et = pytz.timezone("US/Eastern")
+        now_et = datetime.fromtimestamp(now, tz=et)
+
+        # Get all 1m candles
+        raw = get_candles(symbol, "1m")
+        if not raw:
+            return jsonify({"error": "No candle data available"}), 404
+
+        # Determine time range based on mode
+        if mode == "prior_day":
+            # Prior session: find yesterday's 6PM ET → today's 6PM ET
+            today_6pm = now_et.replace(hour=18, minute=0, second=0, microsecond=0)
+            if now_et.hour < 18:
+                session_end = today_6pm
+                session_start = session_end.replace(day=session_end.day - 1)
+            else:
+                session_start = today_6pm
+                session_end = today_6pm.replace(day=today_6pm.day + 1)
+            # Go back one more day for "prior"
+            from datetime import timedelta
+            session_end = session_start
+            session_start = session_start - timedelta(days=1)
+            from_ts = int(session_start.timestamp())
+            to_ts = int(session_end.timestamp())
+
+            # Fallback: if prior day has < 10 candles in memory, use current session
+            prior_count = sum(1 for c in raw if from_ts <= int(c.get("t", 0)) <= to_ts)
+            if prior_count < 10:
+                if now_et.hour >= 18:
+                    fallback_start = now_et.replace(hour=18, minute=0, second=0, microsecond=0)
+                else:
+                    fallback_start = (now_et - timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)
+                from_ts = int(fallback_start.timestamp())
+                to_ts = int(now)
+
+        elif mode == "rolling_1h":
+            from_ts = int(now - 1 * 3600)
+            to_ts = int(now)
+
+        elif mode == "rolling_2h":
+            from_ts = int(now - 2 * 3600)
+            to_ts = int(now)
+
+        elif mode == "rolling_4h":
+            from_ts = int(now - 4 * 3600)
+            to_ts = int(now)
+
+        elif mode == "2day":
+            from datetime import timedelta
+            if now_et.hour >= 18:
+                session_end = now_et.replace(hour=18, minute=0, second=0, microsecond=0)
+            else:
+                session_end = (now_et - timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)
+            session_start = session_end - timedelta(days=2)
+            from_ts = int(session_start.timestamp())
+            to_ts = int(now)
+
+        elif mode == "weekly":
+            from datetime import timedelta
+            from_ts = int(now - 7 * 86400)
+            to_ts = int(now)
+
+        elif mode == "custom":
+            from_ts = int(request.args.get("from_ts", 0))
+            to_ts = int(request.args.get("to_ts", 0))
+            if from_ts <= 0 or to_ts <= 0 or to_ts <= from_ts:
+                return jsonify({"error": "custom mode requires valid from_ts and to_ts"}), 400
+
+        else:  # session (current)
+            # Current session: today's 6PM ET (or yesterday's if before 6PM)
+            if now_et.hour >= 18:
+                session_start = now_et.replace(hour=18, minute=0, second=0, microsecond=0)
+            else:
+                from datetime import timedelta
+                session_start = (now_et - timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)
+            from_ts = int(session_start.timestamp())
+            to_ts = int(now)
+
+        # Aggregate volume-at-price across time range
+        # Candles with bp (live tick data) use exact volume-at-price.
+        # Candles without bp (backfill) distribute volume uniformly across H-L.
+        TICK_SIZES = {"NQ": 0.25, "GC": 0.10, "ES": 0.25}
+        tick = TICK_SIZES.get(symbol, 0.25)
+        profile = {}  # {price_str: {buy, sell}}
+        candles_used = 0
+        for c in raw:
+            t = int(c.get("t", 0))
+            if t < from_ts or t > to_ts:
+                continue
+            bp = c.get("bp")
+            if bp:
+                # Exact volume-at-price from live ticks
+                candles_used += 1
+                for price_str, volumes in bp.items():
+                    if not isinstance(volumes, (list, tuple)) or len(volumes) < 2:
+                        continue
+                    if price_str not in profile:
+                        profile[price_str] = {"buy": 0, "sell": 0}
+                    profile[price_str]["buy"] += volumes[0]
+                    profile[price_str]["sell"] += volumes[1]
+            else:
+                # Backfill candle — distribute volume across H-L range
+                h = c.get("h", 0)
+                l = c.get("l", 0)
+                v = c.get("v", 0)
+                o = c.get("o", 0)
+                cl = c.get("c", 0)
+                if v <= 0 or h <= 0 or l <= 0 or h <= l:
+                    continue
+                candles_used += 1
+                # Generate price levels from low to high at tick resolution
+                n_ticks = max(int(round((h - l) / tick)), 1)
+                vol_per_tick = v / (n_ticks + 1)
+                # Determine buy/sell split from candle direction
+                is_bull = cl >= o
+                buy_ratio = 0.6 if is_bull else 0.4
+                sell_ratio = 1.0 - buy_ratio
+                price = l
+                while price <= h + tick * 0.01:
+                    ps = f"{price:.2f}"
+                    if ps not in profile:
+                        profile[ps] = {"buy": 0, "sell": 0}
+                    profile[ps]["buy"] += vol_per_tick * buy_ratio
+                    profile[ps]["sell"] += vol_per_tick * sell_ratio
+                    price = round(price + tick, 10)
+
+        if not profile:
+            return jsonify({
+                "symbol": symbol, "mode": mode, "from_ts": from_ts, "to_ts": to_ts,
+                "poc": 0, "vah": 0, "val": 0, "total_vol": 0,
+                "levels_count": 0, "candles_used": 0, "levels": []
+            })
+
+        # Build sorted levels
+        levels = []
+        for price_str, vols in profile.items():
+            total = vols["buy"] + vols["sell"]
+            levels.append({
+                "price": float(price_str),
+                "buy": vols["buy"],
+                "sell": vols["sell"],
+                "total": total,
+                "delta": vols["buy"] - vols["sell"],
+            })
+        levels.sort(key=lambda x: x["price"])
+        total_vol = sum(lv["total"] for lv in levels)
+
+        # POC: price with highest volume
+        poc_level = max(levels, key=lambda x: x["total"])
+        poc = poc_level["price"]
+
+        # Value Area — expand from POC outward
+        levels_by_vol = sorted(levels, key=lambda x: x["total"], reverse=True)
+        va_target = total_vol * va_pct
+        va_vol = 0
+        va_prices = []
+        for lv in levels_by_vol:
+            va_vol += lv["total"]
+            va_prices.append(lv["price"])
+            if va_vol >= va_target:
+                break
+        va_prices.sort()
+        vah = va_prices[-1] if va_prices else poc
+        val = va_prices[0] if va_prices else poc
+
+        # Bucket into row_count bins if requested
+        if row_count > 0 and len(levels) > row_count:
+            min_p = levels[0]["price"]
+            max_p = levels[-1]["price"]
+            bucket_size = (max_p - min_p) / row_count
+            if bucket_size > 0:
+                buckets = []
+                for i in range(row_count):
+                    lo = min_p + i * bucket_size
+                    hi = lo + bucket_size
+                    b = {"price": round(lo + bucket_size / 2, 2), "buy": 0, "sell": 0, "total": 0, "delta": 0}
+                    for lv in levels:
+                        if lv["price"] >= lo and (lv["price"] < hi or i == row_count - 1):
+                            b["buy"] += lv["buy"]
+                            b["sell"] += lv["sell"]
+                            b["total"] += lv["total"]
+                            b["delta"] += lv["delta"]
+                    if b["total"] > 0:
+                        buckets.append(b)
+                levels = buckets
+
+        # ── Initial Balance (IB) — first 30 min of session ──
+        ib_high = None
+        ib_low = None
+        if mode in ("session", "prior_day"):
+            # Session open for IB: use the actual session start, not fallback from_ts
+            if mode == "session":
+                if now_et.hour >= 18:
+                    ib_session_start = int(now_et.replace(hour=18, minute=0, second=0, microsecond=0).timestamp())
+                else:
+                    from datetime import timedelta
+                    ib_session_start = int((now_et - timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0).timestamp())
+            else:
+                ib_session_start = from_ts
+            ib_end = ib_session_start + 30 * 60
+            ib_count = 0
+            for c in raw:
+                ct = int(c.get("t", 0))
+                if ct < ib_session_start or ct > ib_end:
+                    continue
+                ib_count += 1
+                ch = c.get("h", 0)
+                cl_ib = c.get("l", 0)
+                if ch > 0 and cl_ib > 0:
+                    if ib_high is None or ch > ib_high:
+                        ib_high = ch
+                    if ib_low is None or cl_ib < ib_low:
+                        ib_low = cl_ib
+
+        result = {
+            "symbol": symbol,
+            "mode": mode,
+            "from_ts": from_ts,
+            "to_ts": to_ts,
+            "poc": poc,
+            "vah": vah,
+            "val": val,
+            "total_vol": total_vol,
+            "levels_count": len(levels),
+            "candles_used": candles_used,
+            "levels": levels,
+        }
+        if ib_high is not None and ib_low is not None:
+            ib_range = ib_high - ib_low
+            result["ib_high"] = ib_high
+            result["ib_low"] = ib_low
+            result["ib_range"] = ib_range
+            # IB extensions: 0.5x, 1x, 1.5x, 2x above and below
+            result["ib_ext"] = {
+                "upper_0_5": ib_high + ib_range * 0.5,
+                "upper_1_0": ib_high + ib_range * 1.0,
+                "upper_1_5": ib_high + ib_range * 1.5,
+                "upper_2_0": ib_high + ib_range * 2.0,
+                "lower_0_5": ib_low - ib_range * 0.5,
+                "lower_1_0": ib_low - ib_range * 1.0,
+                "lower_1_5": ib_low - ib_range * 1.5,
+                "lower_2_0": ib_low - ib_range * 2.0,
+            }
+        return jsonify(result)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/l2/status")
 def api_l2_status():
     """L2 connection health and candle availability."""
@@ -2581,6 +2856,40 @@ def _ensure_workers_started():
 @socketio.on('connect')
 def handle_connect():
     print(f"[Socket.IO] Client connected: {request.sid}")
+    # Push candle history immediately on connect (NQ 1m by default).
+    # This ensures bubble profiles (bp) are populated on the first page load
+    # without waiting for a topology reconnect / gap-fill trigger.
+    try:
+        from background_engine.l2_worker import get_candles, _CURRENT_CANDLE
+        candles_raw = get_candles('NQ', '1m')
+        # Append current in-flight candle (has live bp but isn't frozen yet)
+        cur = _CURRENT_CANDLE.get('NQ', {}).get('1m')
+        all_candles = list(candles_raw)
+        if cur and (not all_candles or cur['t'] != all_candles[-1]['t']):
+            all_candles.append(cur)
+        send_candles = []
+        for c in all_candles[-200:]:
+            out = {
+                "time":   int(c.get("t", 0)),
+                "open":   c["o"], "high": c["h"],
+                "low":    c["l"], "close": c["c"],
+                "volume": c.get("v", 0),
+            }
+            bp = c.get("bp")
+            if bp:
+                out["bp"] = {k: v for k, v in bp.items() if v[0] > 0 or v[1] > 0}
+            for key in ("icebergs", "sweeps", "delta_div", "ignition",
+                        "spoofs", "drifting_iceberg", "wall_gone"):
+                val = c.get(key)
+                if val:
+                    out[key] = val
+            send_candles.append(out)
+        if send_candles:
+            emit('candle_history', {'symbol': 'NQ', 'tf': '1m', 'candles': send_candles})
+            bp_count = sum(1 for c in send_candles if c.get('bp'))
+            print(f"[Socket.IO] Pushed {len(send_candles)} candles ({bp_count} with bp) to {request.sid}")
+    except Exception as e:
+        print(f"[Socket.IO] candle_history push on connect failed: {e}")
 
 @socketio.on('disconnect')
 def handle_disconnect():
@@ -2588,14 +2897,56 @@ def handle_disconnect():
 
 @socketio.on('subscribe')
 def handle_subscribe(data):
-    """Client subscribes to a symbol+timeframe for live candle push."""
-    symbol = data.get('symbol', 'NQ')
+    """Client subscribes to a symbol+timeframe for live candle push.
+    Immediately sends full candle history for the requested symbol/tf.
+    """
+    symbol = data.get('symbol', 'NQ').upper()
     tf = data.get('tf', '1m')
     print(f"[Socket.IO] Client {request.sid} subscribed to {symbol}/{tf}")
     emit('subscribed', {'symbol': symbol, 'tf': tf})
+    # Reset V2 engines so stale state from previous symbol doesn't bleed
+    try:
+        from background_engine.l2_worker import _reset_v2_engines
+        _reset_v2_engines(symbol)
+    except Exception:
+        pass  # l2_worker not yet loaded on cold start
+    # Push full candle history for the requested symbol/tf
+    try:
+        from background_engine.l2_worker import get_candles, _CURRENT_CANDLE, CANDLE_TIMEFRAMES
+        if tf not in CANDLE_TIMEFRAMES:
+            return
+        candles_raw = get_candles(symbol, tf)
+        cur = _CURRENT_CANDLE.get(symbol, {}).get(tf)
+        all_candles = list(candles_raw)
+        if cur and (not all_candles or cur['t'] != all_candles[-1]['t']):
+            all_candles.append(cur)
+        send_candles = []
+        for c in all_candles[-300:]:
+            out = {
+                "time":   int(c.get("t", 0)),
+                "open":   c["o"], "high": c["h"],
+                "low":    c["l"], "close": c["c"],
+                "volume": c.get("v", 0),
+            }
+            bp = c.get("bp")
+            if bp:
+                out["bp"] = {k: v for k, v in bp.items() if v[0] > 0 or v[1] > 0}
+            for key in ("icebergs", "sweeps", "delta_div", "ignition",
+                        "spoofs", "drifting_iceberg", "wall_gone"):
+                val = c.get(key)
+                if val:
+                    out[key] = val
+            send_candles.append(out)
+        if send_candles:
+            emit('candle_history', {'symbol': symbol, 'tf': tf, 'candles': send_candles})
+            bp_count = sum(1 for c in send_candles if c.get('bp'))
+            print(f"[Socket.IO] subscribe: pushed {len(send_candles)} {symbol}/{tf} candles "
+                  f"({bp_count} with bp) to {request.sid}")
+    except Exception as e:
+        print(f"[Socket.IO] subscribe candle_history push failed: {e}")
 
 if __name__ == "__main__":
-    print("Starting Altaris Terminal with Socket.IO...")
+    print("Starting Altaris Dev with Socket.IO...")
     print("Open http://localhost:5000 in your browser")
 
     port = int(os.environ.get("PORT", 5000))

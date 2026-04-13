@@ -478,6 +478,10 @@ class EdgeDetector:
         if self._sio and detection_type in ('iceberg', 'drifting_iceberg', 'sweep', 'wall_gone'):
             vol = detection_data.get('total_vol', detection_data.get('volume', 0))
             price = detection_data.get('price', detection_data.get('mid', 0))
+            if not price or price <= 0:
+                price = detection_data.get('at_price', 0)
+            if not price or price <= 0:
+                return  # no valid price — suppress alert
             # Compute percentile if distribution is warm
             pctl = 95.0  # default high
             if vol > 0:
@@ -514,11 +518,15 @@ class EdgeDetector:
         # mathematically proved this was an iceberg/sweep. Always push to tape.
         if self._sio:
             price = detection_data.get('price', detection_data.get('at_price', 0))
+            if not price or price <= 0:
+                price = detection_data.get('mid', 0)
             try:
+                if not price or price <= 0:
+                    raise ValueError('no valid price')
                 tape_side = 'b' if is_long else 's'
                 self._sio.emit('tape_alert', {
                     'symbol': symbol,
-                    'price': float(price) if price else 0,
+                    'price': float(price),
                     'volume': int(vol) if isinstance(vol, (int, float)) else 0,
                     'side': tape_side,
                     'pctl': 99.9,  # verified — treat as extreme

@@ -235,15 +235,35 @@ void main() {
     // Arrow only shows where there is flow
     float arrowMask = arrowBody * speedNorm * 0.6;
 
-    // ── Obstacle visualization: dim where walls exist ──
-    float obsDim = 1.0 - obstacle * 0.5;
+    // ── Obstacle visualization: depth bars (bid left, ask right) ──
+    vec3 obsColor = vec3(0.0);
+    float obsAlpha = 0.0;
+    if (obstacle > 0.005) {
+        float obsNorm = sqrt(clamp(obstacle, 0.0, 1.0));
+        // Bar extends from edge toward center, width proportional to depth
+        float barPos, barEdge;
+        if (v_uv.x < 0.5) {
+            barPos = 1.0 - v_uv.x * 2.0;  // 1.0 at left edge, 0.0 at center
+            barEdge = smoothstep(0.0, 0.04, barPos - (1.0 - obsNorm));
+            obsColor = vec3(0.0, 0.55 * barEdge, 0.45 * barEdge);
+            obsColor += vec3(0.0, 0.15, 0.12) * obsNorm; // base glow
+        } else {
+            barPos = (v_uv.x - 0.5) * 2.0; // 0.0 at center, 1.0 at right edge
+            barEdge = smoothstep(0.0, 0.04, barPos - (1.0 - obsNorm));
+            obsColor = vec3(0.55 * barEdge, 0.05 * barEdge, 0.15 * barEdge);
+            obsColor += vec3(0.15, 0.02, 0.06) * obsNorm; // base glow
+        }
+        obsAlpha = barEdge * 0.85 + obsNorm * 0.15;
+    }
+    // Thin midline separator
+    float midDist = abs(v_uv.x - 0.5);
+    float midLine = smoothstep(0.004, 0.0, midDist) * 0.25;
 
     // ── Composite ──
-    vec3 color = pColor + velColor * 0.5;
-    color += vec3(arrowMask * 0.3);
-    color *= obsDim;
+    vec3 color = obsColor + pColor + velColor * 0.5;
+    color += vec3(arrowMask * 0.3 + midLine);
 
-    float alpha = clamp(brightness * 0.7 + speedNorm * 0.4 + arrowMask * 0.3, 0.0, 0.85);
+    float alpha = clamp(obsAlpha + midLine + brightness * 0.7 + speedNorm * 0.4 + arrowMask * 0.3, 0.0, 0.95);
     fragColor = vec4(color, alpha);
 }
 `;
@@ -494,8 +514,9 @@ const PressureField = {
      */
     render() {
         if (!this._ready) return;
-        // PressureField only renders on heatmap pane (DOM depth view)
-        if (window._activeChartFeature && window._activeChartFeature !== 'heatmap') return;
+        // Allow rendering on standalone pressure pane or heatmap overlay
+        const feat = window._activeChartFeature;
+        if (feat && feat !== 'heatmap' && feat !== 'pressure' && !this._canvas.id.startsWith('dom-pressure-canvas-')) return;
 
         const gl = this.gl;
         const canvas = this._canvas;
@@ -923,6 +944,7 @@ PressureField.monitorPerformance = function() {
     const self = this;
 
     const check = () => {
+        if (self._destroyed) return; // bail after destroy
         frameCount++;
         const now = performance.now();
 

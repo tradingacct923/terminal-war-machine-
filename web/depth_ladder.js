@@ -157,8 +157,9 @@ function renderDepthLadder(canvas, priceToY, domData, midPrice) {
     // ── PHASE 1: Pull/Stack detection — compare current sizes to previous frame ──
     for (const price of visiblePrices) {
         const pKey = price.toFixed(2);
-        const bidSize = bids[pKey] || bids[price.toString()] || 0;
-        const askSize = asks[pKey] || asks[price.toString()] || 0;
+        const pKey1 = price.toFixed(1);
+        const bidSize = bids[pKey] || bids[pKey1] || bids[price.toString()] || 0;
+        const askSize = asks[pKey] || asks[pKey1] || asks[price.toString()] || 0;
         const currentSize = bidSize + askSize;
         const prev = _ladderMemory[pKey];
 
@@ -190,9 +191,10 @@ function renderDepthLadder(canvas, priceToY, domData, midPrice) {
         if (y === null || y < HEADER_H - HALF_ROW || y > cssH - FOOTER_H + HALF_ROW) continue;
 
         const pKey2 = price.toFixed(2);
+        const pKey1 = price.toFixed(1);
         const pKey = price.toString();
-        const bidSize = bids[pKey2] || bids[pKey] || 0;
-        const askSize = asks[pKey2] || asks[pKey] || 0;
+        const bidSize = bids[pKey2] || bids[pKey1] || bids[pKey] || 0;
+        const askSize = asks[pKey2] || asks[pKey1] || asks[pKey] || 0;
 
         const isCurrentPrice = Math.abs(price - mid) < TICK * 0.6;
         if (bidSize === 0 && askSize === 0 && !isCurrentPrice) continue;
@@ -200,6 +202,18 @@ function renderDepthLadder(canvas, priceToY, domData, midPrice) {
         const isBestBid = Math.abs(price - bestBid) < TICK * 0.1;
         const isBestAsk = Math.abs(price - bestAsk) < TICK * 0.1;
         const rowTop = y - HALF_ROW;
+
+        // ═══ ENGINE 3: Level Survival — row background tint ═══
+        // Blue = high P(hold), Orange = low P(hold). Derived from Beta posterior.
+        const survData = window._levelSurvival || {};
+        const survVal = survData[pKey2] || null;  // backend keys are always .toFixed(2) format
+        if (survVal !== null && !isCurrentPrice) {
+            const survAlpha = 0.02 + survVal * 0.13;  // 2-15% opacity
+            ctx.fillStyle = survVal > 0.5
+                ? `rgba(0, 180, 255, ${survAlpha.toFixed(3)})`    // blue = will hold
+                : `rgba(255, 140, 60, ${survAlpha.toFixed(3)})`;  // orange = will break
+            ctx.fillRect(0, rowTop, cssW, ROW_H);
+        }
 
         // ═══ ENHANCEMENT 1: Size heatmap background ═══
         // Shade the entire row by relative size — larger walls glow brighter
@@ -236,7 +250,7 @@ function renderDepthLadder(canvas, priceToY, domData, midPrice) {
 
         // ═══ ENHANCEMENT 3: Absorption highlighting ═══
         // If L2 worker detected absorption at this price, pulse cyan
-        const absLevel = absorptionData[pKey2] || absorptionData[pKey];
+        const absLevel = absorptionData[pKey2] || absorptionData[pKey1] || absorptionData[pKey];
         if (absLevel && absLevel > 0) {
             const pulse = 0.5 + 0.5 * Math.sin(now / 300); // pulsing effect
             const absAlpha = Math.min(absLevel, 1.0) * 0.15 * pulse;
@@ -317,6 +331,24 @@ function renderDepthLadder(canvas, priceToY, domData, midPrice) {
                 ctx.shadowBlur = 0;
             }
 
+            // ═══ ENGINE 1: Queue Dynamics — bid bar glow ═══
+            const qdData = window._queueDynamics || {};
+            const qdBid = qdData[pKey2];  // backend keys are always .toFixed(2) format
+            if (qdBid && qdBid.ratio != null) {
+                const qr = qdBid.ratio;
+                if (qr > 1.2) {
+                    ctx.shadowColor = `rgba(0,255,180,${Math.min((qr-1)*0.15, 0.35).toFixed(2)})`;
+                    ctx.shadowBlur = 4 + Math.min((qr - 1) * 3, 8);
+                    ctx.fill();
+                    ctx.shadowBlur = 0;
+                } else if (qr < 0.8) {
+                    ctx.shadowColor = `rgba(255,80,60,${Math.min((1-qr)*0.15, 0.35).toFixed(2)})`;
+                    ctx.shadowBlur = 4 + Math.min((1 - qr) * 3, 8);
+                    ctx.fill();
+                    ctx.shadowBlur = 0;
+                }
+            }
+
             if (!_kineticActive) {
                 ctx.font = `${ROW_H >= 16 ? 9 : 7}px "JetBrains Mono", monospace`;
                 ctx.textBaseline = 'middle';
@@ -363,6 +395,23 @@ function renderDepthLadder(canvas, priceToY, domData, midPrice) {
                 ctx.shadowBlur = 0;
             }
 
+            // ═══ ENGINE 1: Queue Dynamics — ask bar glow ═══
+            const qdAsk = (window._queueDynamics || {})[pKey2];  // backend keys are always .toFixed(2) format
+            if (qdAsk && qdAsk.ratio != null) {
+                const qra = qdAsk.ratio;
+                if (qra > 1.2) {
+                    ctx.shadowColor = `rgba(0,255,180,${Math.min((qra-1)*0.15, 0.35).toFixed(2)})`;
+                    ctx.shadowBlur = 4 + Math.min((qra - 1) * 3, 8);
+                    ctx.fill();
+                    ctx.shadowBlur = 0;
+                } else if (qra < 0.8) {
+                    ctx.shadowColor = `rgba(255,80,60,${Math.min((1-qra)*0.15, 0.35).toFixed(2)})`;
+                    ctx.shadowBlur = 4 + Math.min((1 - qra) * 3, 8);
+                    ctx.fill();
+                    ctx.shadowBlur = 0;
+                }
+            }
+
             if (!_kineticActive) {
                 ctx.font = `${ROW_H >= 16 ? 9 : 7}px "JetBrains Mono", monospace`;
                 ctx.textBaseline = 'middle';
@@ -406,6 +455,21 @@ function renderDepthLadder(canvas, priceToY, domData, midPrice) {
                 ? `rgba(0, 210, 255, ${fadeAlpha.toFixed(2)})`
                 : `rgba(255, 50, 180, ${fadeAlpha.toFixed(2)})`;
             ctx.fillText(`${sign}${flash.delta}`, cssW - 3, y);
+        }
+
+        // ═══ ENGINE 2: Trade Toxicity — right edge indicator ═══
+        // Red = informed flow (avoid posting). Green = noise (safe to post).
+        const toxData = window._tradeToxicity || {};
+        const toxLevel = toxData[pKey2];  // backend keys are always .toFixed(2) format
+        if (toxLevel && toxLevel.t10 !== undefined && !isCurrentPrice) {
+            const tox = toxLevel.t10;
+            if (Math.abs(tox - 0.5) > 0.05) {
+                const toxAlpha = Math.min(Math.abs(tox - 0.5) * 2, 0.8);
+                ctx.fillStyle = tox > 0.5
+                    ? `rgba(255, 50, 50, ${toxAlpha.toFixed(2)})`
+                    : `rgba(50, 255, 120, ${toxAlpha.toFixed(2)})`;
+                ctx.fillRect(cssW - 4, rowTop + 2, 3, ROW_H - 4);
+            }
         }
 
         // ── Price label (center column) ──

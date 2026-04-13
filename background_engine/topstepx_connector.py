@@ -456,7 +456,7 @@ class TopStepXConnector:
                     "timestamp":  data.get("timestamp", ""),
                 }
                 mid = (quote["best_bid"] + quote["best_ask"]) / 2.0 \
-                      if (quote["best_bid"] and quote["best_ask"]) else quote["last_price"]
+                      if (quote["best_bid"] > 0 and quote["best_ask"] > 0) else quote["last_price"]
                 quote["mid_price"] = mid
                 self.quote_snapshot[symbol] = quote
                 if self.on_quote:
@@ -501,12 +501,20 @@ class TopStepXConnector:
         def on_open(ws):
             log.info("TopStepX WS: connected, sending handshake...")
             ws.send(HANDSHAKE)
-            # Small delay then subscribe
+            # Small delay then subscribe — guard against race where WS drops
+            # during the 0.5s sleep (TopStepX sometimes closes immediately after
+            # handshake ACK on auth errors or server restarts).
             import threading as _t
             def _sub():
                 import time as _tm; _tm.sleep(0.5)
-                _send_subscriptions(ws)
-                self._on_open(contract_ids)
+                try:
+                    _send_subscriptions(ws)
+                    self._on_open(contract_ids)
+                except Exception as _e:
+                    # WS already closed before we could subscribe — the outer
+                    # while-loop will reconnect automatically. Log at DEBUG only
+                    # to avoid spamming on routine reconnects.
+                    log.debug("TopStepX WS: subscription skipped (WS closed during handshake): %s", _e)
             _t.Thread(target=_sub, daemon=True).start()
 
         def on_error(ws, err):
@@ -550,8 +558,8 @@ class TopStepXConnector:
         ask_total = sum(asks.values())
         total     = bid_total + ask_total
 
-        mid    = (best_bid + best_ask) / 2.0 if best_bid and best_ask else 0
-        spread = best_ask - best_bid if best_bid and best_ask else 0
+        mid    = (best_bid + best_ask) / 2.0 if best_bid > 0 and best_ask > 0 else 0
+        spread = best_ask - best_bid if best_bid > 0 and best_ask > 0 else 0
         imb    = (bid_total - ask_total) / total if total > 0 else 0
 
         return {

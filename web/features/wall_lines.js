@@ -2,17 +2,27 @@
     'use strict';
 
     // ═══ PRIVATE STATE — no globals leak ═══
-    let _chart = null;
-    let _series = null;
     let _visible = true;
-    let _wallLines = [];
+    // Per-instance: array of { series, container, wallLines[] }
+    let _wlInstances = [];
     let _timer = null;
     let _currentSymbol = 'NQ';
 
     // ═══ PUBLIC API — exposed on window.WallLines ═══
     window.WallLines = {
-        attachToSeries(series) {
-            _series = series;
+        attachToSeries(series, container) {
+            if (_wlInstances.find(i => i.container === container)) return;
+            _wlInstances.push({ series, container, wallLines: [] });
+        },
+        detachInstance(container) {
+            const idx = _wlInstances.findIndex(i => i.container === container);
+            if (idx > -1) {
+                const inst = _wlInstances[idx];
+                for (const item of inst.wallLines) {
+                    try { if (item.series && item.line) item.series.removePriceLine(item.line); } catch(e) {}
+                }
+                _wlInstances.splice(idx, 1);
+            }
         },
         
         init() {
@@ -38,7 +48,7 @@
             // Find average price to calculate a dynamic merge threshold (e.g. 0.015% ~ 3.5 NQ pts)
             const validLines = lines.filter(l => l.price && l.price > 0);
             if (validLines.length === 0) return;
-            
+
             const avgPrice = validLines.reduce((sum, l) => sum + l.price, 0) / validLines.length;
             const MERGE_THRESHOLD = avgPrice * 0.00015;
 
@@ -51,24 +61,28 @@
                     const last = merged[merged.length - 1];
                     if (Math.abs(line.price - last.price) <= MERGE_THRESHOLD) {
                         last.title += `  │  ${line.title}`;
-                        last.price = (last.price + line.price) / 2; // Average the price
+                        last.price = (last.price + line.price) / 2;
                         continue;
                     }
                 }
-                // Copy object to avoid mutating originals if they are reused
                 merged.push({ ...line });
             }
 
-            for (const cfg of merged) {
-                const pl = _series.createPriceLine({
-                    price: cfg.price,
-                    color: cfg.color,
-                    lineWidth: 1,
-                    lineStyle: LightweightCharts.LineStyle.Dashed,
-                    axisLabelVisible: true,
-                    title: cfg.title,
-                });
-                _wallLines.push({ series: _series, line: pl });
+            // Draw on all attached instances (per-pane config check)
+            for (const inst of _wlInstances) {
+                // Per-pane toggle check
+                if (inst.container && inst.container._overlayConfig && !inst.container._overlayConfig.walls) continue;
+                for (const cfg of merged) {
+                    const pl = inst.series.createPriceLine({
+                        price: cfg.price,
+                        color: cfg.color,
+                        lineWidth: 1,
+                        lineStyle: LightweightCharts.LineStyle.Dashed,
+                        axisLabelVisible: true,
+                        title: cfg.title,
+                    });
+                    inst.wallLines.push({ series: inst.series, line: pl });
+                }
             }
         },
 
@@ -84,11 +98,13 @@
                 .then(data => {
                     if (data.error) return;
 
-                    // Remove old lines before rendering the new ones
-                    for (const item of _wallLines) {
-                        try { if (item.series && item.line) item.series.removePriceLine(item.line); } catch(e) {}
+                    // Remove old lines from all instances before rendering new ones
+                    for (const inst of _wlInstances) {
+                        for (const item of inst.wallLines) {
+                            try { if (item.series && item.line) item.series.removePriceLine(item.line); } catch(e) {}
+                        }
+                        inst.wallLines = [];
                     }
-                    _wallLines = [];
 
                     const underlying = data.underlying_ticker || 'QQQ';
                     const lines = [
@@ -142,7 +158,7 @@
         },
 
         updateLive(data) {
-            if (!_series || !_visible) return;
+            if (_wlInstances.length === 0 || !_visible) return;
             if (!data || data.error) return;
 
             // ── Sanity check: live WS levels must be plausible ──
@@ -166,10 +182,12 @@
 
             console.log(`[GEX-LIVE] zone_update: put=${pw} call=${cw} flip=${gf} src=${data.source} ratio=${ratio.toFixed(2)}`);
 
-            for (const item of _wallLines) {
-                try { if (item.series && item.line) item.series.removePriceLine(item.line); } catch(e) {}
+            for (const inst of _wlInstances) {
+                for (const item of inst.wallLines) {
+                    try { if (item.series && item.line) item.series.removePriceLine(item.line); } catch(e) {}
+                }
+                inst.wallLines = [];
             }
-            _wallLines = [];
 
             // Show underlying QQQ strike in label for clarity
             const pwQQQ = data.underlying_put_wall ? data.underlying_put_wall.toFixed(0) : '?';
@@ -290,19 +308,23 @@
             if (_visible) {
                 this.update();
             } else {
-                for (const item of _wallLines) {
-                    try { if (item.series && item.line) item.series.removePriceLine(item.line); } catch(e) {}
+                for (const inst of _wlInstances) {
+                    for (const item of inst.wallLines) {
+                        try { if (item.series && item.line) item.series.removePriceLine(item.line); } catch(e) {}
+                    }
+                    inst.wallLines = [];
                 }
-                _wallLines = [];
             }
         },
 
         destroy() {
             if (_timer) clearInterval(_timer);
-            for (const item of _wallLines) {
-                try { if (item.series && item.line) item.series.removePriceLine(item.line); } catch(e) {}
+            for (const inst of _wlInstances) {
+                for (const item of inst.wallLines) {
+                    try { if (item.series && item.line) item.series.removePriceLine(item.line); } catch(e) {}
+                }
             }
-            _wallLines = [];
+            _wlInstances = [];
         }
     };
 })();

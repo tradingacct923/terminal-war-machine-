@@ -133,7 +133,7 @@ class GreekSurface:
             return self._aggregates  # Return cached
 
         sorted_strikes = sorted(self._strikes)
-        if len(sorted_strikes) < 5:
+        if len(sorted_strikes) < 3:
             return {}
 
         multiplier = 100  # options contract multiplier

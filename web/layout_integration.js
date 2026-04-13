@@ -27,16 +27,21 @@
 // FEATURES — Each feature maps to a live renderer
 // ═══════════════════════════════════════════════════════════════════════════
 const FEATURES = {
-  chart:   { label: 'CHART',    icon: '\u{1f4c8}', desc: 'Price Chart' },
-  heatmap: { label: 'HEATMAP',  icon: '\u{1f7e7}', desc: 'DOM Heatmap' },
-  ladder:  { label: 'LADDER',   icon: '\u{1f4ca}', desc: 'Depth Ladder' },
-  gex:     { label: 'GEX',      icon: '\u03b3',  desc: 'Gamma Exposure' },
-  dex:     { label: 'DEX',      icon: '\u0394',  desc: 'Delta Exposure' },
-  ivskew:  { label: 'IV SKEW',  icon: '\u{1f30a}', desc: 'Volatility Surface' },
-  ocheat:  { label: 'OC HEAT',  icon: '\u{1f525}', desc: 'Option Chain Heatmap' },
-  eqbook:  { label: 'EQ BOOK',  icon: '\u{1f4d6}', desc: 'QQQ Equity L2 Book' },
-  opscr:   { label: 'SCREENER', icon: '\u{1f50d}', desc: 'Options Unusual Activity' },
-  alpha:   { label: 'ALPHA',    icon: '\u{1f4a1}', desc: 'Alpha Engine Dashboard' },
+  chart:    { label: 'CHART',     icon: '\u{1f4c8}', desc: 'Price Chart' },
+  heatmap:  { label: 'HEATMAP',   icon: '\u{1f7e7}', desc: 'DOM Heatmap' },
+  ladder:   { label: 'LADDER',    icon: '\u{1f4ca}', desc: 'Depth Ladder' },
+  ocheat:   { label: 'OC HEAT',   icon: '\u{1f525}', desc: 'Option Chain Heatmap' },
+  eqbook:   { label: 'EQ BOOK',   icon: '\u{1f4d6}', desc: 'QQQ Equity L2 Book' },
+  opscr:    { label: 'SCREENER',  icon: '\u{1f50d}', desc: 'Options Unusual Activity' },
+  alpha:    { label: 'ALPHA',     icon: '\u{1f4a1}', desc: 'Alpha Engine Dashboard' },
+  pressure: { label: 'PRESSURE',  icon: '\u{1f300}', desc: 'Navier-Stokes Pressure Field' },
+  kinetic:  { label: 'KINETIC',   icon: '\u26a1',    desc: 'Kinetic HUD' },
+  eqtape:   { label: 'EQ TAPE',   icon: '\u{1f3f7}', desc: 'Equity Tape (Venue Routing)' },
+  dealer:   { label: 'DEALER',    icon: '\u{1f3e6}', desc: 'Dealer Hedge Flow' },
+  xdiv:     { label: 'X-DIV',     icon: '\u{1f318}', desc: 'Cross-Market Divergence + Book Quality' },
+  volsurf:  { label: 'VOL SURF',  icon: '\u{1f321}', desc: 'IV Surface, 3D Vol + Greek Regime' },
+  optflow:  { label: 'OPT FLOW',  icon: '\u{1f4b8}', desc: 'Options Flow Feed' },
+  bookms:   { label: 'BOOK MS',   icon: '\u{1f4d1}', desc: 'Book Microstructure (Venue Quality)' },
 };
 const FEAT_KEYS = Object.keys(FEATURES);
 
@@ -48,17 +53,22 @@ const LAYOUTS = {
   // ── Futures Execution ──
   'exec':     { label:'Execution',    slots:2, cols:2, rows:1, defaults:['chart','ladder'] },
   'scalp':    { label:'Scalp',        slots:2, cols:2, rows:1, defaults:['ladder','chart'] },
-  'flow':     { label:'Flow',         slots:3, cols:3, rows:1, defaults:['chart','gex','dex'] },
+  'flow':     { label:'Flow',         slots:3, cols:3, rows:1, defaults:['chart','volsurf','optflow'] },
   'dom':      { label:'DOM',          slots:3, cols:3, rows:1, defaults:['heatmap','ladder','eqbook'] },
-  'intel':    { label:'Intel',        slots:3, cols:2, rows:2, defaults:['chart','heatmap','dex'] },
+  'intel':    { label:'Intel',        slots:3, cols:2, rows:2, defaults:['chart','heatmap','volsurf'] },
   // ── Options Desk ──
-  'hedge':    { label:'Hedge',        slots:3, cols:3, rows:1, defaults:['chart','gex','ivskew'] },
+  'hedge':    { label:'Hedge',        slots:3, cols:3, rows:1, defaults:['chart','volsurf','optflow'] },
   // ── Full Station ──
-  'recon':    { label:'Recon',        slots:6, cols:3, rows:2, defaults:['chart','heatmap','ladder','eqbook','gex','dex'] },
+  'recon':    { label:'Recon',        slots:6, cols:3, rows:2, defaults:['chart','heatmap','ladder','eqbook','volsurf','optflow'] },
   // ── Market Maker Workstation ──
   'maker':    { label:'Maker',        slots:3, cols:3, rows:1, defaults:['heatmap','ladder','eqbook'] },
   // ── God Mode ──
   'god-mode': { label:'God Mode',     slots:5, cols:3, rows:2, defaults:['chart','chart','heatmap','alpha','ladder'] },
+  // ── Dealer Hedge ──
+  'dealer-desk': { label:'Dealer Desk', slots:4, cols:2, rows:2, defaults:['chart','dealer','xdiv','optflow'] },
+  'war-room':    { label:'War Room',    slots:6, cols:3, rows:2, defaults:['chart','eqtape','dealer','volsurf','xdiv','optflow'] },
+  // ── Pro Default ──
+  'pro':         { label:'Pro',         slots:3, cols:3, rows:1, defaults:['chart','ladder','eqbook'] },
 };
 
 const MAX_PANES = 6;
@@ -220,7 +230,8 @@ function setFeature(i, feat) {
 }
 
 function updatePaneHeader(i) {
-  const p=_panes[i]; const feat=_paneFeature[i];
+  const p=_panes[i]; let feat=_paneFeature[i];
+  if(!FEATURES[feat]){feat='chart';_paneFeature[i]=feat;} // fallback for removed features
   const f=FEATURES[feat];
   p.querySelector('.pane-hdr-icon').textContent=f.icon;
   p.querySelector('.pane-hdr-label').textContent=f.label;
@@ -246,7 +257,7 @@ function setLayout(id) {
     if(i<info.slots){
       p.classList.remove('hidden'); p.setAttribute('data-slot',i);
       p.style.removeProperty('grid-column'); p.style.removeProperty('grid-row');
-      // Always assign layout default features — no stale overrides
+      // Apply layout defaults
       if(info.defaults[i]) _paneFeature[i]=info.defaults[i];
       updatePaneHeader(i);
       _mountFeature(i);
@@ -275,7 +286,8 @@ function setActive(i) {
   _activePaneIdx=i;
   _panes.forEach((p,j)=>p.classList.toggle('active',j===i));
   const sSym = document.getElementById('s-sym');
-  if (sSym) sSym.textContent=`${_sym} · ${_tf} · ${FEATURES[_paneFeature[i]].label}`;
+  const _f = FEATURES[_paneFeature[i]];
+  if (sSym && _f) sSym.textContent=`${_sym} · ${_tf} · ${_f.label}`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -287,7 +299,7 @@ function toggleMax(i) {
   _resizers.forEach(r=>r.style.display='none');
   for(let j=0;j<MAX_PANES;j++){
     if(j===i){_panes[j].classList.remove('hidden');_panes[j].style.gridColumn='1/-1';_panes[j].style.gridRow='1/-1'}
-    else{_panes[j].classList.add('hidden')}
+    else{_unmountFeature(j);_panes[j].classList.add('hidden')}
   }
   setActive(i);
   requestAnimationFrame(()=>_onPaneResize(i));
@@ -419,14 +431,14 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape'){if(_maximized>=0)to
 // FPS & RESIZE
 // ═══════════════════════════════════════════════════════════════════════════
 let fc=0,ft=performance.now();
-function fpsLoop(){fc++;const n=performance.now();if(n-ft>=1000){const el=document.getElementById('s-fps');if(el)el.textContent='FPS: '+fc;fc=0;ft=n}requestAnimationFrame(fpsLoop)}
+function fpsLoop(){fc++;const n=performance.now();if(n-ft>=1000){const el=document.getElementById('s-fps');if(el)el.textContent='FPS '+fc;fc=0;ft=n;const ck=document.getElementById('s-clock');if(ck){const d=new Date();ck.textContent=d.toLocaleTimeString('en-US',{hour12:false})}}requestAnimationFrame(fpsLoop)}
 let wr=false;
 window.addEventListener('resize',()=>{if(wr)return;wr=true;requestAnimationFrame(()=>{wr=false;renderAll();if(_maximized<0)buildResizers()})});
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SAVE / LOAD WORKSPACE — Full state persistence
 // ═══════════════════════════════════════════════════════════════════════════
-const WS_KEY = 'altaris_workspace_v4'; // bumped to invalidate stale feature assignments
+const WS_KEY = 'altaris_workspace_v5'; // bumped: pro default layout
 
 function saveWorkspace() {
   const state = {
@@ -456,13 +468,21 @@ function loadWorkspace() {
     if (s.sym) { _sym = s.sym; }
     if (s.tf) { _tf = s.tf; }
 
-    // Restore features before layout so they're set when panes mount
-    if (s.features && Array.isArray(s.features)) {
-      s.features.forEach((f, i) => { if (i < MAX_PANES && FEATURES[f]) _paneFeature[i] = f; });
-    }
-
-    // Apply layout
+    // Apply layout first (sets default features)
     setLayout(s.layout);
+
+    // Override with saved features — re-mount panes that differ from layout defaults
+    if (s.features && Array.isArray(s.features)) {
+      const info = LAYOUTS[s.layout];
+      let remounted = false;
+      s.features.forEach((f, i) => {
+        if (i < MAX_PANES && FEATURES[f] && _paneFeature[i] !== f) {
+          _paneFeature[i] = f;
+          updatePaneHeader(i);
+          if (i < (info ? info.slots : 0)) { _mountFeature(i); remounted = true; }
+        }
+      });
+    }
 
     // Restore custom grid tracks (from dragged resizers) with min-width validation
     if (s.gridCols) {
@@ -804,7 +824,7 @@ if (_urlLayout && LAYOUTS[_urlLayout]) {
   console.log('[AltarisLayout] URL-forced layout:', _urlLayout);
 } else {
   const didRestore = loadWorkspace();
-  if (!didRestore) setLayout('single');
+  if (!didRestore) setLayout('pro');
 }
 
 requestAnimationFrame(fpsLoop);

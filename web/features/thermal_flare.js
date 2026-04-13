@@ -49,9 +49,15 @@
     function _render() {
         if (!_visible || !_data.length) return;
 
-        // Render flares on ALL active instances
+        // Render flares on ALL active instances (per-pane toggleable)
         for (const inst of _instances) {
             if (!inst.canvas || !inst.ctx || !inst.series) continue;
+            // Per-pane toggle check
+            if (inst.container && inst.container._overlayConfig && !inst.container._overlayConfig.flare) {
+                const dpr = window.devicePixelRatio || 1;
+                inst.ctx.clearRect(0, 0, inst.canvas.width / dpr, inst.canvas.height / dpr);
+                continue;
+            }
 
             const dpr = window.devicePixelRatio || 1;
             const width = inst.canvas.width / dpr;
@@ -97,10 +103,10 @@
 
                 const gradient = inst.ctx.createLinearGradient(rightEdge, y, rightEdge - flareLength, y);
                 if (isResistance) {
-                    gradient.addColorStop(0, \`rgba(255, 60, 90, \${alpha})\`);
+                    gradient.addColorStop(0, `rgba(255, 60, 90, ${alpha})`);
                     gradient.addColorStop(1, 'rgba(230, 0, 30, 0.0)');
                 } else {
-                    gradient.addColorStop(0, \`rgba(50, 255, 150, \${alpha})\`);
+                    gradient.addColorStop(0, `rgba(50, 255, 150, ${alpha})`);
                     gradient.addColorStop(1, 'rgba(0, 200, 80, 0.0)');
                 }
 
@@ -110,7 +116,7 @@
                 inst.ctx.lineWidth = thickness;
                 inst.ctx.lineCap = 'round';
                 inst.ctx.strokeStyle = gradient;
-                inst.ctx.filter = \`blur(\${Math.round(1 + t * 5)}px)\`;
+                inst.ctx.filter = `blur(${Math.round(1 + t * 5)}px)`;
                 inst.ctx.stroke();
 
                 const coreR = isResistance ? 255 : (200 + Math.round(t * 55));
@@ -121,7 +127,7 @@
                 inst.ctx.lineTo(rightEdge - (flareLength * t), y);
                 inst.ctx.lineWidth = 1 + t * 2;
                 inst.ctx.filter = 'none';
-                inst.ctx.strokeStyle = \`rgba(\${coreR}, \${coreG}, \${coreB}, \${alpha})\`;
+                inst.ctx.strokeStyle = `rgba(${coreR}, ${coreG}, ${coreB}, ${alpha})`;
                 inst.ctx.stroke();
                 rendered++;
             }
@@ -156,6 +162,7 @@
     function _openSettings() {
         let pnl = document.getElementById('tf-settings-panel');
         if (pnl) { pnl.remove(); return; }
+        if (window.closeAllSettingsPanels) window.closeAllSettingsPanels('tf-settings-panel');
 
         pnl = document.createElement('div');
         pnl.id = 'tf-settings-panel';
@@ -171,21 +178,21 @@
         pnl.style.fontFamily = 'system-ui, sans-serif';
         pnl.style.boxShadow = '0 8px 24px rgba(0,0,0,0.5)';
         pnl.style.minWidth = '220px';
-        pnl.innerHTML = \`
+        pnl.innerHTML = `
             <div style="font-weight:600;margin-bottom:12px;font-size:13px;color:#aab">🔥 Thermal Flare Settings</div>
             <label style="display:flex;align-items:center;gap:8px;font-size:12px;margin-bottom:10px;cursor:pointer">
-                <input type="checkbox" id="tf-toggle-chk" \${_visible ? 'checked' : ''}> Enable Heatmap
+                <input type="checkbox" id="tf-toggle-chk" ${_visible ? 'checked' : ''}> Enable Heatmap
             </label>
             <label style="display:flex;flex-direction:column;gap:4px;font-size:12px;margin-bottom:10px;">
-                <span>Flare Scale: <strong id="tf-sens-val">\${_sensitivity.toFixed(1)}x</strong></span>
-                <input type="range" id="tf-sens-range" min="0.1" max="5" step="0.1" value="\${_sensitivity}" style="accent-color:#1fd17a">
+                <span>Flare Scale: <strong id="tf-sens-val">${_sensitivity.toFixed(1)}x</strong></span>
+                <input type="range" id="tf-sens-range" min="0.1" max="5" step="0.1" value="${_sensitivity}" style="accent-color:#1fd17a">
             </label>
             <label style="display:flex;flex-direction:column;gap:4px;font-size:12px;margin-bottom:6px;">
-                <span>Min. Deviation: <strong id="tf-thresh-val">\${_threshold.toFixed(1)}σ</strong></span>
-                <input type="range" id="tf-thresh-range" min="0.5" max="4" step="0.1" value="\${_threshold}" style="accent-color:#e03060">
+                <span>Min. Deviation: <strong id="tf-thresh-val">${_threshold.toFixed(1)}σ</strong></span>
+                <input type="range" id="tf-thresh-range" min="0.5" max="4" step="0.1" value="${_threshold}" style="accent-color:#e03060">
                 <span style="font-size:10px;color:#667;margin-top:2px">Low = show more levels · High = only monster walls</span>
             </label>
-        \`;
+        `;
         document.body.appendChild(pnl);
 
         document.getElementById('tf-toggle-chk').addEventListener('change', (ev) => {

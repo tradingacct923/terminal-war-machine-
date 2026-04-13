@@ -4101,34 +4101,30 @@ h3 {
 .main-content { display: none !important; }
 
 .terminal {
-  display: grid;
-  grid-template-rows: 44px 1fr;
-  grid-template-columns: 1fr;
-  grid-template-areas:
-    "toolbar"
-    "chart";
+  display: flex;
+  flex-direction: column;
   height: 100dvh;
   width: 100vw;
   overflow: hidden;
   background: linear-gradient(180deg, #070a14 0%, #0a0e1a 50%, #080b16 100%);
+  position: relative;
+}
+.terminal.metrics-collapsed .t-metrics-ribbon {
+  height: 0 !important;
+  padding: 0 !important;
+  overflow: hidden;
 }
 
-/* When options panel is visible, add the 320px column */
-.terminal.with-options {
-  grid-template-columns: 1fr 320px;
-  grid-template-areas:
-    "toolbar toolbar"
-    "chart   options";
-}
+.t-metrics-ribbon { flex-shrink: 0; }
 
 /* ── Toolbar ── */
 .t-toolbar {
-  grid-area: toolbar;
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: space-between;
   padding: 0 16px;
-  min-height: 36px;
+  height: 38px;
   flex-shrink: 0;
   position: sticky;
   top: 0;
@@ -4144,15 +4140,6 @@ h3 {
   align-items: center;
   gap: 6px;
   flex-shrink: 0;
-}
-
-.t-tb-center {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  flex: 1 1 auto;
-  overflow: hidden;
 }
 
 .t-logo {
@@ -4207,6 +4194,51 @@ h3 {
   border-color: rgba(124, 90, 247, .5);
   color: #c4b5fd;
   box-shadow: 0 0 12px rgba(124, 90, 247, .2), inset 0 0 8px rgba(124, 90, 247, .06);
+}
+
+/* ── Metrics Ribbon (Row 2) ── */
+.t-metrics-ribbon {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  padding: 0 16px;
+  height: 28px;
+  background: rgba(8, 10, 22, .92);
+  border-bottom: 1px solid rgba(100, 120, 180, .08);
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  flex-shrink: 0;
+}
+.t-metrics-ribbon::-webkit-scrollbar { display: none; }
+.terminal.metrics-collapsed .t-metrics-ribbon { display: none; }
+
+/* Metric Group */
+.t-mg {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 10px;
+  border-right: 1px solid rgba(100, 120, 180, .08);
+  flex-shrink: 0;
+}
+.t-mg:last-child { border-right: none; }
+
+.t-mg-label {
+  font-size: .45rem;
+  font-weight: 700;
+  letter-spacing: .12em;
+  color: rgba(124, 90, 247, .35);
+  writing-mode: vertical-lr;
+  text-orientation: mixed;
+  transform: rotate(180deg);
+  margin-right: 4px;
+  white-space: nowrap;
+}
+
+.t-btn-xs {
+  font-size: .55rem;
+  padding: 2px 5px;
 }
 
 .t-metric {
@@ -4292,7 +4324,7 @@ h3 {
 
 /* ── Chart Panel — 3-Zone Flex Layout ── */
 .t-chart {
-  grid-area: chart;
+  flex: 1;
   display: flex;
   flex-direction: row;
   overflow: hidden;
@@ -4406,7 +4438,6 @@ h3 {
 
 /* ── Options Chain Panel ── */
 .t-options {
-  grid-area: options;
   display: flex;
   flex-direction: column;
   background: rgba(8, 10, 18, .95);
@@ -5289,7 +5320,7 @@ h3 {
 /* ── Heatmap Settings Panel ── */
 .hm-settings-panel {
   position: absolute;
-  top: 38px;
+  top: 68px;
   right: 10px;
   width: 340px;
   background: rgba(8, 10, 20, 0.96);
@@ -5981,4 +6012,4 @@ h3 {
 
 .dt-color-btn:hover {
   transform: scale(1.2);
-}
+}@keyframes rho-pulse { 0% { text-shadow: 0 0 0px #ff3060; } 50% { text-shadow: 0 0 8px #ff3060, 0 0 16px #ff3060; } 100% { text-shadow: 0 0 0px #ff3060; } }

@@ -28,13 +28,21 @@ function _applyETLabelFormatter(chart) {
         init(container, initialSymbol, featureKey) {
             featureKey = featureKey || 'chart';
 
+            // Guard: if container has no dimensions yet, defer until it does
+            if (!container.clientWidth || !container.clientHeight) {
+                const _self = this;
+                requestAnimationFrame(() => _self.init(container, initialSymbol, featureKey));
+                return;
+            }
+
             // Unmount existing chart in this container if any
             this.destroy(container);
 
-            const chartH = container.clientHeight || 700;
+            const chartW = container.clientWidth;
+            const chartH = container.clientHeight;
 
             const _chart = LightweightCharts.createChart(container, {
-                width: container.clientWidth,
+                width: chartW,
                 height: chartH,
                 layout: {
                     background: { type: 'solid', color: 'transparent' },
@@ -86,13 +94,25 @@ function _applyETLabelFormatter(chart) {
 
             container.style.position = 'relative';
 
+            // ── Per-pane overlay config (toggled by toolbar buttons) ──
+            if (!container._overlayConfig) {
+                container._overlayConfig = {
+                    bubbles: true,
+                    flare: true,
+                    cumlDelta: true,
+                    iceberg: true,
+                    vp: true,
+                    walls: true,
+                };
+            }
+
             // ── Series ──
             const L2_TICK_SIZES = { NQ: 0.25, GC: 0.10 };
             
-            // Only 'chart' panes show visible candlesticks — others use transparent
-            // candles to maintain the price axis for coordinate mapping
-            const showCandles = (featureKey === 'chart');
-            
+            // Chart and alpha panes show visible candlesticks — heatmap uses transparent
+            // candles (DOM overlay replaces them) to maintain the price axis for coordinate mapping
+            const showCandles = (featureKey !== 'heatmap');
+
             const _candleSeries = _chart.addCandlestickSeries({
                 upColor:         showCandles ? '#26A69A' : 'transparent',
                 downColor:       showCandles ? '#EF5350' : 'transparent',
@@ -114,24 +134,47 @@ function _applyETLabelFormatter(chart) {
                 visible: false,
             });
 
-            // ── Volume Bubbles: ONLY for 'chart' feature ──
+            // ── Volume Bubbles: for all chart-based panes (not heatmap) ──
             let _bubbleSeries = null;
-            if (featureKey === 'chart' && typeof VolumeBubbleSeries !== 'undefined') {
-                _bubbleSeries = _chart.addCustomSeries(new VolumeBubbleSeries(), {
+            if (featureKey !== 'heatmap' && typeof VolumeBubbleSeries !== 'undefined') {
+                const _bubblePlugin = new VolumeBubbleSeries();
+                // Store container ref on renderer for per-pane overlay config lookup
+                _bubblePlugin._renderer._containerRef = container;
+                _bubbleSeries = _chart.addCustomSeries(_bubblePlugin, {
                     priceScaleId: 'right',
                     lastValueVisible: false,
                     priceLineVisible: false,
                 });
             }
 
+            // ── Volume Profile Overlay: attach as primitive on candlestick series ──
+            if (featureKey !== 'heatmap' && typeof VolumeProfileOverlay !== 'undefined') {
+                VolumeProfileOverlay.attach(_chart, _candleSeries, container);
+            }
+
+            // ── Wall Lines: attach to candlestick series ──
+            if (featureKey !== 'heatmap' && typeof WallLines !== 'undefined') {
+                WallLines.attachToSeries(_candleSeries, container);
+            }
+
             // ── Heatmap Canvas: ONLY for 'heatmap' feature ──
+            // Must be placed INSIDE LWC's chart area div (the position:relative wrapper
+            // around the main canvases) so it stacks above them. Appending to `container`
+            // puts it outside LWC's table stacking context and it's hidden.
             let heatmapCanvas = null;
             if (featureKey === 'heatmap') {
                 heatmapCanvas = document.createElement('canvas');
                 heatmapCanvas.id = 'dom-heatmap-canvas-' + Date.now();
-                heatmapCanvas.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:10;';
-                container.appendChild(heatmapCanvas);
-                
+                heatmapCanvas.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:5;';
+                // Find LWC's main chart area div (TABLE > TR > TD[1] > DIV with position:relative)
+                const lwcEl = container.querySelector('.tv-lightweight-charts');
+                const chartAreaDiv = lwcEl && lwcEl.querySelector('tr td:nth-child(2) > div');
+                if (chartAreaDiv) {
+                    chartAreaDiv.appendChild(heatmapCanvas);
+                } else {
+                    container.appendChild(heatmapCanvas); // fallback
+                }
+
                 const dpr = window.devicePixelRatio || 1;
                 heatmapCanvas.width = (container.clientWidth || 900) * dpr;
                 heatmapCanvas.height = (container.clientHeight || chartH) * dpr;
@@ -139,6 +182,7 @@ function _applyETLabelFormatter(chart) {
 
             // ── Resize Observer ──
             const _heatmapCanvas = heatmapCanvas; // closure ref
+            let _firstResize = true;
             const ro = new ResizeObserver(entries => {
                 for (const entry of entries) {
                     const { width, height } = entry.contentRect;
@@ -148,6 +192,15 @@ function _applyETLabelFormatter(chart) {
                             const dpr = window.devicePixelRatio || 1;
                             _heatmapCanvas.width = width * dpr;
                             _heatmapCanvas.height = (height || chartH) * dpr;
+                        }
+                        // On first resize, fit content so candles are visible
+                        if (_firstResize) {
+                            _firstResize = false;
+                            setTimeout(() => {
+                                try {
+                                    _chart.timeScale().fitContent();
+                                } catch(e) {}
+                            }, 150);
                         }
                         if (window.AltarisEvents) {
                             window.AltarisEvents.emit('chart:resize', { width, height: height || chartH, container });
@@ -207,6 +260,13 @@ function _applyETLabelFormatter(chart) {
             if (idx > -1) {
                 const inst = _instances[idx];
                 inst.ro.disconnect();
+                // Detach per-instance VP and WallLines before removing chart
+                if (typeof VolumeProfileOverlay !== 'undefined') {
+                    VolumeProfileOverlay.detachInstance(inst.container);
+                }
+                if (typeof WallLines !== 'undefined') {
+                    WallLines.detachInstance(inst.container);
+                }
                 inst.chart.remove();
                 if (inst.heatmapCanvas && inst.heatmapCanvas.parentNode) {
                     inst.heatmapCanvas.parentNode.removeChild(inst.heatmapCanvas);

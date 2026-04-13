@@ -342,13 +342,13 @@ class SchwabStreamer:
                     data = json.loads(message)
                     self._process_message(data)
 
-                    # Track heartbeats
-                    if 'notify' in data:
+                    # Track heartbeats — any valid message keeps connection alive
+                    if 'notify' in data or 'data' in data or 'response' in data:
                         last_heartbeat = time.time()
 
                     # Check heartbeat timeout
-                    if time.time() - last_heartbeat > 60:
-                        print("[STREAM] ⚠️  No heartbeat in 60s, reconnecting...")
+                    if time.time() - last_heartbeat > 90:
+                        print("[STREAM] ⚠️  No messages in 90s, reconnecting...")
                         break
 
                 except json.JSONDecodeError:
