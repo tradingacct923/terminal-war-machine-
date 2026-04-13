@@ -23,8 +23,6 @@
 // PATCHED draw() — Replace VolumeBubbleRenderer.prototype.draw
 // ═══════════════════════════════════════════════════════════════════════════
 
-const _originalDraw = VolumeBubbleRenderer.prototype.draw;
-
 // ── Symbol change detection ──
 // Tracks the active instrument so all modules can reset when it changes.
 // d.symbol is passed by the chart host; falls back to first bar's 's' field
@@ -118,10 +116,12 @@ window._tapeEWMA = TapeEWMA; // expose for console inspection
 // Also cache spread/BBO from the new backend fields (best_bid, best_ask, spread).
 // Uses a deferred approach so this works regardless of load order.
 (function _wireTapeEWMAListener() {
+    let _handler = null;
     function attach() {
         const sio = window._sio;
         if (!sio) { setTimeout(attach, 400); return; }
-        sio.on('dom_snapshot', (data) => {
+        if (_handler) sio.off('dom_snapshot', _handler);
+        _handler = (data) => {
             if (data && data.trades && data.trades.length) {
                 TapeEWMA.ingest(data.trades);
             }
@@ -164,10 +164,11 @@ window._tapeEWMA = TapeEWMA; // expose for console inspection
                     ts:     data.ts        || 0,
                 };
             }
-        });
+        };
+        sio.on('dom_snapshot', _handler);
     }
     attach();
-})();;
+})();
 
 // Wire the socket listener once (after Socket.IO connects).
 // Uses a deferred approach so this works regardless of load order.

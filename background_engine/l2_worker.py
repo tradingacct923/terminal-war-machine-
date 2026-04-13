@@ -1429,8 +1429,9 @@ def _record_iceberg_completion(symbol: str, price: float, side: str,
     # FIX 9: Capture mid-price at detection time for realized spread computation.
     # realized_spread = |outcome_price - mid_at_detect| = actual MM edge realized
     # BUG 4 FIX: Was reading L2_STATE["dom"][symbol] without _L2_LOCK (race condition).
-    # mid_prices is a scalar float updated atomically under the lock — safe to read directly.
-    _mid_detect = L2_STATE["mid_prices"].get(symbol, price)
+    # mid_prices dict is written under _L2_LOCK — must read under lock too.
+    with _L2_LOCK:
+        _mid_detect = L2_STATE["mid_prices"].get(symbol, price)
 
     # ── Double-Rejection: count prior failures of opposing side at this level ──
     # Opposing side key: the side that WOULD FAIL to produce this signal
@@ -2625,6 +2626,22 @@ def _cleanup_detection_state():
             dq = _DOM_BAND_DEPTH[sym][s]
             while dq and dq[0][0] < now - _DRIFT_WINDOW_SEC * 2:
                 dq.popleft()
+
+    # ── LEVEL_FAIL_MEMORY: prune stale price buckets ──
+    for key in list(_LEVEL_FAIL_MEMORY.keys()):
+        dq = _LEVEL_FAIL_MEMORY[key]
+        while dq and now - dq[0] > _LEVEL_FAIL_WINDOW:
+            dq.popleft()
+        if not dq:
+            del _LEVEL_FAIL_MEMORY[key]
+
+    # ── ICE_TRACKER_VTAG: prune stale price keys (mirrors ICE_TRACKER cleanup) ──
+    for sym in list(SYMBOLS):
+        vtag_sym = _ICE_TRACKER_VTAG.get(sym, {})
+        stale_vtag = [p for p, fills in vtag_sym.items()
+                      if not fills or (now - fills[-1][0]) > _ICE_WINDOWS[-1][0] * 3]
+        for p in stale_vtag:
+            del vtag_sym[p]
 
 
 # Dedicated lock for candle data — separate from _L2_LOCK to avoid
@@ -4000,9 +4017,10 @@ def _record_dom_snapshot(symbol, dom):
     if depth_vel:
         _DEPTH_VEL_CACHE[symbol] = depth_vel
 
-    # Drain trade buffer: capture all trades since last snapshot
+    # Drain trade buffer: snapshot + clear (not pop — avoids losing trades between bursts)
     with _L2_LOCK:
-        trades = _HEATMAP_TRADE_BUF.pop(symbol, [])
+        trades = list(_HEATMAP_TRADE_BUF[symbol])
+        _HEATMAP_TRADE_BUF[symbol].clear()
     # Compact trades: [{p: price, v: volume, s: 'b'/'s'}, ...]
     compact_trades = []
     for t in trades:
@@ -4717,7 +4735,7 @@ def on_trade(symbol: str, trade: dict):
     # ── Emit trade tick via Socket.IO ──
     if _socketio is not None and price > 0:
         try:
-            iso_ts = datetime.utcfromtimestamp(ts).isoformat() + "Z"
+            iso_ts = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat().replace("+00:00", "Z")
             _socketio.emit("trade_tick", {
                 "symbol": symbol,
                 "price": price,

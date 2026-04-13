@@ -297,6 +297,8 @@ class TopStepXConnector:
                 log.warning(
                     "TopStepX watchdog: no DOM events for %.0fs — restarting...", silent_for
                 )
+                # Signal old connection to stop before spawning new thread
+                self._signalr_cancel = True
                 try:
                     if self._connection:
                         self._connection.stop()
@@ -308,6 +310,7 @@ class TopStepXConnector:
                     self.authenticate()
                     contract_ids = self._resolve_contracts(self._symbols_requested)
                     if contract_ids:
+                        self._signalr_cancel = False
                         self._last_depth_ts = _t.time()  # reset so we don't loop
                         t = threading.Thread(
                             target=self._run_signalr,
@@ -324,8 +327,7 @@ class TopStepXConnector:
         import websocket as _ws   # pip install websocket-client
         import json as _json
 
-        hub_url = MARKET_HUB.replace("https://", "wss://").replace("http://", "ws://")
-        hub_url = f"{hub_url}?access_token={self._token}"
+        hub_base = MARKET_HUB.replace("https://", "wss://").replace("http://", "ws://")
 
         # SignalR handshake
         HANDSHAKE = '{"protocol":"json","version":1}\x1e'
@@ -381,7 +383,7 @@ class TopStepXConnector:
                 ts = ""
                 for data in events:
                     dom_type = data.get("type", 0)
-                    price    = float(data.get("price", 0))
+                    price    = round(float(data.get("price", 0)), 6)
                     volume   = int(data.get("volume", 0))
                     ts       = data.get("timestamp", ts) # Use the last timestamp in the batch
                     if dom_type == DomType.Reset:
@@ -402,19 +404,29 @@ class TopStepXConnector:
                 if self.on_dom_update:
                     self.on_dom_update(symbol, snap)
             except Exception as e:
-                log.debug("GatewayDepth parse error: %s", e)
+                log.warning("GatewayDepth parse error: %s", e, exc_info=True)
 
         def on_gateway_trade(args):
             """GatewayTrade: args = [contractId, [trade_event, ...]]
             args[1] is a LIST of trade events (batch), not a single dict."""
             try:
-                contract_id = args[0]
-                symbol = self._contract_to_symbol.get(contract_id)
+                # Distinguish message shapes: 2-arg [contractId, events] vs 1-arg [events]
+                if len(args) >= 2:
+                    contract_id = args[0]
+                    events = args[1]
+                else:
+                    contract_id = None
+                    events = args[0]
+                if isinstance(events, dict):
+                    events = [events]
+                if not isinstance(events, list):
+                    return
+                symbol = self._contract_to_symbol.get(contract_id) if contract_id else None
                 if not symbol:
                     # Fallback: check symbolId inside events
-                    events = args[1] if len(args) >= 2 else args[0]
-                    if isinstance(events, dict): events = [events]
                     for ev in events:
+                        if not isinstance(ev, dict):
+                            continue
                         sid = ev.get('symbolId', '')
                         for cid, sym in self._contract_to_symbol.items():
                             if sid and sym in sid:
@@ -422,9 +434,6 @@ class TopStepXConnector:
                         if symbol: break
                 if not symbol:
                     return
-                events = args[1] if len(args) >= 2 else args[0]
-                if isinstance(events, dict):
-                    events = [events]   # single-event form
                 for data in events:
                     price      = float(data.get("price", 0))
                     volume     = int(data.get("volume", 0))
@@ -437,7 +446,7 @@ class TopStepXConnector:
                     if self.on_trade:
                         self.on_trade(symbol, trade)
             except Exception as e:
-                log.debug("GatewayTrade parse error: %s", e)
+                log.warning("GatewayTrade parse error: %s", e, exc_info=True)
 
         def on_gateway_quote(args):
             try:
@@ -462,7 +471,7 @@ class TopStepXConnector:
                 if self.on_quote:
                     self.on_quote(symbol, quote)
             except Exception as e:
-                log.debug("GatewayQuote parse error: %s", e)
+                log.warning("GatewayQuote parse error: %s", e, exc_info=True)
 
 
         def on_message(ws, raw):
@@ -523,8 +532,10 @@ class TopStepXConnector:
         def on_close(ws, code, msg):
             log.warning("TopStepX WS: closed (code=%s) — will reconnect", code)
 
-        while self._running:
+        while self._running and not getattr(self, '_signalr_cancel', False):
             try:
+                # Rebuild URL with current token on each reconnect attempt
+                hub_url = f"{hub_base}?access_token={self._token}"
                 ws = _ws.WebSocketApp(
                     hub_url,
                     on_open=on_open,
@@ -537,7 +548,7 @@ class TopStepXConnector:
                 ws.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as e:
                 log.error("TopStepX WS loop error: %s", e)
-            if self._running:
+            if self._running and not getattr(self, '_signalr_cancel', False):
                 log.info("TopStepX WS: reconnecting in 5s...")
                 time.sleep(5)
 
@@ -551,8 +562,8 @@ class TopStepXConnector:
         bids = self._dom_bids[symbol]
         asks = self._dom_asks[symbol]
 
-        best_bid = self._dom_best_bid.get(symbol) or (max(bids) if bids else 0)
-        best_ask = self._dom_best_ask.get(symbol) or (min(asks) if asks else 0)
+        best_bid = float(self._dom_best_bid.get(symbol) or 0) or (max(bids) if bids else 0)
+        best_ask = float(self._dom_best_ask.get(symbol) or 0) or (min(asks) if asks else 0)
 
         bid_total = sum(bids.values())
         ask_total = sum(asks.values())

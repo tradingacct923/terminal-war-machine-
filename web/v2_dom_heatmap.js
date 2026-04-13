@@ -400,8 +400,11 @@ function startDomHistory(symbol) {
             setTimeout(_attachSio, 300);
             return;
         }
-        sio.off('dom_snapshot'); // remove any stale listener
-        sio.on('dom_snapshot', (data) => {
+        // Remove only OUR previous heatmap listener (not v2_integration's)
+        if (DOM2D_STATE._domSnapshotHandler) {
+            sio.off('dom_snapshot', DOM2D_STATE._domSnapshotHandler);
+        }
+        DOM2D_STATE._domSnapshotHandler = (data) => {
             if (!data || data.sym !== symbol) return;
             // Store absorption buffer for v2_integration
             if (data.abs) window._v2AbsBuffer = data.abs;
@@ -414,7 +417,8 @@ function startDomHistory(symbol) {
                 trades: data.trades || [],
                 absorption: data.abs || {},
             });
-        });
+        };
+        sio.on('dom_snapshot', DOM2D_STATE._domSnapshotHandler);
         DOM2D_STATE.socketRef = sio; // store reference so stopDomHistory can clean up
         console.log('[v2_dom_heatmap] Socket.IO dom_snapshot listener active for', symbol);
     }
@@ -423,8 +427,11 @@ function startDomHistory(symbol) {
 
 function stopDomHistory() {
     DOM2D_STATE.destroy();
-    // Remove Socket.IO listener
-    if (window._sio) window._sio.off('dom_snapshot');
+    // Remove only OUR heatmap listener (preserve v2_integration's listener)
+    if (window._sio && DOM2D_STATE._domSnapshotHandler) {
+        window._sio.off('dom_snapshot', DOM2D_STATE._domSnapshotHandler);
+        DOM2D_STATE._domSnapshotHandler = null;
+    }
     DOM2D_STATE.socketRef = null;
     const tt = document.getElementById('dom2d-tooltip');
     if (tt) tt.style.display = 'none';

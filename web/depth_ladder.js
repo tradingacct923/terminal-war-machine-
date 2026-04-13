@@ -206,7 +206,7 @@ function renderDepthLadder(canvas, priceToY, domData, midPrice) {
         // ═══ ENGINE 3: Level Survival — row background tint ═══
         // Blue = high P(hold), Orange = low P(hold). Derived from Beta posterior.
         const survData = window._levelSurvival || {};
-        const survVal = survData[pKey2] || null;  // backend keys are always .toFixed(2) format
+        const survVal = survData[pKey2] !== undefined ? survData[pKey2] : null;  // 0 is valid (certain break)
         if (survVal !== null && !isCurrentPrice) {
             const survAlpha = 0.02 + survVal * 0.13;  // 2-15% opacity
             ctx.fillStyle = survVal > 0.5

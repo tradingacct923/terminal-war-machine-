@@ -159,9 +159,12 @@ def _build_ver():
             stderr=subprocess.DEVNULL
         ).decode().strip()
     except Exception:
-        return str(int(os.path.getmtime(
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "app.js")
-        )))
+        try:
+            return str(int(os.path.getmtime(
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "app.js")
+            )))
+        except Exception:
+            return "unknown"
 
 _BUILD_VER = _build_ver()
 
@@ -322,7 +325,7 @@ def api_test_connection():
     body_key = ""
     if request.method == "POST" or request.content_length:
         try:
-            body_key = request.get_json(force=True, silent=True).get("key", "")
+            body_key = (request.get_json(force=True, silent=True) or {}).get("key", "")
         except Exception:
             pass
     try:
@@ -410,8 +413,8 @@ def api_settings_post():
             try:
                 from data_provider import _cache, _cache_ts
                 _cache.clear(); _cache_ts.clear()
-            except Exception:
-                pass
+            except Exception as _e:
+                print(f"[Settings] Cache invalidation failed: {_e}")
         saved = save_config(update)
         return jsonify({"ok": True, "ticker": saved["ticker"]})
     except Exception as e:
@@ -2289,7 +2292,7 @@ def api_l2_candles():
         cache_key = (symbol, tf, since)
         cached = _candle_cache.get(cache_key)
         if cached and (_time.time() - cached[0]) < _CANDLE_CACHE_TTL:
-            return cached[1]
+            return jsonify(cached[1])
 
         raw = get_candles(symbol, tf)
 
@@ -2326,14 +2329,14 @@ def api_l2_candles():
             seen[c["time"]] = c
         candles = sorted(seen.values(), key=lambda x: x["time"])
 
-        resp = jsonify({"symbol": symbol, "tf": tf, "candles": candles})
-        # Cache the response
-        _candle_cache[cache_key] = (_time.time(), resp)
+        payload = {"symbol": symbol, "tf": tf, "candles": candles}
+        # Cache the serialized data (not the mutable Response object)
+        _candle_cache[cache_key] = (_time.time(), payload)
         # Evict stale entries (keep cache small)
         stale = [k for k, v in _candle_cache.items() if (_time.time() - v[0]) > 5.0]
         for k in stale:
             _candle_cache.pop(k, None)
-        return resp
+        return jsonify(payload)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -2374,15 +2377,15 @@ def api_vprofile():
         # Determine time range based on mode
         if mode == "prior_day":
             # Prior session: find yesterday's 6PM ET → today's 6PM ET
+            from datetime import timedelta
             today_6pm = now_et.replace(hour=18, minute=0, second=0, microsecond=0)
             if now_et.hour < 18:
                 session_end = today_6pm
-                session_start = session_end.replace(day=session_end.day - 1)
+                session_start = session_end - timedelta(days=1)
             else:
                 session_start = today_6pm
-                session_end = today_6pm.replace(day=today_6pm.day + 1)
+                session_end = today_6pm + timedelta(days=1)
             # Go back one more day for "prior"
-            from datetime import timedelta
             session_end = session_start
             session_start = session_start - timedelta(days=1)
             from_ts = int(session_start.timestamp())
@@ -2653,7 +2656,8 @@ def api_alpha():
 
         signals = []
         if os.path.exists(log_path):
-            lines = open(log_path).readlines()
+            with open(log_path) as _f:
+                lines = _f.readlines()
             for line in lines[-500:]:
                 if line.strip() and line.startswith('{'):
                     try:
