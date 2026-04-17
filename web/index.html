@@ -12,45 +12,44 @@
   <link rel="preconnect" href="https://unpkg.com" crossorigin />
   <!-- Fonts: non-render-blocking with swap -->
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600;700&family=Share+Tech+Mono&display=swap" />
-  <link rel="stylesheet" href="style.css?v=1775795421" />
-  <link rel="stylesheet" href="layout_engine.css?v=1775796000" />
+  <link rel="stylesheet" href="style.css?v=1777900000" />
+  <link rel="stylesheet" href="layout_engine.css?v=1777900000" />
   <!-- CDN libraries: defer to avoid blocking page render -->
   <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <script defer src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
-  <!-- Plotly: lazy-loaded on demand (3.5MB) — loaded by app.js?v=1775594144664 when GEX/DEX panes are mounted -->
+  <!-- Plotly: lazy-loaded on demand (3.5MB) — loaded by app.js?v=1777900000 when GEX/DEX panes are mounted -->
   <script defer src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.4/socket.io.min.js"></script>
   <!-- Local scripts: all deferred for non-blocking load -->
-  <script defer src="core/event_bus.js?v=1775574086"></script>
-  <script defer src="volume_bubbles.js?v=1775795600"></script>
-  <script defer src="v2_dom_heatmap.js?v=1775795500"></script>
-  <script defer src="v2_sigma_engine.js?v=1775750000000"></script>
-  <script defer src="v2_iceberg_sweep.js?v=1775770000000"></script>
-  <script defer src="volume_profile_overlay.js?v=1775795600"></script>
-  <script defer src="v2_integration.js?v=1775795600"></script>
-  <script defer src="sigma_engine.js?v=1775594144664"></script>
-  <script defer src="kinetic_text.js?v=1775594144664"></script>
-  <script defer src="kinetic_hud.js?v=1775594144664"></script>
-  <script defer src="book_microstructure_hud.js?v=1775681396467"></script>
-  <script defer src="equity_tape_pane.js?v=1775770000000"></script>
-  <script defer src="cross_divergence_pane.js?v=1775770000000"></script>
-  <script defer src="options_flow_pane.js?v=1775770000000"></script>
-  <script defer src="vol_surface_pane.js?v=1775770000000"></script>
-  <script defer src="dealer_flow_pane.js?v=1775770000000"></script>
-  <script defer src="depth_ladder.js?v=1775574086"></script>
-  <script defer src="data_audit.js?v=1775574086"></script>
-  <script defer src="pressure_field.js?v=1775594144664"></script>
-  <script defer src="features/thermal_flare.js?v=1775795423"></script>
-  <script defer src="features/wall_lines.js?v=1775574086"></script>
-  <script defer src="features/options_chain.js?v=1775574086"></script>
-  <script defer src="features/chart_core.js?v=1775796100"></script>
-  <script defer src="features/drawing_tools.js?v=1775574086"></script>
-  <script defer src="features/data_fetch.js?v=1775795500"></script>
-  <script defer src="features/dashboard_charts.js?v=1775574086"></script>
-  <script defer src="features/alpha_dashboard.js?v=1775574086"></script>
-  <script defer src="layout_manager.js?v=1775574086"></script>
-  <script defer src="layout_integration.js?v=1775796000"></script>
-  <script defer src="toast.js?v=1775574086"></script>
-  <script defer src="app.js?v=1775796000"></script>
+  <script defer src="webgl_overlay.js?v=1777900000"></script>
+  <script defer src="core/event_bus.js?v=1777900000"></script>
+  <script defer src="volume_bubbles.js?v=1777900000"></script>
+  <script defer src="v2_sigma_engine.js?v=1777900000"></script>
+  <script defer src="volume_profile_overlay.js?v=1777900000"></script>
+  <script defer src="vp_intel_pane.js?v=1777900000"></script>
+  <script defer src="v2_integration.js?v=1777900000"></script>
+  <script defer src="sigma_engine.js?v=1777900000"></script>
+  <script defer src="kinetic_text.js?v=1777900000"></script>
+  <script defer src="kinetic_hud.js?v=1777900000"></script>
+  <script defer src="book_microstructure_hud.js?v=1777900000"></script>
+  <script defer src="equity_tape_pane.js?v=1777900000"></script>
+  <script defer src="cross_divergence_pane.js?v=1777900000"></script>
+  <script defer src="options_flow_pane.js?v=1777900000"></script>
+  <script defer src="vol_surface_pane.js?v=1777900000"></script>
+  <script defer src="dealer_flow_pane.js?v=1777900000"></script>
+  <script defer src="depth_ladder.js?v=1777900000"></script>
+  <script defer src="pressure_field.js?v=1777900000"></script>
+  <script defer src="features/thermal_flare.js?v=1777900000"></script>
+  <script defer src="features/wall_lines.js?v=1777900000"></script>
+  <script defer src="features/options_chain.js?v=1777900000"></script>
+  <script defer src="features/chart_core.js?v=1777900000"></script>
+  <script defer src="features/drawing_tools.js?v=1777900000"></script>
+  <script defer src="features/data_fetch.js?v=1777900000"></script>
+  <script defer src="features/dashboard_charts.js?v=1777900000"></script>
+  <script defer src="features/alpha_dashboard.js?v=1777900000"></script>
+  <script defer src="layout_manager.js?v=1777900000"></script>
+  <script defer src="layout_integration.js?v=1777900000"></script>
+  <script defer src="toast.js?v=1777900000"></script>
+  <script defer src="app.js?v=1777900000"></script>
   <!-- Apply saved theme before first paint -->
   <script>document.documentElement.setAttribute('data-theme', localStorage.getItem('dashTheme') || 'void');</script>
   <!-- Suppress LWC internal "Value is null" throws (CDN cross-origin, no stack access) -->
@@ -87,7 +86,7 @@
     <!-- ── Row 1: Control Bar ── -->
     <div class="t-toolbar" id="t-toolbar">
       <div class="t-tb-left">
-        <span class="t-logo"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="url(#logo-grad)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:2px"><defs><linearGradient id="logo-grad" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#e0e8f0"/><stop offset="100%" stop-color="#7c5af7"/></linearGradient></defs><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg> Altaris Dev</span>
+        <span class="t-logo"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="rgba(200,210,230,0.7)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:2px"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg> Altaris</span>
         <span class="t-divider"></span>
         <div class="t-btn-group" id="t-symbols">
           <button class="t-btn active" data-sym="NQ">NQ</button>
@@ -98,7 +97,9 @@
           <button class="t-btn" data-tf="15s">15s</button>
           <button class="t-btn" data-tf="30s">30s</button>
           <button class="t-btn active" data-tf="1m">1m</button>
+          <button class="t-btn" data-tf="200s">200s</button>
           <button class="t-btn" data-tf="5m">5m</button>
+          <button class="t-btn" data-tf="10m">10m</button>
           <button class="t-btn" data-tf="15m">15m</button>
           <button class="t-btn" data-tf="30m">30m</button>
           <button class="t-btn" data-tf="1h">1h</button>
@@ -108,13 +109,6 @@
         <!-- Overlays -->
         <button class="t-btn active" id="t-walls-toggle" title="Toggle Options Levels"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:2px"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M3 15h18M9 3v18M15 3v18"/></svg> Walls</button>
         <button class="t-btn active" id="t-vp-toggle" title="Toggle Volume Profile"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:2px"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 3v18"/></svg> VP</button>
-        <div class="t-btn-group" id="t-vp-modes" style="margin-left:2px">
-          <button class="t-btn active t-btn-xs" data-vp="prior_day" title="Prior Day VP">PD</button>
-          <button class="t-btn active t-btn-xs" data-vp="session" title="Developing Session VP">DEV</button>
-          <button class="t-btn t-btn-xs" data-vp="rolling_1h" title="Rolling 1H VP">1H</button>
-          <button class="t-btn t-btn-xs" data-vp="rolling_2h" title="Rolling 2H VP">2H</button>
-          <button class="t-btn t-btn-xs" data-vp="rolling_4h" title="Rolling 4H VP">4H</button>
-        </div>
         <span class="t-divider"></span>
         <button class="t-btn" id="t-metrics-toggle" title="Toggle Metrics Ribbon">Metrics</button>
       </div>
@@ -122,9 +116,7 @@
         <span class="t-timestamp" id="t-timestamp">—</span>
         <span class="t-badge live" id="t-badge">LIVE</span>
         <span class="t-divider"></span>
-        <button class="t-settings-btn" id="vp-settings-btn" title="Volume Profile Settings" aria-label="VP Settings"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg></button>
-        <button class="t-settings-btn" id="t-heatmap-settings-btn" title="NQ DOM Heatmap Settings" aria-label="Heatmap Settings"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg></button>
-        <button class="t-settings-btn" id="tf-settings-btn" title="Thermal Flare Settings" aria-label="Thermal Flare Settings"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z"/></svg></button>
+        <button class="t-settings-btn" id="master-settings-btn" title="Settings" aria-label="Settings"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg></button>
         <span class="t-divider"></span>
         <span id="tb-sym-display" class="tb-lbl">NQ · 1m</span>
         <button class="tb-btn" id="tb-save" aria-label="Save Workspace"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:2px"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg> Save</button>
@@ -189,9 +181,9 @@
                 <svg viewBox="0 0 28 20"><rect x="1" y="1" width="8" height="18" rx="1" stroke="rgba(255,180,40,.5)"/><rect x="11" y="1" width="8" height="18" rx="1" stroke="rgba(0,180,255,.5)"/><rect x="21" y="1" width="6" height="18" rx="1" stroke="rgba(255,200,0,.5)"/></svg>
                 <span class="ld-opt-lbl">MAKER</span>
               </div>
-              <div class="ld-opt" data-layout="god-mode" title="GOD MODE — The Ultimate Multi-Pane Setup">
+              <div class="ld-opt" data-layout="god-mode" title="FULL — Complete Multi-Pane View">
                 <svg viewBox="0 0 28 20"><rect x="1" y="1" width="12" height="10" rx="1.5" stroke="rgba(255,50,100,.6)"/><rect x="15" y="1" width="12" height="10" rx="1.5" stroke="rgba(46,232,138,.6)"/><rect x="1" y="13" width="8" height="6" rx="1" stroke="rgba(124,90,247,.6)"/><rect x="11" y="13" width="8" height="6" rx="1" stroke="rgba(255,180,40,.6)"/><rect x="21" y="13" width="6" height="6" rx="1" stroke="rgba(0,180,255,.6)"/></svg>
-                <span class="ld-opt-lbl" style="color:var(--magenta)">GOD MODE</span>
+                <span class="ld-opt-lbl">FULL</span>
               </div>
             </div>
             <div class="layout-dropdown-title" style="padding-top:6px"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="rgba(224,48,96,.6)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:3px"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg> Dealer Hedge</div>
@@ -254,9 +246,26 @@
         <div class="t-metric" style="display:none"><span class="t-metric-label">P/C</span><span class="t-metric-val" id="t-pcr">—</span></div>
         <div class="t-metric"><span class="t-metric-label" style="color:#00d2be" title="Put/Call IV Skew">Skew</span><span class="t-metric-val" id="t-iv-skew" style="color:#00d2be;font-size:8px">—</span></div>
         <div class="t-metric"><span class="t-metric-label" style="color:#c832dc" title="IV Term Structure">Term</span><span class="t-metric-val" id="t-term" style="color:#c832dc;font-size:8px">—</span></div>
-        <div class="t-metric"><span class="t-metric-label" style="color:#a78bfa" title="Vol Surface Regime">Vol.R</span><span class="t-metric-val" id="t-vol-regime" style="font-size:8px;font-weight:600">—</span></div>
+        <div class="t-metric" title="HMM Vol Regime + Posterior Confidence">
+          <span class="t-metric-label" style="color:#a78bfa">Vol.R</span>
+          <span class="t-metric-val" id="t-vol-regime" style="font-size:8px;font-weight:600">—</span><span id="t-vol-regime-conf" style="font-size:7px;font-weight:600;margin-left:2px;opacity:0.7">—</span>
+        </div>
         <div class="t-metric"><span class="t-metric-label" style="color:#38bdf8" title="IV - Realized Vol (Vol Premium)">V.Prm</span><span class="t-metric-val" id="t-vol-prem" style="color:#38bdf8;font-size:8px">—</span></div>
         <div class="t-metric"><span class="t-metric-label" title="IV Rank (0-100)">IVR</span><span class="t-metric-val" id="t-iv-rank" style="font-size:8px">—</span></div>
+        <div class="t-metric" title="Volatility Alert (vol_surface.py skew/regime events)"><span class="t-metric-label" style="color:#ff6b35">Alert</span><span class="t-metric-val" id="t-vol-alert" style="font-size:8px">—</span></div>
+        <div class="t-metric" title="Duration in current HMM regime"><span class="t-metric-label" style="color:#a78bfa">Dur</span><span class="t-metric-val" id="t-vol-dur" style="font-size:8px">—</span></div>
+        <div class="t-metric" title="Rate of change of IV skew (Δ/min) — leading indicator"><span class="t-metric-label" style="color:#00d2be">ΔSkew</span><span class="t-metric-val" id="t-skew-vel" style="font-size:8px">—</span></div>
+        <div class="t-metric" title="Rate of change of ATM IV (Δ/min) — leading indicator"><span class="t-metric-label" style="color:#38bdf8">ΔIV</span><span class="t-metric-val" id="t-iv-vel" style="font-size:8px">—</span></div>
+      </div>
+      <!-- Vol Surface (ORATS) -->
+      <div class="t-mg" data-group="surface">
+        <span class="t-mg-label">SURFACE</span>
+        <div class="t-metric" title="25-Delta Risk Reversal (put IV − call IV)"><span class="t-metric-label" style="color:#c832dc">25Δ</span><span class="t-metric-val" id="t-skew-25d" style="font-size:8px">—</span></div>
+        <div class="t-metric" title="ORATS calibrated ATM mid IV"><span class="t-metric-label" style="color:#ffd700">O.Mid</span><span class="t-metric-val" id="t-orats-mid" style="font-size:8px">—</span></div>
+        <div class="t-metric" title="ORATS smoothed mid-vol (skew-corrected)"><span class="t-metric-label" style="color:#ffd700">O.SMV</span><span class="t-metric-val" id="t-orats-smv" style="font-size:8px">—</span></div>
+        <div class="t-metric" title="Market-Maker bid-ask uncertainty band (0-3)"><span class="t-metric-label" style="color:#ff6b6b">MM.σ</span><span class="t-metric-val" id="t-mm-unc" style="font-size:8px">—</span></div>
+        <div class="t-metric" title="Mean pairwise signal correlation (ρ̄)"><span class="t-metric-label" style="color:#b4a7ff">ρ̄</span><span class="t-metric-val" id="t-rho-bar" style="font-size:8px">—</span></div>
+        <div class="t-metric" title="Copula-specific correlation estimate"><span class="t-metric-label" style="color:#b4a7ff">ρC</span><span class="t-metric-val" id="t-copula-rho" style="font-size:8px">—</span></div>
       </div>
       <!-- Greeks -->
       <div class="t-mg" data-group="greeks">
@@ -274,15 +283,24 @@
           <span class="t-metric-label" style="color:#ff6b6b">Hawkes</span>
           <span class="t-metric-val" id="t-hawkes-rho" style="font-size:8px;font-weight:700">—</span><span id="t-hawkes-dir" style="font-size:7px;font-weight:700;margin-left:2px;opacity:0.85;transition:color 0.3s"></span>
         </div>
-        <div class="t-metric" title="Kalman OFI Signal-to-Noise Ratio">
-          <span class="t-metric-label" style="color:#38bdf8">SNR</span>
+        <div class="t-metric" title="NQ Top-of-Book Spread (live)">
+          <span class="t-metric-label" style="color:#38bdf8">Spread</span>
           <span class="t-metric-val" id="t-spread" style="font-size:8px;font-weight:700">--</span>
+        </div>
+        <div class="t-metric" title="Adverse Selection Score (Kyle λ + Glosten-Harris + Huang-Stoll composite)">
+          <span class="t-metric-label" style="color:#ff8c00">AS</span>
+          <span class="t-metric-val" id="t-as-score" style="font-size:8px;font-weight:700">—</span>
+        </div>
+        <div class="t-metric" title="Copula-Calibrated Joint Signal Confidence (Gaussian copula + effective dimensionality)">
+          <span class="t-metric-label" style="color:#b4a7ff">Sig.C</span>
+          <span class="t-metric-val" id="t-sig-cal" style="font-size:8px;font-weight:700">—</span>
         </div>
       </div>
     </div>
 
     <!-- ── Volume Profile Settings Panel ── -->
-    <div class="hm-settings-panel" id="vp-settings-panel" style="display:none;right:90px"></div>
+    <div id="vp-settings-panel" style="display:none"></div>
+    <div id="master-settings-panel" style="display:none"></div>
 
     <!-- ── Heatmap Settings Dropdown Panel ── -->
     <div class="hm-settings-panel" id="hm-settings-panel" style="display:none">
@@ -379,30 +397,6 @@
           </div>
           <div class="hm-group-body">
 
-            <!-- Cumulative Delta -->
-            <div class="hm-row">
-              <label class="hm-toggle"><input type="checkbox" id="hms-delta" checked><span class="hm-slider"></span></label>
-              <span class="hm-label">Cumulative Delta (Δ)</span>
-              <div class="hm-controls">
-                <input type="range" min="20" max="80" value="40" id="hms-delta-height" title="Strip Height">
-              </div>
-            </div>
-            <!-- Depth Persistence -->
-            <div class="hm-row">
-              <label class="hm-toggle"><input type="checkbox" id="hms-persistence" checked><span class="hm-slider"></span></label>
-              <span class="hm-label">Depth Persistence</span>
-              <div class="hm-controls">
-                <span style="font-size:8px;color:rgba(160,170,200,.5)">spoof filter</span>
-              </div>
-            </div>
-            <!-- Depth Velocity -->
-            <div class="hm-row">
-              <label class="hm-toggle"><input type="checkbox" id="hms-velocity" checked><span class="hm-slider"></span></label>
-              <span class="hm-label">Depth Velocity</span>
-              <div class="hm-controls">
-                <span style="font-size:8px;color:rgba(160,170,200,.5)">loading pulses</span>
-              </div>
-            </div>
 
 
           </div>
@@ -455,14 +449,6 @@
                 <span id="hms-vel-sigma-val" style="font-size:8px;color:rgba(0,220,255,.7);min-width:20px;text-align:right">1.0</span>
               </div>
             </div>
-            <!-- Wall Glow % -->
-            <div class="hm-row">
-              <span class="hm-label" style="padding-left:8px;font-size:9px;color:rgba(160,170,200,.6)">Wall Glow %</span>
-              <div class="hm-controls" style="flex:1">
-                <input type="range" min="70" max="99" value="90" id="hms-wallglow-pct" title="Percentile for wall glow. 90 = P90">
-                <span id="hms-wallglow-pct-val" style="font-size:8px;color:rgba(255,200,50,.7);min-width:20px;text-align:right">90</span>
-              </div>
-            </div>
             <!-- EWMA α -->
             <div class="hm-row">
               <span class="hm-label" style="padding-left:8px;font-size:9px;color:rgba(160,170,200,.6)">EWMA α</span>
@@ -499,12 +485,12 @@
 
     <!-- ════════════════════════════════════════════════════════════════════
          PANE GRID — Dynamic Layout Engine
-         Panes are created by layout_integration.js, content mounted by app.js?v=1775594144664
+         Panes are created by layout_integration.js, content mounted by app.js?v=1777900000
          ════════════════════════════════════════════════════════════════════ -->
     <div id="pane-grid" data-layout="single"></div>
     <div id="drag-overlay"></div>
 
-    <!-- ── Options Chain Panel (hidden, mounted into oclvl pane by app.js?v=1775594144664) ── -->
+    <!-- ── Options Chain Panel (hidden, mounted into oclvl pane by app.js?v=1777900000) ── -->
     <div class="t-options" id="t-options" style="display:none">
       <div class="oc-header">
         <span class="oc-title">OPTIONS CHAIN</span>

@@ -1,3 +1,19 @@
+// ── Debug log gate ────────────────────────────────────────────────────────────
+// Silence console.log/info/debug in prod unless user opts in:
+//   localStorage.setItem('altaris_debug', '1'); location.reload();
+// Preserves console.warn/error so genuine problems stay visible.
+(function _gateDebugLogs() {
+    try {
+        window._ALTARIS_DEBUG = localStorage.getItem('altaris_debug') === '1';
+    } catch (_) { window._ALTARIS_DEBUG = false; }
+    if (!window._ALTARIS_DEBUG) {
+        const noop = () => {};
+        console.log = noop;
+        console.info = noop;
+        console.debug = noop;
+    }
+})();
+
 // ── Auth ──────────────────────────────────────────────────────────────────────
 // authFetch is defined by features/data_fetch.js as window.authFetch
 // DO NOT re-declare here — function declarations hoist and overwrite window.authFetch,
@@ -140,6 +156,7 @@ let _l2CandlePollTimer = null;
 let _l2SeamTime = 0;  // timestamp of the first candle with live bubble data
 let _l2FetchController = null;   // AbortController for in-flight fetch cancellation
 let _l2FetchVersion = 0;         // bumped on each switch to discard stale responses
+let _l2FetchInFlight = false;    // guard against abort cascade from competing fetches
 let _l2TapeAll = [];   // accumulated trades, newest first
 let _useCanvasLadder = false;  // true when Canvas 2D ladder pane is active
 let _l2KineticCursor = 0;     // tracks which trades have already been fed to KineticText
@@ -147,62 +164,173 @@ let _l2KineticCursor = 0;     // tracks which trades have already been fed to Ki
 // ── Wall / Max Pain overlay state ──
 let _ocRefreshTimer = null; // options chain auto-refresh
 
-const L2_SYMBOLS = ['NQ', 'GC'];
+const L2_SYMBOLS = ['NQ'];
 const L2_TICK_SIZES = { NQ: 0.25, GC: 0.10 };
 
 // ── Socket.IO connection for real-time candle/trade push ──
+// ── Cached enriched data (bp, signals) — updated at 5Hz by candle_enriched ──
+// Module-scope so _l2SwitchSymbol can clear on symbol change.
+let _cachedBp = null;
+let _cachedEnriched = null;
+let _lastCandleOHLC = null;  // { time, open, high, low, close } — for DOM mid sync
+
 // ── Data Events Setup (delegated to DataFetch module) ──
 function _setupDataEvents() {
     if (!window.AltarisEvents || window._dataEventsWired) return;
     window._dataEventsWired = true;
 
+    // Candle OHLCV updates — fast path, no throttle, matches DOM speed
+    // Also updates bubbleSeries with cached bp data to keep time-aligned
     window.AltarisEvents.on('data:candles:update', (data) => {
         if (typeof ChartCore === 'undefined' || ChartCore.getInstances().length === 0) return;
-        if (data.symbol !== _l2ChartSymbol || data.tf !== _l2ChartTF) return;
+        if (data.symbol !== _l2ChartSymbol || data.tf !== _l2ChartTF) {
+            // DIAG: log once per distinct mismatch to trace tf routing bugs
+            if (!window._candleDropLog) window._candleDropLog = {};
+            const _k = `${data.symbol}/${data.tf} (active: ${_l2ChartSymbol}/${_l2ChartTF})`;
+            if (!window._candleDropLog[_k]) {
+                window._candleDropLog[_k] = true;
+                console.log('[CANDLE DROP]', _k);
+            }
+            return;
+        }
 
         const et = _utcToET(data.time);
-        try {
-            if (typeof ChartCore !== 'undefined') {
-                ChartCore.getInstances().forEach(inst => {
-                    inst.candleSeries.update({
-                        time: et, open: data.open, high: data.high, low: data.low, close: data.close
-                    });
-                    if (inst.volumeSeries) {
-                        inst.volumeSeries.update({
-                            time: et, value: data.volume || 0,
-                            color: data.close >= data.open ? 'rgba(38,166,154,.25)' : 'rgba(239,83,80,.25)'
-                        });
-                    }
-                    if (inst.bubbleSeries && data.bp) {
-                        inst.bubbleSeries.update({
-                            time: et, close: data.close, bp: data.bp,
-                            icebergs: data.icebergs || null, sweeps: data.sweeps || null,
-                            delta_div: data.delta_div || null, ignition: data.ignition || null,
-                            spoofs: data.spoofs || null, drifting_iceberg: data.drifting_iceberg || null,
-                            wall_gone: data.wall_gone || null
-                        });
-                    }
-                });
+        if (_l2LastCandleTime && et < _l2LastCandleTime) {
+            // DIAG: live update older than last stored — timestamp bug?
+            if (!window._candleTimeDrop) window._candleTimeDrop = 0;
+            if (++window._candleTimeDrop <= 3) {
+                console.warn('[CANDLE TIME DROP]', 'et=', et, 'last=', _l2LastCandleTime, 'tf=', _l2ChartTF);
             }
-        } catch (e) {}
-        _l2LastCandleTime = data.time;
+            return;
+        }
+        // New candle boundary — clear stale bp from previous candle
+        if (_l2LastCandleTime && et > _l2LastCandleTime) {
+            _cachedBp = null;
+            _cachedEnriched = null;
+        }
+        _lastCandleOHLC = { time: et, open: data.open, high: data.high, low: data.low, close: data.close };
+        try {
+            ChartCore.getInstances().forEach(inst => {
+                inst.candleSeries.update({
+                    time: et, open: data.open, high: data.high, low: data.low, close: data.close
+                });
+                if (inst.volumeSeries) {
+                    inst.volumeSeries.update({
+                        time: et, value: data.volume || 0,
+                        color: data.close >= data.open ? 'rgba(38,166,154,.25)' : 'rgba(239,83,80,.25)'
+                    });
+                }
+                // Bubble update: same time as candle, using cached bp from enriched events
+                if (inst.bubbleSeries && _cachedBp) {
+                    inst.bubbleSeries.update({
+                        time: et,
+                        o: data.open, h: data.high, l: data.low, c: data.close, close: data.close,
+                        bp: _cachedBp,
+                        sweeps: _cachedEnriched?.sweeps || null,
+                        delta_div: _cachedEnriched?.delta_div || null,
+                        ignition: _cachedEnriched?.ignition || null,
+                        spoofs: _cachedEnriched?.spoofs || null,
+                        wall_gone: _cachedEnriched?.wall_gone || null,
+                        absorption: _cachedEnriched?.absorption || null,
+                        depth_deltas: _cachedEnriched?.depth_deltas || null
+                    });
+                }
+            });
+        } catch (e) {
+            if (window._candleErrCount === undefined) window._candleErrCount = 0;
+            if (++window._candleErrCount <= 5) console.warn('[CANDLE]', e.message);
+        }
+        _l2LastCandleTime = et;
     });
 
+    // Candle enriched data — cache bp + signals at 5Hz, don't touch bubbleSeries directly
+    window.AltarisEvents.on('data:candles:enriched', (data) => {
+        if (data.symbol !== _l2ChartSymbol) return;
+        // bp is timeframe-specific — only cache when tf matches
+        if (data.tf === _l2ChartTF && data.bp) {
+            _cachedBp = data.bp;
+            _cachedEnriched = data;
+        }
+        // absorption + depth_deltas are per-symbol, not per-tf — always cache
+        if (data.absorption) _cachedEnriched = { ...(_cachedEnriched || {}), absorption: data.absorption };
+        if (data.depth_deltas) _cachedEnriched = { ...(_cachedEnriched || {}), depth_deltas: data.depth_deltas };
+    });
+
+    // Cache trade tick DOM refs
+    let _tradeStrip = null, _tradeSpot = null;
+    const _tradePriceEls = {};
+
+    // Price display: only needs latest trade (emitted at 20Hz after batching)
     window.AltarisEvents.on('data:trades:update', (data) => {
-        const strip = document.getElementById('l2-symbol-prices');
-        if (strip) {
-            const priceEl = strip.querySelector(`[data-sym="${data.symbol}"] .price`);
-            if (priceEl) priceEl.textContent = data.price.toFixed(2);
+        if (!_tradeStrip) _tradeStrip = document.getElementById('l2-symbol-prices');
+        if (_tradeStrip) {
+            if (!_tradePriceEls[data.symbol]) {
+                const row = _tradeStrip.querySelector(`[data-sym="${data.symbol}"] .price`);
+                if (row) _tradePriceEls[data.symbol] = row;
+            }
+            if (_tradePriceEls[data.symbol]) _tradePriceEls[data.symbol].textContent = data.price.toFixed(2);
         }
         if (data.symbol === _l2ChartSymbol) {
-            const spotEl = document.getElementById('t-spot');
-            if (spotEl) spotEl.textContent = data.price.toFixed(2);
-        }
-        // Push the live trade into the tape buffer directly!
-        if (typeof _l2RenderTape === 'function') {
-            _l2RenderTape({ [data.symbol]: [data] });
+            if (!_tradeSpot) _tradeSpot = document.getElementById('t-spot');
+            if (_tradeSpot) _tradeSpot.textContent = data.price.toFixed(2);
         }
     });
+    // Tape + physics: consume full batch (all trades in 50ms window)
+    window.AltarisEvents.on('data:trades:batch', (batch) => {
+        if (typeof _l2RenderTape === 'function') {
+            const grouped = {};
+            for (const t of batch) {
+                if (!grouped[t.symbol]) grouped[t.symbol] = [];
+                grouped[t.symbol].push(t);
+            }
+            _l2RenderTape(grouped);
+        }
+    });
+
+    // Cache zone metric DOM refs once (avoid getElementById every 5s)
+    let _zoneEls = null;
+    function _getZoneEls() {
+        if (_zoneEls) return _zoneEls;
+        _zoneEls = {
+            cw: document.getElementById('t-cw'),
+            pw: document.getElementById('t-pw'),
+            mp: document.getElementById('t-mp'),
+            flip: document.getElementById('t-flip'),
+            dexL: document.getElementById('t-dex-long'),
+            dexS: document.getElementById('t-dex-short'),
+            ndex: document.getElementById('t-ndex'),
+            netPrem: document.getElementById('t-net-prem'),
+            theta: document.getElementById('t-net-theta'),
+            ivrv: document.getElementById('t-ivrv'),
+            // Greek-surface cells — moved from wall_lines /api/walls poll (which
+            // doesn't include these fields) to the 5Hz zone_update handler.
+            skew: document.getElementById('t-iv-skew'),
+            term: document.getElementById('t-term'),
+            speed: document.getElementById('t-speed'),
+            conf: document.getElementById('t-confluence'),
+            misp: document.getElementById('t-misprice'),
+            flow: document.getElementById('t-flow'),
+            ivSpread: document.getElementById('t-iv-spread'),
+            volRegime: document.getElementById('t-vol-regime'),
+            volRegimeConf: document.getElementById('t-vol-regime-conf'),
+            volPrem: document.getElementById('t-vol-prem'),
+            ivRank: document.getElementById('t-iv-rank'),
+            asScore: document.getElementById('t-as-score'),
+            sigCal: document.getElementById('t-sig-cal'),
+            // 10 newly-surfaced backend fields (zone_update) — previously dark.
+            volAlert: document.getElementById('t-vol-alert'),
+            volDur: document.getElementById('t-vol-dur'),
+            skewVel: document.getElementById('t-skew-vel'),
+            ivVel: document.getElementById('t-iv-vel'),
+            skew25d: document.getElementById('t-skew-25d'),
+            oratsMid: document.getElementById('t-orats-mid'),
+            oratsSmv: document.getElementById('t-orats-smv'),
+            mmUnc: document.getElementById('t-mm-unc'),
+            rhoBar: document.getElementById('t-rho-bar'),
+            copulaRho: document.getElementById('t-copula-rho'),
+        };
+        return _zoneEls;
+    }
 
     window.AltarisEvents.on('data:zone:update', (data) => {
         if (typeof ChartCore === 'undefined' || ChartCore.getInstances().length === 0) return;
@@ -212,27 +340,151 @@ function _setupDataEvents() {
             WallLines.updateLive(data);
         }
 
-        const setCW = document.getElementById('t-cw');
-        const setPW = document.getElementById('t-pw');
-        const setMP = document.getElementById('t-mp');
-        const setFlip = document.getElementById('t-flip');
-        const setDexL = document.getElementById('t-dex-long');
-        const setDexS = document.getElementById('t-dex-short');
-        const setNDex = document.getElementById('t-ndex');
-        const setNetPrem = document.getElementById('t-net-prem');
-        const setTheta = document.getElementById('t-net-theta');
-        const setIvrv = document.getElementById('t-ivrv');
+        const z = _getZoneEls();
 
-        if (setCW && data.underlying_call_wall) setCW.textContent = data.underlying_call_wall;
-        if (setPW && data.underlying_put_wall) setPW.textContent = data.underlying_put_wall;
-        if (setMP && data.underlying_max_pain) setMP.textContent = data.underlying_max_pain;
-        if (setFlip && data.underlying_gamma_flip) setFlip.textContent = data.underlying_gamma_flip;
-        if (setDexL && data.dex_wall_long_qqq !== undefined) setDexL.textContent = data.dex_wall_long_qqq;
-        if (setDexS && data.dex_wall_short_qqq !== undefined) setDexS.textContent = data.dex_wall_short_qqq;
-        if (setNDex && data.total_dex !== undefined) setNDex.textContent = (data.total_dex / 1e6).toFixed(2) + 'M';
-        if (setNetPrem && data.net_premium_m !== undefined) setNetPrem.textContent = data.net_premium_m.toFixed(2) + 'M';
-        if (setTheta && data.net_theta_m !== undefined) setTheta.textContent = data.net_theta_m.toFixed(2) + 'M';
-        if (setIvrv && data.mean_iv !== undefined) setIvrv.textContent = data.mean_iv.toFixed(2) + '%';
+        if (z.cw && data.underlying_call_wall) z.cw.textContent = data.underlying_call_wall;
+        if (z.pw && data.underlying_put_wall) z.pw.textContent = data.underlying_put_wall;
+        if (z.mp && data.underlying_max_pain) z.mp.textContent = data.underlying_max_pain;
+        if (z.flip && data.underlying_gamma_flip) z.flip.textContent = data.underlying_gamma_flip;
+        if (z.dexL && data.dex_wall_long_qqq !== undefined) z.dexL.textContent = data.dex_wall_long_qqq;
+        if (z.dexS && data.dex_wall_short_qqq !== undefined) z.dexS.textContent = data.dex_wall_short_qqq;
+        if (z.ndex && data.total_dex !== undefined) z.ndex.textContent = (data.total_dex / 1e6).toFixed(2) + 'M';
+        if (z.netPrem && data.net_premium_m !== undefined) z.netPrem.textContent = data.net_premium_m.toFixed(2) + 'M';
+        if (z.theta && data.net_theta_m !== undefined) z.theta.textContent = data.net_theta_m.toFixed(2) + 'M';
+        if (z.ivrv && data.mean_iv !== undefined) z.ivrv.textContent = data.mean_iv.toFixed(2) + '%';
+
+        if (z.skew && data.iv_skew_label) z.skew.textContent = data.iv_skew_label;
+        if (z.term && data.term_structure) z.term.textContent = data.term_structure;
+        if (z.speed && data.speed_sign) z.speed.textContent = data.speed_sign;
+        if (z.conf) z.conf.textContent = data.confluence_count != null ? `${data.confluence_count}` : '0';
+
+        if (z.misp && data.avg_mispricing_pct !== undefined) {
+            const mp = data.avg_mispricing_pct || 0;
+            z.misp.textContent = mp > 0 ? `${mp.toFixed(1)}%` : '—';
+            z.misp.style.color = mp > 10 ? '#ff3060' : mp > 5 ? '#ff9500' : '#ff6b35';
+        }
+        if (z.flow && data.mark_flow_direction) {
+            const f = data.mark_flow_direction;
+            if (f === 'CALL_ACCUMULATING')      { z.flow.textContent = '▲ CALLS'; z.flow.style.color = '#2ee88a'; }
+            else if (f === 'PUT_ACCUMULATING')  { z.flow.textContent = '▼ PUTS';  z.flow.style.color = '#ff3060'; }
+            else                                { z.flow.textContent = '◆ BAL';    z.flow.style.color = '#888'; }
+        }
+        if (z.ivSpread && data.iv_spread_label) {
+            const lbl = data.iv_spread_label;
+            z.ivSpread.textContent = lbl;
+            const c = lbl === 'WIDE' ? '#ff3060' : lbl === 'NORMAL' ? '#ff9500' : lbl === 'TIGHT' ? '#4cd964' : '#888';
+            z.ivSpread.style.color = c;
+        }
+        if (z.volRegime && data.vol_regime) {
+            const regimeColors = { 'STRESSED': '#ff3060', 'ELEVATED': '#ff9500', 'NORMAL': '#a78bfa', 'COMPLACENT': '#4cd964', 'COMPRESSED': '#00dcff' };
+            z.volRegime.textContent = data.vol_regime;
+            z.volRegime.style.color = regimeColors[data.vol_regime] || '#888';
+        }
+        if (z.volPrem && data.vol_premium !== undefined) {
+            const vp = data.vol_premium;
+            const sign = vp >= 0 ? '+' : '';
+            z.volPrem.textContent = `${sign}${vp.toFixed(1)}%`;
+            z.volPrem.style.color = vp > 15 ? '#ff3060' : vp > 8 ? '#ff9500' : vp > 0 ? '#38bdf8' : '#4cd964';
+        }
+        if (z.ivRank && data.iv_rank !== undefined) {
+            z.ivRank.textContent = `${data.iv_rank.toFixed(0)}`;
+            z.ivRank.style.color = data.iv_rank > 80 ? '#ff3060' : data.iv_rank > 60 ? '#ff9500' : data.iv_rank < 20 ? '#4cd964' : '#888';
+        }
+
+        // HMM regime posterior confidence (0-100%)
+        if (z.volRegimeConf && data.vol_regime_confidence !== undefined) {
+            const c = data.vol_regime_confidence;
+            z.volRegimeConf.textContent = `${c.toFixed(0)}%`;
+            z.volRegimeConf.style.color = c > 85 ? '#4cd964' : c > 65 ? '#ff9500' : '#ff3060';
+        }
+
+        // Adverse selection composite score (0-100, higher = more informed flow)
+        if (z.asScore && data.adverse_selection_score !== undefined) {
+            const s = data.adverse_selection_score;
+            z.asScore.textContent = s.toFixed(0);
+            // High AS = tape is toxic for MM; low = safe to quote
+            z.asScore.style.color = s > 70 ? '#ff3060' : s > 40 ? '#ff9500' : '#4cd964';
+        }
+
+        // Copula-calibrated joint signal confidence (50-99.99 percentile)
+        if (z.sigCal && data.copula_joint !== undefined) {
+            const c = data.copula_joint;
+            z.sigCal.textContent = `${c.toFixed(1)}`;
+            // Higher percentile = rarer composite signal. Coloured by extremity.
+            z.sigCal.style.color = c > 95 ? '#ff3060' : c > 85 ? '#ff9500' : c > 70 ? '#ffd700' : '#888';
+        }
+
+        // Vol alert: NONE/SHOCK/STRESS/SKEW_SHIFT etc.
+        if (z.volAlert && data.vol_alert !== undefined) {
+            const a = String(data.vol_alert || 'NONE');
+            z.volAlert.textContent = a === 'NONE' ? '—' : a;
+            z.volAlert.style.color = a === 'NONE' ? '#888' :
+                (a.includes('SHOCK') || a.includes('STRESS')) ? '#ff3060' : '#ff9500';
+        }
+
+        // Duration in current HMM regime (seconds → compact Xs/Xm/Xh)
+        if (z.volDur && data.vol_regime_duration !== undefined) {
+            const s = Number(data.vol_regime_duration) || 0;
+            z.volDur.textContent = s < 60 ? `${s.toFixed(0)}s` :
+                s < 3600 ? `${(s / 60).toFixed(0)}m` : `${(s / 3600).toFixed(1)}h`;
+        }
+
+        // Skew velocity (Δ/min) — leading indicator, sign-colored
+        if (z.skewVel && data.skew_velocity !== undefined) {
+            const v = Number(data.skew_velocity) || 0;
+            const sign = v >= 0 ? '+' : '';
+            z.skewVel.textContent = `${sign}${v.toFixed(2)}`;
+            z.skewVel.style.color = Math.abs(v) < 0.01 ? '#888' : v > 0 ? '#4cd964' : '#ff3060';
+        }
+
+        // IV velocity (Δ/min)
+        if (z.ivVel && data.iv_velocity !== undefined) {
+            const v = Number(data.iv_velocity) || 0;
+            const sign = v >= 0 ? '+' : '';
+            z.ivVel.textContent = `${sign}${v.toFixed(2)}`;
+            z.ivVel.style.color = Math.abs(v) < 0.01 ? '#888' : v > 0 ? '#4cd964' : '#ff3060';
+        }
+
+        // 25-delta risk reversal (IV pts, positive = put skew premium)
+        if (z.skew25d && data.skew_25d !== undefined) {
+            const v = Number(data.skew_25d) || 0;
+            const sign = v >= 0 ? '+' : '';
+            z.skew25d.textContent = `${sign}${v.toFixed(2)}`;
+            z.skew25d.style.color = v > 3 ? '#ff3060' : v > 1 ? '#ff9500' : v < -1 ? '#4cd964' : '#888';
+        }
+
+        // ORATS ATM mid IV
+        if (z.oratsMid && data.orats_mid_iv !== undefined) {
+            const v = Number(data.orats_mid_iv) || 0;
+            z.oratsMid.textContent = `${v.toFixed(1)}%`;
+        }
+
+        // ORATS smoothed-mid vol
+        if (z.oratsSmv && data.orats_smv_vol !== undefined) {
+            const v = Number(data.orats_smv_vol) || 0;
+            z.oratsSmv.textContent = `${v.toFixed(1)}%`;
+        }
+
+        // Market-maker uncertainty (0-3 normalized bid-ask band)
+        if (z.mmUnc && data.mm_uncertainty !== undefined) {
+            const v = Number(data.mm_uncertainty) || 0;
+            z.mmUnc.textContent = v.toFixed(2);
+            z.mmUnc.style.color = v > 2 ? '#ff3060' : v > 1 ? '#ff9500' : '#888';
+        }
+
+        // Mean pairwise signal correlation (0-1)
+        if (z.rhoBar && data.rho_bar !== undefined) {
+            const v = Number(data.rho_bar) || 0;
+            z.rhoBar.textContent = v.toFixed(2);
+            z.rhoBar.style.color = v > 0.7 ? '#ff3060' : v > 0.4 ? '#ff9500' : '#38bdf8';
+        }
+
+        // Copula-specific correlation estimate
+        if (z.copulaRho && data.copula_rho_bar !== undefined) {
+            const v = Number(data.copula_rho_bar) || 0;
+            z.copulaRho.textContent = v.toFixed(2);
+            z.copulaRho.style.color = v > 0.7 ? '#ff3060' : v > 0.4 ? '#ff9500' : '#38bdf8';
+        }
 
         if (data.dex_profile && typeof ThermalFlare !== 'undefined') {
             ThermalFlare.updateData(data.dex_profile);
@@ -240,17 +492,22 @@ function _setupDataEvents() {
     });
 
     window.AltarisEvents.on('data:tape:alert', (alert) => {
-        // Match key: price + timestamp (ms) — same as used in _l2RenderTape
         const key = `${alert.price}_${alert.timestamp}`;
+        alert._expiry = Date.now() + 15000;
         _tapeAlerts.set(key, alert);
-        // Cap size to prevent memory growth during high-freq iceberging
-        if (_tapeAlerts.size > 500) {
+        // Hard cap — drop oldest when over limit
+        if (_tapeAlerts.size > 300) {
             const keys = [..._tapeAlerts.keys()].slice(0, 100);
             keys.forEach(k => _tapeAlerts.delete(k));
         }
-        // Auto-expire after 15s to prevent memory leak
-        setTimeout(() => _tapeAlerts.delete(key), 15000);
     });
+    // Batch expiry sweep every 5s instead of per-alert setTimeout (prevents timeout queue leak)
+    setInterval(() => {
+        const now = Date.now();
+        for (const [k, a] of _tapeAlerts) {
+            if (a._expiry && now > a._expiry) _tapeAlerts.delete(k);
+        }
+    }, 5000);
 
     // ── spot_update: Live NQ/QQQ/SPY/VIX spot from Schwab WS streamer ──
     window.AltarisEvents.on('data:spot:update', (data) => {
@@ -272,7 +529,7 @@ function _setupDataEvents() {
     window.AltarisEvents.on('data:edge:signal', (signal) => {
         if (!signal) return;
         const isLong = (signal.type || '').includes('LONG');
-        const dir = isLong ? '🟢' : '🔴';
+        const dir = isLong ? '[BUY]' : '[SELL]';
         const conf = signal.confidence_pctl ? `P${signal.confidence_pctl.toFixed(0)}` : '';
         console.log(`[EDGE] ${dir} ${signal.type} ${conf}`);
         // Show toast for high-conviction signals
@@ -283,6 +540,11 @@ function _setupDataEvents() {
         // Feed signal to _l2RenderSignals if signals grid exists
         if (window._latestEdgeSignals === undefined) window._latestEdgeSignals = {};
         window._latestEdgeSignals[signal.type] = signal;
+        // Cap to 50 signal types to prevent unbounded growth
+        const eKeys = Object.keys(window._latestEdgeSignals);
+        if (eKeys.length > 50) {
+            for (const k of eKeys.slice(0, eKeys.length - 50)) delete window._latestEdgeSignals[k];
+        }
     });
 
     // ── eq_book_update: QQQ NASDAQ L2 book depth from Schwab ──
@@ -299,12 +561,59 @@ function _setupDataEvents() {
         _renderScreenerAlerts(data);
     });
 
-    // ── l2_update: Full L2 state via WebSocket (replaces /api/l2 REST poll) ──
+    // ── l2_update: Full L2 state via WebSocket ──
+    // Throttled to 10Hz (100ms) — DOM ladder at 20Hz vs 10Hz is visually identical.
+    // Signals still processed immediately; only the expensive DOM render is throttled.
+    let _l2RenderLast = 0, _l2RenderQueued = null, _l2RenderTid = 0;
+    const _L2_RENDER_MS = 100; // 10Hz
     window.AltarisEvents.on('data:l2:update', (data) => {
         if (!data) return;
+        const symDom = (data.dom || {})[_l2ChartSymbol];
+        if (!symDom || (Object.keys(symDom.bids || {}).length === 0 && Object.keys(symDom.asks || {}).length === 0)) {
+            window._l2WsActive = true;
+            window._l2WsLastTs = Date.now();
+            if (data.imbalance !== undefined) _l2RenderImbalance(data);
+            if (data.signals) _l2RenderSignals(data.signals);
+            return;
+        }
         window._l2WsActive = true;
         window._l2WsLastTs = Date.now();
-        _l2Render(data);
+        // Throttle expensive DOM render to 10Hz
+        const now = performance.now();
+        if (now - _l2RenderLast >= _L2_RENDER_MS) {
+            _l2RenderLast = now;
+            _l2Render(data);
+        } else {
+            _l2RenderQueued = data;
+            if (!_l2RenderTid) {
+                _l2RenderTid = setTimeout(() => {
+                    _l2RenderTid = 0;
+                    _l2RenderLast = performance.now();
+                    if (_l2RenderQueued) { _l2Render(_l2RenderQueued); _l2RenderQueued = null; }
+                }, _L2_RENDER_MS - (now - _l2RenderLast));
+            }
+        }
+        if (symDom && symDom.mid_price) {
+            const spotEl = document.getElementById('t-spot');
+            if (spotEl) spotEl.textContent = symDom.mid_price.toFixed(2);
+
+            // ── Candle-to-DOM sync: update chart candle close at L2 speed ──
+            // Between trades, the chart freezes while the ladder keeps ticking.
+            // This syncs the active candle's close to the DOM mid so chart is
+            // as responsive as the ladder. No new objects — reuses _lastCandleOHLC.
+            if (_lastCandleOHLC && typeof ChartCore !== 'undefined') {
+                const mid = symDom.mid_price;
+                _lastCandleOHLC.close = mid;
+                if (mid > _lastCandleOHLC.high) _lastCandleOHLC.high = mid;
+                if (mid < _lastCandleOHLC.low) _lastCandleOHLC.low = mid;
+                try {
+                    const insts = ChartCore.getInstances();
+                    for (let i = 0; i < insts.length; i++) {
+                        insts[i].candleSeries.update(_lastCandleOHLC);
+                    }
+                } catch(e) { /* silent — chart may not be mounted yet */ }
+            }
+        }
     });
 
     // ── candle_history: WS push of full candle history (with bp) on connect ──
@@ -312,8 +621,20 @@ function _setupDataEvents() {
     // and on subscribe. Without this handler, bp data was silently dropped and
     // volume bubbles would never render until REST polling accumulated enough data.
     window.AltarisEvents.on('data:candles:history', (data) => {
+        console.log('[CANDLE HISTORY]', data?.symbol, data?.tf, 'count:', data?.candles?.length, 'active:', _l2ChartSymbol, _l2ChartTF);
         if (!data || !data.candles || data.candles.length === 0) return;
-        if (data.symbol !== _l2ChartSymbol || data.tf !== _l2ChartTF) return;
+        // Leak-fix: ALWAYS buffer keyed by sym+tf so a history that arrives
+        // for a pane that's still mounting (or a brief tf mismatch during
+        // layout switch) can be replayed once the chart is ready. Previously
+        // mismatches were silently dropped → blank chart.
+        const _histKey = `${data.symbol}|${data.tf}`;
+        window._pendingCandleHistoryMap = window._pendingCandleHistoryMap || {};
+        window._pendingCandleHistoryMap[_histKey] = data;
+        if (data.symbol !== _l2ChartSymbol || data.tf !== _l2ChartTF) {
+            // Not for the currently selected chart — buffered for later switch-back.
+            console.warn('[CANDLE HISTORY BUFFER] tf/symbol mismatch, keeping for later', _histKey);
+            return;
+        }
         // Buffer if chart not ready yet — replay from chart:ready handler
         if (typeof ChartCore === 'undefined' || ChartCore.getInstances().length === 0) {
             window._pendingCandleHistory = data;
@@ -336,11 +657,14 @@ function _setupDataEvents() {
 
             if (inst.feature === 'chart' && inst.bubbleSeries) {
                 const bubbleData = candles.map(c => ({
-                    time: _utcToET(c.time), close: c.close, bp: c.bp || null,
-                    icebergs: c.icebergs || null, sweeps: c.sweeps || null,
+                    time: _utcToET(c.time),
+                    o: c.open, h: c.high, l: c.low, c: c.close, close: c.close,
+                    bp: c.bp || null,
+                    sweeps: c.sweeps || null,
                     delta_div: c.delta_div || null, ignition: c.ignition || null,
-                    spoofs: c.spoofs || null, drifting_iceberg: c.drifting_iceberg || null,
-                    wall_gone: c.wall_gone || null
+                    spoofs: c.spoofs || null,
+                    wall_gone: c.wall_gone || null,
+                    absorption: c.absorption || null, depth_deltas: c.depth_deltas || null
                 }));
                 inst.bubbleSeries.setData(bubbleData);
             }
@@ -356,10 +680,10 @@ function _setupDataEvents() {
                     });
                 }, 100);
             } else {
-                inst.chart.timeScale().fitContent();
-                // Deferred re-fit in case layout hasn't fully settled
+                // Scroll to right edge showing latest candles, not fitContent which compresses everything
+                inst.chart.timeScale().scrollToPosition(5, false);
                 setTimeout(() => {
-                    try { inst.chart.timeScale().fitContent(); } catch(e) {}
+                    try { inst.chart.timeScale().scrollToPosition(5, false); } catch(e) {}
                 }, 250);
             }
         });
@@ -383,18 +707,21 @@ function _setupDataEvents() {
 
         // Cache for layout switches + update poll cursor
         _l2CandleDataCache = { ohlc, vol };
-        _l2LastCandleTime = candles[candles.length - 1].time;
+        _l2LastCandleTime = _utcToET(candles[candles.length - 1].time);
 
-        // Dismiss welcome screen on first data
+        // Dismiss welcome screen + hide loading overlay on data arrival
         if (window._dismissWelcome) window._dismissWelcome();
+        _l2HideOverlay();
     });
 }
 
 // ── Timezone helper ──
-// Server sends raw UTC epoch seconds. LWC uses them as-is.
-// ET display is handled by _applyETLabelFormatter in chart_core.js.
+// Server sends raw UTC epoch seconds. This shifts them to ET for LWC display.
+// IMPORTANT: ALL timestamps stored in _l2LastCandleTime, _l2SeamTime, etc.
+// MUST go through _utcToET. Raw UTC will cause silent comparison mismatches
+// (candle_update rejected because et < _l2LastCandleTime).
 function _utcToET(utcEpoch) {
-    return utcEpoch;
+    return utcEpoch - 4 * 3600; // EDT = UTC-4
 }
 
 const SIG_META = {
@@ -424,32 +751,36 @@ function _l2RenderImbalance(data) {
     if (!row) return;
     const dom = data.dom || {};
     const mid = data.mid_prices || {};
-    row.innerHTML = L2_SYMBOLS.map(sym => {
+    // Build DOM nodes once, then update in-place (avoid innerHTML rebuild at 20Hz)
+    if (!row._imbCards || row._imbCards.length !== L2_SYMBOLS.length) {
+        row.innerHTML = L2_SYMBOLS.map(sym => `<div class="l2-imb-card" data-sym="${sym}">
+          <div class="l2-imb-label"><span class="imb-sym">${sym}</span> <span class="imb-mid" style="color:var(--text);font-size:.72rem">—</span></div>
+          <div class="l2-imb-bar-wrap"><div class="l2-imb-bar"></div></div>
+          <div class="l2-imb-val"><span class="imb-pct">—</span><span class="l2-imb-side imb-side">—</span></div>
+        </div>`).join('');
+        row._imbCards = L2_SYMBOLS.map((sym, i) => {
+            const card = row.children[i];
+            return { midEl: card.querySelector('.imb-mid'), barEl: card.querySelector('.l2-imb-bar'), pctEl: card.querySelector('.imb-pct'), sideEl: card.querySelector('.imb-side') };
+        });
+    }
+    L2_SYMBOLS.forEach((sym, i) => {
+        const c = row._imbCards[i];
         const snap = dom[sym] || {};
         const imb = snap.imbalance != null ? snap.imbalance : (data.imbalance || {})[sym];
         const midP = mid[sym] || 0;
-        const pct = imb != null ? Math.abs(imb) * 50 : 0; // 0..50% from center
+        const pct = imb != null ? Math.abs(imb) * 50 : 0;
         const isBid = imb != null && imb > 0;
         const barClr = imb == null ? '#555' : (isBid ? 'var(--green)' : 'var(--red)');
-        const side = imb == null ? '—' : (isBid ? 'BID HVY' : 'ASK HVY');
-        const imbTxt = imb != null ? (imb * 100).toFixed(1) + '%' : '—';
-        const midTxt = midP > 0 ? midP.toFixed(2) : '—';
-        return `<div class="l2-imb-card">
-          <div class="l2-imb-label">${sym} <span style="color:var(--text);font-size:.72rem">${midTxt}</span></div>
-          <div class="l2-imb-bar-wrap">
-            <div class="l2-imb-bar" style="
-              width:${pct}%;
-              background:${barClr};
-              transform-origin:left;
-              ${isBid ? 'right:50%;left:auto;transform:scaleX(-1)' : 'left:50%'};
-            "></div>
-          </div>
-          <div class="l2-imb-val">
-            <span>${imbTxt}</span>
-            <span class="l2-imb-side" style="color:${barClr}">${side}</span>
-          </div>
-        </div>`;
-    }).join('');
+        c.midEl.textContent = midP > 0 ? midP.toFixed(2) : '—';
+        c.barEl.style.width = pct + '%';
+        c.barEl.style.background = barClr;
+        c.barEl.style.transformOrigin = 'left';
+        if (isBid) { c.barEl.style.right = '50%'; c.barEl.style.left = 'auto'; c.barEl.style.transform = 'scaleX(-1)'; }
+        else { c.barEl.style.left = '50%'; c.barEl.style.right = ''; c.barEl.style.transform = ''; }
+        c.pctEl.textContent = imb != null ? (imb * 100).toFixed(1) + '%' : '—';
+        c.sideEl.textContent = imb == null ? '—' : (isBid ? 'BID HVY' : 'ASK HVY');
+        c.sideEl.style.color = barClr;
+    });
 }
 
 let _domNodesCreated = false;
@@ -507,7 +838,7 @@ function _l2RenderDOM(dom) {
                     ctx.font = '12px "JetBrains Mono", monospace';
                     ctx.textAlign = 'center';
                     ctx.textBaseline = 'middle';
-                    ctx.fillText('⏸ WAITING FOR DOM DATA', cssW / 2, cssH / 2 - 10);
+                    ctx.fillText('WAITING FOR DOM DATA', cssW / 2, cssH / 2 - 10);
                     ctx.font = '9px "JetBrains Mono", monospace';
                     ctx.fillStyle = 'rgba(140, 160, 200, 0.25)';
                     ctx.fillText('Market may be closed', cssW / 2, cssH / 2 + 12);
@@ -607,17 +938,9 @@ function _l2RenderDOM(dom) {
             }
             if (flashClass) {
                 row.el.classList.remove(..._flashClasses);
-                // Double-rAF to retrigger animation without synchronous reflow
-                requestAnimationFrame(() => {
-                    requestAnimationFrame(() => {
-                        row.el.classList.add(flashClass);
-                    });
-                });
-                // Clean up class after animation ends so future flashes can retrigger
-                row.el.addEventListener('animationend', function _cleanup() {
-                    row.el.classList.remove(..._flashClasses);
-                    row.el.removeEventListener('animationend', _cleanup);
-                });
+                // Void offsetWidth to retrigger animation (single sync reflow, no double-rAF)
+                void row.el.offsetWidth;
+                row.el.classList.add(flashClass);
             }
         }
         _domMemory[p] = vol;
@@ -788,24 +1111,13 @@ function _updateEqContext(data) {
         _eqCtxEls.cp.className = 'eq-ctx-badge cp';
     }
 
-    // 4. Iceberg counts (raw)
-    const iceL = data.ice_long || 0;
-    const iceS = data.ice_short || 0;
-    if (iceL + iceS > 0) {
-        _eqCtxEls.ice.innerHTML = `ICE <span class="ice-bull">${iceL}▲</span><span class="ice-bear">${iceS}▼</span>`;
-        _eqCtxEls.ice.className = 'eq-ctx-badge ice ctx-active';
-    } else {
-        _eqCtxEls.ice.textContent = 'ICE —';
-        _eqCtxEls.ice.className = 'eq-ctx-badge ice';
-    }
-
-    // 5. MM pull events (raw counts)
+    // 4. MM pull events (raw counts)
     const mmB = data.mm_bid_pulls || 0;
     const mmA = data.mm_ask_pulls || 0;
     const mmSD = data.mm_smart_dumb || 0;
     if (mmB + mmA > 0) {
         let mmText = `MM B${mmB} A${mmA}`;
-        if (mmSD > 0) mmText += ' ⚠';
+        if (mmSD > 0) mmText += ' !';
         _eqCtxEls.mm.textContent = mmText;
         _eqCtxEls.mm.className = 'eq-ctx-badge mm ctx-active' +
             (mmSD > 0 ? ' ctx-diverge' : '');
@@ -833,7 +1145,7 @@ function _l2RenderTape(trades) {
             hasNewTrades = true;
             const entry = { ...t, sym };
             _l2TapeAll.push(entry);
-            if (_l2TapeAll.length > 2000) _l2TapeAll = _l2TapeAll.slice(-1500);
+            if (_l2TapeAll.length > 2000) _l2TapeAll.splice(0, _l2TapeAll.length - 1500);
             // Feed delta accumulator
             const side = t.side || (t.spin > 0 ? 'buy' : 'sell');
             const vol = t.volume || t.v || 1;
@@ -841,8 +1153,8 @@ function _l2RenderTape(trades) {
         }
     }
     // Cap array size (trim from front = oldest trades)
-    if (_l2TapeAll.length > 300) _l2TapeAll = _l2TapeAll.slice(-300);
-    if (_deltaHistory.length > _DELTA_WINDOW) _deltaHistory = _deltaHistory.slice(-_DELTA_WINDOW);
+    if (_l2TapeAll.length > 300) _l2TapeAll.splice(0, _l2TapeAll.length - 300);
+    if (_deltaHistory.length > _DELTA_WINDOW) _deltaHistory.splice(0, _deltaHistory.length - _DELTA_WINDOW);
     if (cnt) cnt.textContent = `${_l2TapeAll.length} prints`;
     // Feed latest trade to ladder for last-trade marker
     if (_l2TapeAll.length > 0) {
@@ -1426,18 +1738,49 @@ function _l2InitCandleChart(container, featureKey) {
                     }
                 }
 
-                // Replay buffered candle_history if it arrived before chart was ready
-                if (window._pendingCandleHistory) {
-                    const pending = window._pendingCandleHistory;
-                    window._pendingCandleHistory = null;
+                // Replay buffered candle_history if it arrived before chart was ready.
+                // Leak-fix: prefer the sym+tf-matched buffer over the legacy single slot,
+                // and clear the entry only AFTER the emit resolves (next microtask) so a
+                // rapid 2nd layout-switch can't orphan the replay.
+                const _activeKey = `${_l2ChartSymbol}|${_l2ChartTF}`;
+                const _bufMap = window._pendingCandleHistoryMap || {};
+                const _pending = _bufMap[_activeKey] || window._pendingCandleHistory;
+                if (_pending) {
                     setTimeout(() => {
-                        if (window.AltarisEvents) window.AltarisEvents.emit('data:candles:history', pending);
+                        try {
+                            if (window.AltarisEvents) window.AltarisEvents.emit('data:candles:history', _pending);
+                        } finally {
+                            delete _bufMap[_activeKey];
+                            if (window._pendingCandleHistory === _pending) window._pendingCandleHistory = null;
+                        }
+                        // Re-arm the chart's initial fit now that data is in place.
+                        try {
+                            ChartCore.getInstances().forEach(inst => {
+                                if (typeof inst._tryInitialFit === 'function') inst._tryInitialFit();
+                            });
+                        } catch(e) {}
                     }, 100);
                 }
+
+                // Direct REST fetch if no candle data loaded yet
+                // This is the primary data load — don't rely solely on Socket.IO candle_history
+                if (!_l2CandleDataCache) {
+                    setTimeout(() => {
+                        if (!_l2CandleDataCache) {
+                            _l2FetchCandles(true).then(() => {
+                                ChartCore.getInstances().forEach(inst => {
+                                    if (inst.feature !== 'heatmap') inst.chart.timeScale().fitContent();
+                                });
+                            }).catch(() => {});
+                        }
+                    }, 500);
+                }
             });
+            // Scroll: skip ALL overlay redraws. Global _chartScrolling flag handles it.
+            // Overlays re-render 200ms after scroll stops via their own dirty flags.
             window.AltarisEvents.on('chart:scroll', () => {
-                if (typeof ThermalFlare !== 'undefined') requestAnimationFrame(() => ThermalFlare.render());
-                if (typeof window._forceRenderHeatmap === 'function') requestAnimationFrame(() => window._forceRenderHeatmap());
+                // Nothing — all overlays check window._chartScrolling and skip.
+                // After scroll stops (200ms), they'll render on next data update.
             });
             window.AltarisEvents.on('chart:resize', () => {
                 if (typeof window._forceRenderHeatmap === 'function') requestAnimationFrame(() => window._forceRenderHeatmap());
@@ -1529,6 +1872,7 @@ function _l2SwitchSymbol(sym) {
 
     // 1. Cancel in-flight fetch
     if (_l2FetchController) { _l2FetchController.abort(); _l2FetchController = null; }
+    _l2FetchInFlight = false;
 
     // 2. Cancel poll timer
     if (_l2CandlePollTimer) { clearTimeout(_l2CandlePollTimer); _l2CandlePollTimer = null; }
@@ -1550,6 +1894,10 @@ function _l2SwitchSymbol(sym) {
 
     // 4b. Clear DOM delta memory so stale prices don't cause false flashes
     _domMemory = {};
+    // 4c. Clear cached bp so old symbol's bubbles don't leak into new chart
+    _cachedBp = null;
+    _cachedEnriched = null;
+    _lastCandleOHLC = null;
 
     // 5. Update price format for symbol-specific tick size
     const tickSize = L2_TICK_SIZES[sym] || 0.25;
@@ -1590,6 +1938,7 @@ function _l2SwitchTimeframe(tf) {
 
     // 1. Cancel in-flight fetch
     if (_l2FetchController) { _l2FetchController.abort(); _l2FetchController = null; }
+    _l2FetchInFlight = false;
 
     // 2. Cancel poll timer
     if (_l2CandlePollTimer) { clearTimeout(_l2CandlePollTimer); _l2CandlePollTimer = null; }
@@ -1603,22 +1952,22 @@ function _l2SwitchTimeframe(tf) {
         });
     }
 
-    // 4. Set new timeframe + reset delta tracking
+    // 4. Set new timeframe + reset all state
     _l2ChartTF = tf;
     _l2LastCandleTime = 0;
     _l2FetchVersion++;
+    _cachedBp = null;
+    _cachedEnriched = null;
+    _lastCandleOHLC = null;
 
     // 5. Show loading overlay
     _l2ShowOverlay(`Loading ${_l2ChartSymbol} ${tf}...`, false);
 
-    // 6. Tell Socket.IO server about new timeframe
+    // 6. Tell server about new tf (for live candle_update filtering)
     if (typeof DataFetch !== 'undefined') DataFetch.subscribe(_l2ChartSymbol, _l2ChartTF);
 
-    // 7. Fetch full candle history + restart poll on success
-    _l2FetchCandles(true).then(() => {
-        _l2HideOverlay();
-        _l2ScheduleNextPoll();
-    });
+    // 7. Fetch candle history via REST (reliable, no race conditions)
+    _l2FetchCandles(true).then(() => _l2HideOverlay()).catch(() => _l2HideOverlay());
 
     // 8. Sync button active states
     document.querySelectorAll('#t-timeframes .t-btn, #l2-chart-tfs .l2-tf-btn').forEach(b => {
@@ -1636,14 +1985,21 @@ function _l2FetchCandles(fullRedraw, _retryCount) {
     const MAX_RETRIES = 3;
     const myVersion = _l2FetchVersion; // capture to detect stale responses
 
-    // Abort any previous in-flight fetch
-    if (fullRedraw) {
+    // Abort any previous in-flight fetch — but ONLY for explicit symbol/tf switches,
+    // NOT for safety-net retries (which would kill a perfectly good in-flight request)
+    if (fullRedraw && attempt === 0) {
+        // Always abort previous fetch on explicit tf/symbol switch
         if (_l2FetchController) _l2FetchController.abort();
         _l2FetchController = new AbortController();
+        _l2FetchInFlight = false;
     }
 
-    const since = (!fullRedraw && _l2LastCandleTime > 0) ? _l2LastCandleTime : 0;
+    _l2FetchInFlight = true;
+    // _l2LastCandleTime is stored in ET (UTC-4). Backend expects UTC for ?since —
+    // convert back by adding 4*3600 so the server filters on real UTC epoch.
+    const since = (!fullRedraw && _l2LastCandleTime > 0) ? (_l2LastCandleTime + 4 * 3600) : 0;
     const signal = _l2FetchController ? _l2FetchController.signal : null;
+    console.log('[L2 FETCH]', _l2ChartSymbol, _l2ChartTF, 'fullRedraw=', fullRedraw, 'since=', since);
     
     return DataFetch.fetchCandles(_l2ChartSymbol, _l2ChartTF, since, signal)
         .then(resp => {
@@ -1661,7 +2017,7 @@ function _l2FetchCandles(fullRedraw, _retryCount) {
                     msg.style.cssText = 'position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);'
                         + 'color:rgba(140,160,200,.45);font-size:1.1rem;font-family:JetBrains Mono,monospace;'
                         + 'text-align:center;pointer-events:none;z-index:10;letter-spacing:.05em;';
-                    msg.innerHTML = '⏸ NO CANDLE DATA<br><span style="font-size:.7rem;opacity:.6">Waiting for L2 feed or market may be closed</span>';
+                    msg.innerHTML = 'NO CANDLE DATA<br><span style="font-size:.7rem;opacity:.6">Waiting for L2 feed or market may be closed</span>';
                     container.style.position = 'relative';
                     container.appendChild(msg);
                 }
@@ -1711,9 +2067,9 @@ function _l2FetchCandles(fullRedraw, _retryCount) {
                         if (inst.feature === 'chart' && inst.bubbleSeries) {
                             const bubbleData = candles.map(c => ({
                                 time: _utcToET(c.time), close: c.close, bp: c.bp || null,
-                                icebergs: c.icebergs || null, sweeps: c.sweeps || null,
+                                sweeps: c.sweeps || null,
                                 delta_div: c.delta_div || null, ignition: c.ignition || null,
-                                spoofs: c.spoofs || null, drifting_iceberg: c.drifting_iceberg || null,
+                                spoofs: c.spoofs || null,
                                 wall_gone: c.wall_gone || null
                             }));
                             inst.bubbleSeries.setData(bubbleData);
@@ -1769,11 +2125,14 @@ function _l2FetchCandles(fullRedraw, _retryCount) {
                             // Bubbles only for 'chart' feature
                             if (inst.feature === 'chart' && inst.bubbleSeries) {
                                 inst.bubbleSeries.update({
-                                    time: et, close: c.close, bp: c.bp || null,
-                                    icebergs: c.icebergs || null, sweeps: c.sweeps || null,
+                                    time: et,
+                                    o: c.open, h: c.high, l: c.low, c: c.close, close: c.close,
+                                    bp: c.bp || null,
+                                    sweeps: c.sweeps || null,
                                     delta_div: c.delta_div || null, ignition: c.ignition || null,
-                                    spoofs: c.spoofs || null, drifting_iceberg: c.drifting_iceberg || null,
-                                    wall_gone: c.wall_gone || null
+                                    spoofs: c.spoofs || null,
+                                    wall_gone: c.wall_gone || null,
+                                    absorption: c.absorption || null, depth_deltas: c.depth_deltas || null
                                 });
                             }
                         });
@@ -1781,11 +2140,13 @@ function _l2FetchCandles(fullRedraw, _retryCount) {
                 }
             }
 
-            // Track the newest candle timestamp (raw UTC for ?since= param)
-            _l2LastCandleTime = candles[candles.length - 1].time;
+            // Track the newest candle timestamp (ET-converted for comparison with _utcToET)
+            _l2LastCandleTime = _utcToET(candles[candles.length - 1].time);
+            _l2FetchInFlight = false;
             _l2HideOverlay(); // clear any error overlay
         })
         .catch(err => {
+            _l2FetchInFlight = false;
             // Aborted fetches are normal during rapid switching — ignore silently
             if (err && err.name === 'AbortError') return;
             // Stale request — ignore
@@ -1799,34 +2160,46 @@ function _l2FetchCandles(fullRedraw, _retryCount) {
                 return new Promise(resolve => setTimeout(resolve, delay))
                     .then(() => _l2FetchCandles(fullRedraw, attempt + 1));
             } else {
-                _l2ShowOverlay('⚠ Failed to load chart data — click a symbol to retry', true);
+                _l2ShowOverlay('Failed to load chart data -- click a symbol to retry', true);
             }
         });
 }
 
-function _l2Render(data) {
-    // Status dot
-    const dot  = document.getElementById('l2-status-dot');
-    const txt  = document.getElementById('l2-status-text');
-    const conn = data.connected;
-    if (dot) dot.className = 'l2-dot' + (conn ? ' live' : '');
-    if (txt) txt.textContent = conn ? 'LIVE' : 'DISCONNECTED';
+// Cache L2 render DOM refs
+let _l2RenderEls = null;
+function _getL2RenderEls() {
+    if (_l2RenderEls) return _l2RenderEls;
+    _l2RenderEls = {
+        dot: document.getElementById('l2-status-dot'),
+        txt: document.getElementById('l2-status-text'),
+        strip: document.getElementById('l2-symbol-prices'),
+        sMid: document.getElementById('s-mid'),
+        sSpread: document.getElementById('s-spread'),
+        sImbal: document.getElementById('s-imbal'),
+        sBidAsk: document.getElementById('s-bidask'),
+    };
+    return _l2RenderEls;
+}
 
-    // Symbol prices strip
-    const strip = document.getElementById('l2-symbol-prices');
-    if (strip) {
+function _l2Render(data) {
+    const el = _getL2RenderEls();
+    const conn = data.connected;
+    if (el.dot) el.dot.className = 'l2-dot' + (conn ? ' live' : '');
+    if (el.txt) el.txt.textContent = conn ? 'LIVE' : 'DISCONNECTED';
+
+    if (el.strip) {
         const mid = data.mid_prices || {};
-        strip.innerHTML = L2_SYMBOLS.map(s =>
+        el.strip.innerHTML = L2_SYMBOLS.map(s =>
             `<div class="l2-sym-price"><span class="l2-sym-label">${s}</span><span>${mid[s] ? mid[s].toFixed(2) : '—'}</span></div>`
         ).join('');
     }
 
     // ── Status Bar live data ──
     const symDom = (data.dom || {})[_l2ChartSymbol] || {};
-    const sMid = document.getElementById('s-mid');
-    const sSpread = document.getElementById('s-spread');
-    const sImbal = document.getElementById('s-imbal');
-    const sBidAsk = document.getElementById('s-bidask');
+    const sMid = el.sMid;
+    const sSpread = el.sSpread;
+    const sImbal = el.sImbal;
+    const sBidAsk = el.sBidAsk;
     if (sMid) {
         const mp = symDom.mid_price || (data.mid_prices || {})[_l2ChartSymbol] || 0;
         sMid.textContent = mp ? 'MID ' + mp.toFixed(2) : 'MID —';
@@ -1996,10 +2369,15 @@ function _termUpdateMetrics() {
     copy('ds-mp', 't-mp');
     copy('ds-pcr', 't-pcr');
     copy('ds-ndex', 't-ndex');
-    // Also update timestamp
-    const tsEl = document.getElementById('timestamp');
+    // Live clock (EST)
     const tTsEl = document.getElementById('t-timestamp');
-    if (tsEl && tTsEl) tTsEl.textContent = tsEl.textContent;
+    if (tTsEl) {
+        const now = new Date();
+        const hh = now.getHours().toString().padStart(2, '0');
+        const mm = now.getMinutes().toString().padStart(2, '0');
+        const ss = now.getSeconds().toString().padStart(2, '0');
+        tTsEl.textContent = `${hh}:${mm}:${ss} ET`;
+    }
 }
 
 // ── Terminal Init ──
@@ -2033,14 +2411,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // ── Settings Panel Mutual Exclusion ──
     window.closeAllSettingsPanels = function(exceptId) {
-        ['vp-settings-panel', 'hm-settings-panel', 'tf-settings-panel'].forEach(id => {
+        ['vp-settings-panel', 'hm-settings-panel', 'tf-settings-panel', 'master-settings-panel'].forEach(id => {
             if (id === exceptId) return;
             const el = document.getElementById(id);
             if (el) { if (id === 'tf-settings-panel') el.remove(); else el.style.display = 'none'; }
         });
     };
 
-    // ── Toolbar: Volume Profile toggles ──
+    // ── Toolbar: Volume Profile toggle ──
     const vpToggle = document.getElementById('t-vp-toggle');
     if (vpToggle) {
         vpToggle.addEventListener('click', () => {
@@ -2049,19 +2427,217 @@ document.addEventListener('DOMContentLoaded', () => {
             vpToggle.classList.toggle('active', vis);
         });
     }
-    document.querySelectorAll('#t-vp-modes .t-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-            if (typeof VolumeProfileOverlay === 'undefined') return;
-            const mode = btn.dataset.vp;
-            btn.classList.toggle('active');
-            const active = [...document.querySelectorAll('#t-vp-modes .t-btn.active')].map(b => b.dataset.vp);
-            VolumeProfileOverlay.setActiveProfiles(active);
+
+    // ── Master Settings Panel ──
+    const masterBtn = document.getElementById('master-settings-btn');
+    if (masterBtn) {
+        masterBtn.addEventListener('click', () => {
+            const panel = document.getElementById('master-settings-panel');
+            if (!panel) return;
+            const opening = panel.style.display === 'none';
+            if (opening) {
+                window.closeAllSettingsPanels('master-settings-panel');
+                _buildMasterSettings(panel);
+            }
+            panel.style.display = opening ? '' : 'none';
         });
-    });
-    const vpSettingsBtn = document.getElementById('vp-settings-btn');
-    if (vpSettingsBtn) {
-        vpSettingsBtn.addEventListener('click', () => {
+    }
+
+    function _buildMasterSettings(panel) {
+        if (panel.dataset.built) return;
+        panel.dataset.built = '1';
+        panel.innerHTML = `
+            <div class="vp-panel-header">
+                <span class="vp-panel-title">Settings</span>
+                <button class="vp-panel-close" id="ms-close">\u2715</button>
+            </div>
+
+            <!-- Accordion sections -->
+            <div class="ms-body">
+
+                <!-- CHART OVERLAYS -->
+                <div class="ms-section" data-open="true">
+                    <div class="ms-section-header" onclick="this.parentElement.dataset.open = this.parentElement.dataset.open === 'true' ? 'false' : 'true'">
+                        <span class="ms-arrow">\u25B8</span> Chart Overlays
+                    </div>
+                    <div class="ms-section-body">
+                        <div class="vp-field">
+                            <label class="vp-checkbox"><input type="checkbox" id="ms-ov-bubbles" checked> Trade Bubbles</label>
+                        </div>
+                        <div class="vp-field">
+                            <label class="vp-checkbox"><input type="checkbox" id="ms-ov-flare" checked> DEX Thermal Flare</label>
+                        </div>
+                        <div class="vp-field">
+                            <label class="vp-checkbox"><input type="checkbox" id="ms-vp" checked> Volume Profile</label>
+                        </div>
+                        <div class="vp-field">
+                            <label class="vp-checkbox"><input type="checkbox" id="ms-walls" checked> Options Walls</label>
+                        </div>
+                        <div class="vp-separator"></div>
+                        <div class="vp-field">
+                            <label class="vp-checkbox"><input type="checkbox" id="ms-metrics"> Metrics Ribbon</label>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- VOLUME PROFILE -->
+                <div class="ms-section" data-open="false">
+                    <div class="ms-section-header" onclick="this.parentElement.dataset.open = this.parentElement.dataset.open === 'true' ? 'false' : 'true'">
+                        <span class="ms-arrow">\u25B8</span> Volume Profile
+                    </div>
+                    <div class="ms-section-body">
+                        <button class="ms-open-btn" id="ms-vp-open">Open VP Settings \u2192</button>
+                    </div>
+                </div>
+
+                <!-- DRAWING TOOLS -->
+                <div class="ms-section" data-open="false">
+                    <div class="ms-section-header" onclick="this.parentElement.dataset.open = this.parentElement.dataset.open === 'true' ? 'false' : 'true'">
+                        <span class="ms-arrow">\u25B8</span> Drawing Tools
+                    </div>
+                    <div class="ms-section-body">
+                        <div class="ms-draw-grid">
+                            <button class="ms-draw-btn" data-draw="draw_hline">\u2500 H-Line</button>
+                            <button class="ms-draw-btn" data-draw="draw_vline">\u2502 V-Line</button>
+                            <button class="ms-draw-btn" data-draw="draw_box">\u25A0 Box</button>
+                            <button class="ms-draw-btn ms-draw-del" data-draw="delete">\u2715 Delete</button>
+                        </div>
+                        <div class="vp-separator"></div>
+                        <div class="vp-field">
+                            <span class="vp-field-label">Color</span>
+                            <div class="ms-color-dots">
+                                <div class="ms-dot active" data-color="#E0A800" style="background:#E0A800"></div>
+                                <div class="ms-dot" data-color="#26A69A" style="background:#26A69A"></div>
+                                <div class="ms-dot" data-color="#EF5350" style="background:#EF5350"></div>
+                                <div class="ms-dot" data-color="#7a8ba8" style="background:#7a8ba8"></div>
+                                <div class="ms-dot" data-color="#ffffff" style="background:#ffffff"></div>
+                            </div>
+                        </div>
+                        <div class="vp-separator"></div>
+                        <div class="vp-field">
+                            <span class="vp-field-label">Label</span>
+                            <input type="text" id="ms-draw-label" class="vp-num-input" style="width:100px;text-align:left" placeholder="S/R, POI...">
+                        </div>
+                        <div class="vp-field">
+                            <label class="vp-checkbox"><input type="checkbox" id="ms-draw-extend"> Extend Right</label>
+                        </div>
+                        <div class="vp-separator"></div>
+                        <div class="vp-field">
+                            <button class="ms-clear-btn" id="ms-clear-drawings">Clear All</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- HEATMAP -->
+                <div class="ms-section" data-open="false">
+                    <div class="ms-section-header" onclick="this.parentElement.dataset.open = this.parentElement.dataset.open === 'true' ? 'false' : 'true'">
+                        <span class="ms-arrow">\u25B8</span> DOM Heatmap
+                    </div>
+                    <div class="ms-section-body">
+                        <button class="ms-open-btn" id="ms-hm-open">Open Heatmap Settings \u2192</button>
+                    </div>
+                </div>
+
+            </div>
+        `;
+
+        // Wire close
+        document.getElementById('ms-close').addEventListener('click', () => { panel.style.display = 'none'; });
+
+        // Chart overlay config helper — finds the active chart container's _overlayConfig
+        function _setOverlay(key, enabled) {
+            document.querySelectorAll('[data-slot]').forEach(slot => {
+                const wrap = slot.querySelector('.chart-wrap, [class*="chart"]');
+                if (wrap && wrap._overlayConfig) wrap._overlayConfig[key] = enabled;
+                // Also check direct children
+                slot.querySelectorAll('*').forEach(el => {
+                    if (el._overlayConfig) el._overlayConfig[key] = enabled;
+                });
+            });
+        }
+
+        // Chart overlay toggles
+        const ovMap = {
+            'ms-ov-bubbles': 'bubbles',
+            'ms-ov-flare': 'flare',
+        };
+        for (const [id, key] of Object.entries(ovMap)) {
+            const el = document.getElementById(id);
+            if (el) el.addEventListener('change', (e) => _setOverlay(key, e.target.checked));
+        }
+
+        document.getElementById('ms-walls').addEventListener('change', (e) => {
+            _setOverlay('walls', e.target.checked);
+            if (typeof WallLines !== 'undefined') WallLines.toggle();
+            const wb = document.getElementById('t-walls-toggle');
+            if (wb) wb.classList.toggle('active', e.target.checked);
+        });
+        document.getElementById('ms-vp').addEventListener('change', (e) => {
+            _setOverlay('vp', e.target.checked);
+            if (typeof VolumeProfileOverlay !== 'undefined') {
+                const vis = VolumeProfileOverlay.toggleVisibility();
+                const vb = document.getElementById('t-vp-toggle');
+                if (vb) vb.classList.toggle('active', vis);
+            }
+        });
+        document.getElementById('ms-metrics').addEventListener('change', (e) => {
+            const terminal = document.getElementById('terminal');
+            if (terminal) terminal.classList.toggle('metrics-collapsed', !e.target.checked);
+            const mb = document.getElementById('t-metrics-toggle');
+            if (mb) mb.classList.toggle('active', e.target.checked);
+        });
+
+        // VP settings deep link
+        document.getElementById('ms-vp-open').addEventListener('click', () => {
+            panel.style.display = 'none';
             if (typeof VolumeProfileOverlay !== 'undefined') VolumeProfileOverlay.openSettings();
+        });
+
+        // Drawing tools
+        panel.querySelectorAll('.ms-draw-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const mode = btn.dataset.draw;
+                if (typeof DrawingTools !== 'undefined') {
+                    DrawingTools.setMode(mode);
+                    panel.querySelectorAll('.ms-draw-btn').forEach(b => b.classList.remove('active'));
+                    if (mode !== 'delete') btn.classList.add('active');
+                }
+            });
+        });
+        panel.querySelectorAll('.ms-dot').forEach(dot => {
+            dot.addEventListener('click', () => {
+                panel.querySelectorAll('.ms-dot').forEach(d => d.classList.remove('active'));
+                dot.classList.add('active');
+                if (typeof DrawingTools !== 'undefined') DrawingTools.setColor(dot.dataset.color);
+            });
+        });
+        document.getElementById('ms-clear-drawings').addEventListener('click', () => {
+            if (typeof DrawingTools !== 'undefined' && confirm('Clear all drawings?')) DrawingTools.clearAll();
+        });
+
+        // Label input — apply to selected drawing on Enter or blur
+        const labelInput = document.getElementById('ms-draw-label');
+        if (labelInput) {
+            const applyLabel = () => {
+                if (typeof DrawingTools !== 'undefined') DrawingTools.setLabel(labelInput.value);
+            };
+            labelInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') applyLabel(); });
+            labelInput.addEventListener('blur', applyLabel);
+        }
+
+        // Extend toggle — apply to selected hline
+        const extendCheck = document.getElementById('ms-draw-extend');
+        if (extendCheck) {
+            extendCheck.addEventListener('change', () => {
+                if (typeof DrawingTools !== 'undefined') DrawingTools.toggleExtend();
+            });
+        }
+
+        // Heatmap settings deep link
+        document.getElementById('ms-hm-open').addEventListener('click', () => {
+            panel.style.display = 'none';
+            const hmPanel = document.getElementById('hm-settings-panel');
+            if (hmPanel) hmPanel.style.display = hmPanel.style.display === 'none' ? '' : 'none';
         });
     }
 
@@ -2091,37 +2667,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     wrap.style.cssText = 'width:100%;height:100%;position:relative';
                     slotEl.appendChild(wrap);
 
-                    // ── Per-pane overlay toggle toolbar (chart only, not heatmap) ──
-                    if (chartFK === 'chart') {
-                        const toolbar = document.createElement('div');
-                        toolbar.className = 'overlay-toolbar';
-                        toolbar.innerHTML = [
-                            ['bubbles', 'BUB', 'Trade Bubbles'],
-                            ['flare',   'FLR', 'Options DEX Flare'],
-                            ['cumlDelta','CΔ',  'Cumulative Delta'],
-                            ['iceberg', 'ICE', 'Iceberg & Sweep'],
-                            ['vp',      'VP',  'Volume Profile'],
-                            ['walls',   'LVL', 'Options Levels'],
-                        ].map(([key, label, title]) =>
-                            `<button class="ov-btn active" data-ov="${key}" title="${title}">${label}</button>`
-                        ).join('');
-                        wrap.appendChild(toolbar);
-
-                        // Wire toggle clicks — each button controls its overlay independently
-                        toolbar.addEventListener('click', (e) => {
-                            const btn = e.target.closest('.ov-btn');
-                            if (!btn) return;
-                            const key = btn.dataset.ov;
-                            const cfg = wrap._overlayConfig;
-                            if (!cfg) return;
-                            cfg[key] = !cfg[key];
-                            btn.classList.toggle('active', cfg[key]);
-                            // Walls use price lines — need immediate clear/redraw
-                            if (key === 'walls' && typeof WallLines !== 'undefined') {
-                                WallLines.update();
-                            }
-                        });
-                    }
+                    // Overlay config stored on container — controlled from master settings panel
+                    // (BUB/FLR/ICE/VP/LVL toolbar removed — now in Settings > Chart Overlays)
 
                     // Defer init by one frame so browser lays out the container first
                     // (prevents 0-width chart creation which makes candles invisible)
@@ -2169,7 +2716,6 @@ document.addEventListener('DOMContentLoaded', () => {
                           <span id="eq-ctx-regime" class="eq-ctx-badge regime" title="Market regime (empirical)">—</span>
                           <span id="eq-ctx-hawkes" class="eq-ctx-badge hawkes" title="Hawkes λ percentile (tape velocity)">λ —</span>
                           <span id="eq-ctx-cp" class="eq-ctx-badge cp" title="QQQ Call/Put volume ratio (60s screener)">C/P —</span>
-                          <span id="eq-ctx-ice" class="eq-ctx-badge ice" title="NQ iceberg/sweep detections (60s)">ICE —</span>
                           <span id="eq-ctx-mm" class="eq-ctx-badge mm" title="MM venue pull events (30s)">MM —</span>
                         </div>
                         <div id="l2-tape-body" class="l2-tape-body" style="flex:1; overflow-y:auto; overflow-x:hidden"></div>
@@ -2204,17 +2750,41 @@ document.addEventListener('DOMContentLoaded', () => {
                                   </div>`;
                                 return;
                             }
-                            // Standalone render loop
+                            // Standalone render loop — throttled to 20fps + pauses during chart scroll
                             let _pfRAF;
-                            const _pfLoop = () => {
-                                if (!document.body.contains(pCanvas)) return; // unmounted
-                                if (PressureField._ready) {
-                                    PressureField.update(0.016);
-                                    PressureField.render();
+                            let _pfDirty = true;
+                            let _pfLastFrame = 0;
+                            let _pfScrollPaused = false;
+                            let _pfScrollTimer = 0;
+                            if (window.AltarisEvents) {
+                                const _pfScrollHandler = () => {
+                                    _pfScrollPaused = true;
+                                    clearTimeout(_pfScrollTimer);
+                                    _pfScrollTimer = setTimeout(() => { _pfScrollPaused = false; _pfDirty = true; }, 300);
+                                };
+                                window.AltarisEvents.on('chart:scroll', _pfScrollHandler);
+                                slotEl._pfScrollHandler = _pfScrollHandler;
+                            }
+                            const _pfLoop = (now) => {
+                                if (!document.body.contains(pCanvas)) return;
+                                // Skip entirely during scroll — fluid sim is decorative, not critical
+                                if (_pfScrollPaused) {
+                                    _pfRAF = requestAnimationFrame(_pfLoop);
+                                    return;
+                                }
+                                // Throttle to 20fps (50ms)
+                                if (now - _pfLastFrame >= 50) {
+                                    _pfLastFrame = now;
+                                    if (PressureField._ready && _pfDirty) {
+                                        _pfDirty = false;
+                                        PressureField.update(0.05);
+                                        PressureField.render();
+                                    }
                                 }
                                 _pfRAF = requestAnimationFrame(_pfLoop);
                             };
                             _pfRAF = requestAnimationFrame(_pfLoop);
+                            slotEl._pfMarkDirty = () => { _pfDirty = true; };
                             slotEl._pfRAF = _pfRAF;
 
                             // Wire L2 DOM data → obstacle texture
@@ -2225,18 +2795,17 @@ document.addEventListener('DOMContentLoaded', () => {
                                 const asks = symData.asks || {};
                                 const mid = symData.mid_price || 0;
                                 if (!mid) return;
-                                // Build visible price range: 40 levels centered on mid (0.25 tick)
                                 const tick = 0.25;
                                 const levels = 40;
                                 const visiblePrices = [];
                                 for (let i = -levels; i <= levels; i++) {
                                     visiblePrices.push(mid + i * tick);
                                 }
-                                // Compute max depth for normalization
                                 let maxDepth = 1;
                                 for (const k of Object.keys(bids)) { if (bids[k] > maxDepth) maxDepth = bids[k]; }
                                 for (const k of Object.keys(asks)) { if (asks[k] > maxDepth) maxDepth = asks[k]; }
                                 PressureField.updateObstacles(bids, asks, visiblePrices, maxDepth);
+                                _pfDirty = true; // mark for next render frame
                             };
                             window.AltarisEvents.on('data:l2:update', _pfL2Handler);
                             slotEl._pfL2Handler = _pfL2Handler;
@@ -2249,6 +2818,7 @@ document.addEventListener('DOMContentLoaded', () => {
                                 const vol = data.vol || data.volume || data.size || 1;
                                 const side = (data.side === 'sell' || data.side === 's') ? 'ask' : 'bid';
                                 PressureField.injectForce(priceStr, vol, side);
+                                _pfDirty = true;
                             };
                             window.AltarisEvents.on('data:trades:update', _pfTradeHandler);
                             slotEl._pfTradeHandler = _pfTradeHandler;
@@ -2273,14 +2843,19 @@ document.addEventListener('DOMContentLoaded', () => {
                                     const pk = parseFloat(data.price).toFixed(2);
                                     const prev = _kHeat[pk] || { vol: 0 };
                                     _kHeat[pk] = { ts: Date.now(), vol: prev.vol + (data.vol || data.volume || 1), side: data.side === 'sell' || data.side === 's' ? 'ask' : 'bid' };
+                                    _kDirty = true;
                                 };
                                 window.AltarisEvents.on('data:trades:update', _kTradeHandler);
                                 slotEl._kTradeHandler = _kTradeHandler;
 
                                 let _kRAF;
+                                let _kDirty = true;
                                 const _kLoop = () => {
                                     if (!document.body.contains(kCanvas)) return;
-                                    _drawKineticFallback(kCanvas, _kHeat);
+                                    if (_kDirty) {
+                                        _kDirty = false;
+                                        _drawKineticFallback(kCanvas, _kHeat);
+                                    }
                                     _kRAF = requestAnimationFrame(_kLoop);
                                 };
                                 _kRAF = requestAnimationFrame(_kLoop);
@@ -2300,6 +2875,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     if (typeof VolSurfacePane !== 'undefined') VolSurfacePane.init(slotEl);
                 } else if (featureKey === 'optflow') {
                     if (typeof OptionsFlowPane !== 'undefined') OptionsFlowPane.init(slotEl);
+                } else if (featureKey === 'vpintel') {
+                    if (typeof VPIntelPane !== 'undefined') VPIntelPane.init(slotEl);
                 } else if (featureKey === 'ocheat') {
                     // Options Chain GEX Heatmap (Canvas2D)
                     slotEl.innerHTML = `<div style="width:100%;height:100%;background:#070a14;position:relative">
@@ -2346,12 +2923,26 @@ document.addEventListener('DOMContentLoaded', () => {
             AltarisLayout.onFeatureUnmount = (paneIdx, featureKey, slotEl) => {
                 if (['chart', 'heatmap'].includes(featureKey)) {
                     if (typeof ChartCore !== 'undefined') {
-                        const chartDiv = slotEl.querySelector('[id^="t-l2-candle-chart"]');
-                        if (chartDiv) ChartCore.destroy(chartDiv);
+                        // Fix #10 — selector-based lookup was missing instances when
+                        // the layout engine tore down slot DOM before unmount fired.
+                        // Walk the instance array and destroy any instance whose
+                        // container is this slot, inside this slot, or already
+                        // detached. Catches orphans that previously leaked and
+                        // caused "blank chart with only VP lines" symptom.
+                        const stale = ChartCore.getInstances().filter(inst => {
+                            const c = inst.container;
+                            if (!c) return true;
+                            if (!c.isConnected) return true;
+                            if (c === slotEl) return true;
+                            if (slotEl && slotEl.contains && slotEl.contains(c)) return true;
+                            return false;
+                        });
+                        stale.forEach(inst => { try { ChartCore.destroy(inst.container); } catch(e) {} });
                     }
                 }
                 if (featureKey === 'pressure') {
                     if (slotEl._pfRAF) cancelAnimationFrame(slotEl._pfRAF);
+                    if (slotEl._pfScrollHandler) window.AltarisEvents.off('chart:scroll', slotEl._pfScrollHandler);
                     if (slotEl._pfL2Handler) window.AltarisEvents.off('data:l2:update', slotEl._pfL2Handler);
                     if (slotEl._pfTradeHandler) window.AltarisEvents.off('data:trades:update', slotEl._pfTradeHandler);
                     if (typeof PressureField !== 'undefined') PressureField.destroy();
@@ -2399,20 +2990,24 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (featureKey === 'xdiv' && typeof CrossDivergencePane !== 'undefined') CrossDivergencePane.destroy();
                 if (featureKey === 'volsurf' && typeof VolSurfacePane !== 'undefined') VolSurfacePane.destroy();
                 if (featureKey === 'optflow' && typeof OptionsFlowPane !== 'undefined') OptionsFlowPane.destroy();
+                if (featureKey === 'vpintel' && typeof VPIntelPane !== 'undefined') VPIntelPane.destroy(slotEl);
             };
 
             AltarisLayout.triggerInitialMounts();
             _startL2Poll();
 
-            // Safety net: if candles haven't loaded after 4s, force a REST fetch
-            setTimeout(() => {
+            // Safety net: if candles haven't loaded, force REST fetch
+            // Two passes: fast (2s) catches slow WS, slow (6s) catches everything
+            const _safetyFetch = (label) => {
                 if (!_l2CandleDataCache && typeof ChartCore !== 'undefined' && ChartCore.getInstances().length > 0) {
-                    console.warn('[Safety] No candle data after 4s — force fetching...');
+                    console.warn(`[Safety] ${label} — no candle data, force fetching...`);
                     _l2FetchCandles(true).then(() => {
                         ChartCore.getInstances().forEach(inst => inst.chart.timeScale().fitContent());
                     });
                 }
-            }, 4000);
+            };
+            setTimeout(() => _safetyFetch('2s check'), 2000);
+            setTimeout(() => _safetyFetch('6s check'), 6000);
         } else {
             // Legacy layout fallback
             _l2InitCandleChart();
@@ -2427,8 +3022,16 @@ document.addEventListener('DOMContentLoaded', () => {
     if (typeof WallLines !== 'undefined') WallLines.init();
 
     // ── Metric bridge: update toolbar from old dash metrics ──
+    // Pause when tab hidden to avoid wasted CPU
     if (window._termMetricsTimer) clearInterval(window._termMetricsTimer);
     window._termMetricsTimer = setInterval(_termUpdateMetrics, 2000);
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+            if (window._termMetricsTimer) { clearInterval(window._termMetricsTimer); window._termMetricsTimer = null; }
+        } else {
+            if (!window._termMetricsTimer) window._termMetricsTimer = setInterval(_termUpdateMetrics, 2000);
+        }
+    });
 
     // Removed duplicate event listener for #t-heatmap-settings-btn since it conflicts with volume_bubbles.js
 
