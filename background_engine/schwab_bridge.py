@@ -92,6 +92,7 @@ def _run_bridge():
         print("[SCHWAB-BRIDGE] EdgeDetector attached")
 
         # Initialize MMTracker — market maker withdrawal detection
+        global _mm_tracker
         from connectors.mm_tracker import MMTracker
         _mm_tracker = MMTracker(edge_detector=_edge_detector)
         _edge_detector._mm_tracker_ref = _mm_tracker
@@ -127,6 +128,7 @@ def _run_bridge():
             print(f"[SCHWAB-BRIDGE] ⚠️ VolSurface not available: {e}")
 
         # Initialize IV Calibrator — Tradier ORATS IV surface polling
+        global _iv_calibrator
         try:
             from connectors.iv_calibrator import IVCalibrator
             _iv_calibrator = IVCalibrator(ticker='QQQ', poll_interval=300)
@@ -988,8 +990,8 @@ def _maybe_emit_zones():
                     zone_data['iv_spread_label'] = iv_cal.get('iv_spread_label', 'UNKNOWN')
                     zone_data['mm_uncertainty'] = iv_cal.get('mm_uncertainty', 0)
                     zone_data['skew_25d'] = iv_cal.get('skew_25d', 0)
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("IV calibration merge failed: %s", e, exc_info=True)
 
         # ── Feed VolSurface monitor and merge regime data ─────────────────
         if _vol_surface:
