@@ -21,15 +21,13 @@
 // ═══════════════════════════════════════════════════════════════════════════
 const HM_DEFAULTS = {
     imbalance: true, bidColor: '#00ff96', askColor: '#ff4030', imbalanceOpacity: 75,
-    wallglow: false, wallglowBlur: 8,
     wallColor: '#ffffff',  // color heavy orders blend toward (default white)
     wallBlend: 90,         // 0-100: how much heavy orders blend toward wallColor
     densityBoost: 100,     // 50-300: intensity multiplier (100 = default, 200 = 2× brighter)
     midprice: true, midpriceColor: '#ffdc00', midpriceWidth: 2,
     microprice: true, micropriceColor: '#00dcff', micropriceWidth: 3,
-    trades: false, buyColor: '#00ff78', sellColor: '#ff3246', tradesSize: 6,
+    buyColor: '#00ff78', sellColor: '#ff3246',
     delta: true, deltaHeight: 40,
-    spread: false, spreadHeight: 14,
     persistence: true,   // depth persistence borders
     velocity: true,      // depth velocity pulses
     depthMax: 0,         // 0 = auto (EWMA), >0 = manual max contracts for full brightness
@@ -38,9 +36,7 @@ const HM_DEFAULTS = {
     persistMid: 5,       // snapshots for established tier
     persistHigh: 20,     // snapshots for battle-tested tier
     velSigma: 10,        // velocity σ multiplier (/10 → 1.0σ default). Range 5-30
-    wallglowPct: 90,     // percentile for wall glow threshold. Range 70-99
     ewmaAlpha: 5,        // EWMA decay rate (/100 → 0.05 default). Range 1-20
-    // Phase 1: Institutional Upgrades
     flickerFilter: 0,    // min persistence (snapshots) to display a cell (0=off, 3-10 typical)
     bboBar: true,        // show best bid/ask size imbalance bar at top of heatmap
     clusterTape: true,   // show clustered trade tape on heatmap
@@ -54,14 +50,11 @@ const HeatmapSettings = { ...HM_DEFAULTS };
         const saved = localStorage.getItem('heatmapSettings');
         if (saved) Object.assign(HeatmapSettings, JSON.parse(saved));
     } catch (e) { /* ignore */ }
-    // Force-disable removed features (override stale localStorage)
-    HeatmapSettings.trades = false;
-    HeatmapSettings.wallglow = false;
-    HeatmapSettings.spread = false;
 })();
 
 function _saveHMS() {
     try { localStorage.setItem('heatmapSettings', JSON.stringify(HeatmapSettings)); } catch (e) { /* ignore */ }
+    try { window.AltarisEvents && window.AltarisEvents.emit('hms:updated', HeatmapSettings); } catch (_) {}
 }
 
 // Helper: hex color → {r,g,b}
@@ -121,7 +114,6 @@ document.addEventListener('DOMContentLoaded', () => {
         { id: 'hms-persist-mid', key: 'persistMid', type: 'range' },
         { id: 'hms-persist-high', key: 'persistHigh', type: 'range' },
         { id: 'hms-vel-sigma', key: 'velSigma', type: 'range' },
-        { id: 'hms-wallglow-pct', key: 'wallglowPct', type: 'range' },
         { id: 'hms-ewma-alpha', key: 'ewmaAlpha', type: 'range' },
         { id: 'hms-flicker-filter', key: 'flickerFilter', type: 'range' },
         { id: 'hms-bbo-bar', key: 'bboBar', type: 'check' },
@@ -159,7 +151,6 @@ document.addEventListener('DOMContentLoaded', () => {
                 'persistMid': 'hms-persist-mid-val',
                 'persistHigh': 'hms-persist-high-val',
                 'velSigma': 'hms-vel-sigma-val',
-                'wallglowPct': 'hms-wallglow-pct-val',
                 'ewmaAlpha': 'hms-ewma-alpha-val',
                 'flickerFilter': 'hms-flicker-filter-val',
                 'wallBlend': 'hms-wall-blend-val',
@@ -199,7 +190,6 @@ document.addEventListener('DOMContentLoaded', () => {
             lbl('hms-persist-mid-val', String(HM_DEFAULTS.persistMid));
             lbl('hms-persist-high-val', String(HM_DEFAULTS.persistHigh));
             lbl('hms-vel-sigma-val', (HM_DEFAULTS.velSigma / 10).toFixed(1));
-            lbl('hms-wallglow-pct-val', String(HM_DEFAULTS.wallglowPct));
             lbl('hms-ewma-alpha-val', (HM_DEFAULTS.ewmaAlpha / 100).toFixed(2));
             lbl('hms-flicker-filter-val', 'off');
             lbl('hms-wall-blend-val', String(HM_DEFAULTS.wallBlend));
@@ -225,9 +215,9 @@ const BUBBLE_CONFIG = {
 
     // ── Gradient Display (The Eyes) ──
     // Visual tuning only — these affect HOW things look, not WHAT’s significant
-    GRADIENT_BASE_OPACITY: 0.04,  // opacity for noise (barely visible)
+    GRADIENT_BASE_OPACITY: 0.03,  // opacity for noise (barely visible)
     GRADIENT_EXPONENT_SCALE: 0.05,// σ² multiplier for exponential curve
-    GRADIENT_MAX_OPACITY: 0.92,   // cap
+    GRADIENT_MAX_OPACITY: 0.55,   // cap — was 0.92, too opaque over candles
     CLUSTER_OPACITY_BOOST: 0.15,  // extra opacity for clustered bubbles
     DOMINANCE_OPACITY_SCALE: 0.10,// max opacity boost from dominance (90%+ → +0.04)
 
@@ -251,8 +241,8 @@ const BUBBLE_CONFIG = {
     CUML_DELTA_GLOW_THRESHOLD: 0.6,   // bars wider than 60% of max get a glow
 
     // ── Sizing ──
-    MAX_RADIUS: 24,               // max bubble radius in px
-    MIN_RADIUS: 3,                // min bubble radius
+    MAX_RADIUS: 14,               // max bubble radius — was 24, too large over candles
+    MIN_RADIUS: 2,                // min bubble radius
     DOT_RADIUS: 2.5,              // radius for macro-zoom dots
 
     // ── Colors ──
@@ -263,17 +253,10 @@ const BUBBLE_CONFIG = {
     NEUTRAL_COLOR: 'rgba(140, 160, 200, 0.3)',
 
     // ── Institutional glow ──
-    GLOW_COLOR_BUY:  'rgba(31, 209, 122, 0.35)',
-    GLOW_COLOR_SELL: 'rgba(224, 48, 96, 0.35)',
-    GLOW_COLOR_ABSORB: 'rgba(168, 85, 247, 0.35)',
-    GLOW_EXTRA_RADIUS: 6,  // px added to radius for the glow ring
-
-    // ── Iceberg Detection ──
-    ICE_BUY_COLOR:    [100, 180, 255],   // ice blue for buy icebergs
-    ICE_SELL_COLOR:   [255, 140, 180],   // ice pink for sell icebergs
-    ICE_DIAMOND_SIZE: 12,                // diamond half-size in px (zoomed in)
-    ICE_DOT_SIZE:     4,                 // dot size when zoomed out
-    ICE_PULSE_SPEED:  2000,              // pulse cycle duration in ms
+    GLOW_COLOR_BUY:  'rgba(31, 209, 122, 0.18)',
+    GLOW_COLOR_SELL: 'rgba(224, 48, 96, 0.18)',
+    GLOW_COLOR_ABSORB: 'rgba(168, 85, 247, 0.18)',
+    GLOW_EXTRA_RADIUS: 3,  // px added to radius for the glow ring — was 6
 
     // ── Sweep Detection ──
     SWEEP_BUY_COLOR:  [31, 209, 122],    // green for buy sweeps
@@ -364,6 +347,9 @@ class VolumeBubbleRenderer {
         const d = this._data;
         if (!d || !d.bars || d.bars.length === 0) return;
 
+        // NOTE: beginFrame/flush are handled by v2_integration.js which patches this draw().
+        // Do NOT call beginFrame() here — v2_integration.js owns the lifecycle.
+
 
         const barSpacing = d.barSpacing || 6;
 
@@ -372,8 +358,9 @@ class VolumeBubbleRenderer {
         const { from, to } = d.visibleRange;
 
         try { target.useMediaCoordinateSpace(({ context: ctx, mediaSize }) => {
-            // ── Pre-compute volume scale ──
+            // ── Single-pass pre-computation (was 4 separate loops) ──
             let maxVol = 0;
+            const allLevelVols = [];
             for (let i = from; i < to; i++) {
                 const bar = d.bars[i];
                 if (!bar || !bar.originalData || !bar.originalData.bp) continue;
@@ -382,22 +369,10 @@ class VolumeBubbleRenderer {
                     const entry = bp[key];
                     const total = entry[0] + entry[1];
                     if (total > maxVol) maxVol = total;
+                    if (total > 0) allLevelVols.push(total);
                 }
             }
             if (maxVol === 0) return;
-
-            // ── Adaptive threshold: compute rolling average vol per level ──
-            const allLevelVols = [];
-            for (let i = from; i < to; i++) {
-                const bar = d.bars[i];
-                if (!bar || !bar.originalData || !bar.originalData.bp) continue;
-                const bp = bar.originalData.bp;
-                for (const key in bp) {
-                    const entry = bp[key];
-                    const tv = entry[0] + entry[1];
-                    if (tv > 0) allLevelVols.push(tv);
-                }
-            }
             // ── Step 1: THE BRAIN — Log-Transform StdDev ──
             // Log-transform compresses scale so outliers don’t break sigma.
             // Without: one 200-lot makes threshold=91, hiding 50-lot prints.
@@ -490,8 +465,6 @@ class VolumeBubbleRenderer {
                     const entry = bp[priceStr];
                     const buyVol  = entry[0];
                     const sellVol = entry[1];
-                    // entry[2] = fp_absorption_score (0.0–1.0), entry[3] = true_absorption (0|1)
-                    // These are stamped by the backend when _detect_iceberg fires at this price.
                     const fpScore    = (entry.length >= 3 && entry[2] != null) ? entry[2] : 0;
                     const trueAbsorb = (entry.length >= 4 && entry[3] === 1);
                     const totalVol = buyVol + sellVol;
@@ -583,118 +556,147 @@ class VolumeBubbleRenderer {
                 }
             }
 
-            // ════════════════════════════════════════════════════════════════
-            // RENDER LAYERS (back to front)
-            // ════════════════════════════════════════════════════════════════
-
-            // ── Layer 1: Institutional glow rings (behind everything) ──
-            for (const b of glowBubbles) {
-                const glowR = b.radius + BUBBLE_CONFIG.GLOW_EXTRA_RADIUS;
-                let glowColor;
-                if (b.isAbsorb) {
-                    glowColor = BUBBLE_CONFIG.GLOW_COLOR_ABSORB;
-                } else if (b.buyVol >= b.sellVol) {
-                    glowColor = BUBBLE_CONFIG.GLOW_COLOR_BUY;
-                } else {
-                    glowColor = BUBBLE_CONFIG.GLOW_COLOR_SELL;
+            // ── Per-price dedup — keep only largest bubble per price ──
+            // On dense timeframes (1m) the same price hits across many bars,
+            // bubbles stack horizontally and merge into opaque pills that hide
+            // candles. This dedup collapses the pill into a single marker.
+            const _dedupByPrice = (arr) => {
+                const best = {};
+                for (const b of arr) {
+                    const k = b._priceKey || b.y?.toFixed?.(1) || String(b.y);
+                    if (!best[k] || b.totalVol > best[k].totalVol) best[k] = b;
                 }
-
-                // Radial gradient glow
-                const grad = ctx.createRadialGradient(b.x, b.y, b.radius, b.x, b.y, glowR);
-                grad.addColorStop(0, glowColor);
-                grad.addColorStop(1, 'rgba(0,0,0,0)');
-                ctx.fillStyle = grad;
-                ctx.beginPath();
-                ctx.arc(b.x, b.y, glowR, 0, Math.PI * 2);
-                ctx.fill();
+                return Object.values(best);
+            };
+            {
+                // Use y-bucket as key since price is floor'd to tick already.
+                for (const arr of [buyBubbles, sellBubbles, absorbBubbles]) {
+                    for (const b of arr) b._priceKey = (b.y | 0);
+                }
+                const _buyD = _dedupByPrice(buyBubbles);
+                const _sellD = _dedupByPrice(sellBubbles);
+                const _absD = _dedupByPrice(absorbBubbles);
+                buyBubbles.length = 0; buyBubbles.push(..._buyD);
+                sellBubbles.length = 0; sellBubbles.push(..._sellD);
+                absorbBubbles.length = 0; absorbBubbles.push(..._absD);
+                // Rebuild glow/label from deduped survivors
+                const _survivors = new Set([..._buyD, ..._sellD, ..._absD]);
+                glowBubbles.length = 0;
+                trueAbsorbBubbles.length = 0;
+                labelBubbles.length = 0;
+                for (const b of _survivors) {
+                    if (b.isInstitutional || b.trueAbsorb) glowBubbles.push(b);
+                    if (b.trueAbsorb) trueAbsorbBubbles.push(b);
+                    if (b.radius >= 7) labelBubbles.push(b);
+                }
             }
 
-            // ── Layer 2: Buy bubbles (green) ──
-            if (buyBubbles.length > 0) {
+            // ── Performance cap: limit total bubbles to prevent scroll jank ──
+            const MAX_BUBBLES = 600;
+            const totalBubbles = buyBubbles.length + sellBubbles.length + absorbBubbles.length;
+            if (totalBubbles > MAX_BUBBLES) {
+                // Keep only the highest-sigma bubbles
+                const all = [
+                    ...buyBubbles.map(b => ({...b, _arr: 'buy'})),
+                    ...sellBubbles.map(b => ({...b, _arr: 'sell'})),
+                    ...absorbBubbles.map(b => ({...b, _arr: 'absorb'})),
+                ];
+                all.sort((a, b) => b.totalVol - a.totalVol);
+                const keep = new Set(all.slice(0, MAX_BUBBLES));
+                buyBubbles.length = 0;
+                sellBubbles.length = 0;
+                absorbBubbles.length = 0;
+                for (const b of keep) {
+                    if (b._arr === 'buy') buyBubbles.push(b);
+                    else if (b._arr === 'sell') sellBubbles.push(b);
+                    else absorbBubbles.push(b);
+                }
+                // Glow/label arrays already reference same objects, filter them
+                glowBubbles.length = 0;
+                trueAbsorbBubbles.length = 0;
+                labelBubbles.length = 0;
+                for (const b of keep) {
+                    if (b.isInstitutional || b.trueAbsorb) glowBubbles.push(b);
+                    if (b.trueAbsorb) trueAbsorbBubbles.push(b);
+                    if (b.radius >= 7) labelBubbles.push(b);
+                }
+            }
+
+            // ════════════════════════════════════════════════════════════════
+            // RENDER — WebGL path (GPU instanced) or Canvas 2D fallback
+            // ════════════════════════════════════════════════════════════════
+            const _useWebGL = typeof WebGLOverlay !== 'undefined' && WebGLOverlay.isReady();
+
+            if (_useWebGL) {
+                // ── WebGL: submit all bubbles as circle instances ──
+                // Glow bubbles (larger, dimmer — rendered first, behind)
+                for (const b of glowBubbles) {
+                    const c = b.isAbsorb ? [160, 80, 200] :
+                              b.buyVol >= b.sellVol ? BUBBLE_CONFIG.BUY_COLOR : BUBBLE_CONFIG.SELL_COLOR;
+                    WebGLOverlay.addCircle(b.x, b.y, b.radius + BUBBLE_CONFIG.GLOW_EXTRA_RADIUS,
+                        c[0], c[1], c[2], Math.round(b.opacity * 80));
+                }
+
+                // Buy bubbles
+                for (const b of buyBubbles) {
+                    const c = BUBBLE_CONFIG.BUY_COLOR;
+                    WebGLOverlay.addCircle(b.x, b.y, b.radius,
+                        c[0], c[1], c[2], Math.round(b.opacity * 255));
+                }
+
+                // Sell bubbles
+                for (const b of sellBubbles) {
+                    const c = BUBBLE_CONFIG.SELL_COLOR;
+                    WebGLOverlay.addCircle(b.x, b.y, b.radius,
+                        c[0], c[1], c[2], Math.round(b.opacity * 255));
+                }
+
+                // Absorption bubbles
+                for (const b of absorbBubbles) {
+                    const c = BUBBLE_CONFIG.ABSORPTION_COLOR;
+                    WebGLOverlay.addCircle(b.x, b.y, b.radius,
+                        c[0], c[1], c[2], Math.round(b.opacity * 255));
+                }
+
+                // Institutional border rings (slightly larger, high alpha)
+                for (const b of glowBubbles) {
+                    const c = b.isAbsorb ? BUBBLE_CONFIG.ABSORPTION_COLOR :
+                              b.buyVol >= b.sellVol ? BUBBLE_CONFIG.BUY_COLOR : BUBBLE_CONFIG.SELL_COLOR;
+                    WebGLOverlay.addCircle(b.x, b.y, b.radius + 2.5,
+                        c[0], c[1], c[2], Math.round(0.15 * 255));
+                }
+
+                // True absorption gold rings
+                for (const b of trueAbsorbBubbles) {
+                    WebGLOverlay.addCircle(b.x, b.y, b.radius + 4, 255, 215, 0, 100);
+                    WebGLOverlay.addCircle(b.x, b.y, b.radius + 2, 255, 215, 0, 200);
+                }
+
+            } else {
+                // ── Canvas 2D fallback ──
+                // Glow
+                for (const b of glowBubbles) {
+                    const c = b.isAbsorb ? BUBBLE_CONFIG.ABSORPTION_COLOR :
+                              b.buyVol >= b.sellVol ? BUBBLE_CONFIG.BUY_COLOR : BUBBLE_CONFIG.SELL_COLOR;
+                    ctx.fillStyle = _rgba(c, b.opacity * 0.3);
+                    ctx.beginPath();
+                    ctx.arc(b.x, b.y, b.radius + BUBBLE_CONFIG.GLOW_EXTRA_RADIUS, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+                // Buy
                 for (const b of buyBubbles) {
                     ctx.fillStyle = _rgba(BUBBLE_CONFIG.BUY_COLOR, b.opacity);
-                    ctx.beginPath();
-                    ctx.arc(b.x, b.y, b.radius, 0, Math.PI * 2);
-                    ctx.fill();
+                    ctx.beginPath(); ctx.arc(b.x, b.y, b.radius, 0, Math.PI * 2); ctx.fill();
                 }
-            }
-
-            // ── Layer 3: Sell bubbles (red) ──
-            if (sellBubbles.length > 0) {
+                // Sell
                 for (const b of sellBubbles) {
                     ctx.fillStyle = _rgba(BUBBLE_CONFIG.SELL_COLOR, b.opacity);
-                    ctx.beginPath();
-                    ctx.arc(b.x, b.y, b.radius, 0, Math.PI * 2);
-                    ctx.fill();
+                    ctx.beginPath(); ctx.arc(b.x, b.y, b.radius, 0, Math.PI * 2); ctx.fill();
                 }
-            }
-
-            // ── Layer 4: Absorption bubbles (purple with dual-color ring) ──
-            if (absorbBubbles.length > 0) {
+                // Absorb
                 for (const b of absorbBubbles) {
-                    // Inner fill: purple (absorption detected)
                     ctx.fillStyle = _rgba(BUBBLE_CONFIG.ABSORPTION_COLOR, b.opacity);
-                    ctx.beginPath();
-                    ctx.arc(b.x, b.y, b.radius, 0, Math.PI * 2);
-                    ctx.fill();
-
-                    // Dual-color split ring: green top half, red bottom half
-                    if (!useDots && b.radius >= 5) {
-                        ctx.lineWidth = 2;
-                        // Top half — buy (green)
-                        ctx.strokeStyle = _rgba(BUBBLE_CONFIG.BUY_COLOR, 0.8);
-                        ctx.beginPath();
-                        ctx.arc(b.x, b.y, b.radius + 1, Math.PI, 0);  // top semicircle
-                        ctx.stroke();
-                        // Bottom half — sell (red)
-                        ctx.strokeStyle = _rgba(BUBBLE_CONFIG.SELL_COLOR, 0.8);
-                        ctx.beginPath();
-                        ctx.arc(b.x, b.y, b.radius + 1, 0, Math.PI);  // bottom semicircle
-                        ctx.stroke();
-                    }
-                }
-            }
-
-            // ── Layer 5: Institutional border ring ──
-            if (!useDots) {
-                for (const b of glowBubbles) {
-                    let ringColor;
-                    if (b.isAbsorb) {
-                        ringColor = _rgba(BUBBLE_CONFIG.ABSORPTION_COLOR, 0.9);
-                    } else if (b.buyVol >= b.sellVol) {
-                        ringColor = _rgba(BUBBLE_CONFIG.BUY_COLOR, 0.9);
-                    } else {
-                        ringColor = _rgba(BUBBLE_CONFIG.SELL_COLOR, 0.9);
-                    }
-                    ctx.strokeStyle = ringColor;
-                    ctx.lineWidth = 2;
-                    ctx.beginPath();
-                    ctx.arc(b.x, b.y, b.radius + 2, 0, Math.PI * 2);
-                    ctx.stroke();
-                }
-            }
-
-            // ── Layer 5.5: TRUE ABSORPTION gold ring (footprint-confirmed) ──
-            // This is the highest-conviction visual: the backend proved that
-            // the bid held under massive sell pressure (negative delta, anchored bid).
-            // Render a double gold ring with higher brightness to stand out.
-            if (!useDots && trueAbsorbBubbles.length > 0) {
-                for (const b of trueAbsorbBubbles) {
-                    // Outer diffuse glow
-                    const grad = ctx.createRadialGradient(b.x, b.y, b.radius, b.x, b.y, b.radius + 10);
-                    grad.addColorStop(0, 'rgba(255, 215, 0, 0.5)');   // gold core
-                    grad.addColorStop(1, 'rgba(255, 215, 0, 0.0)');   // fade out
-                    ctx.strokeStyle = grad;
-                    ctx.lineWidth = 3;
-                    ctx.beginPath();
-                    ctx.arc(b.x, b.y, b.radius + 4, 0, Math.PI * 2);
-                    ctx.stroke();
-                    // Inner sharp gold ring
-                    ctx.strokeStyle = 'rgba(255, 215, 0, 0.95)';
-                    ctx.lineWidth = 1.5;
-                    ctx.beginPath();
-                    ctx.arc(b.x, b.y, b.radius + 2, 0, Math.PI * 2);
-                    ctx.stroke();
+                    ctx.beginPath(); ctx.arc(b.x, b.y, b.radius, 0, Math.PI * 2); ctx.fill();
                 }
             }
 
@@ -834,6 +836,8 @@ class VolumeBubbleRenderer {
             }
 
             }); } catch(e) { /* LWC not ready */ }  // close useMediaCoordinateSpace
+
+        // NOTE: flush() is handled by v2_integration.js which patches this draw().
     }  // close draw()
 }  // close VolumeBubbleRenderer class
 

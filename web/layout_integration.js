@@ -28,12 +28,10 @@
 // ═══════════════════════════════════════════════════════════════════════════
 const FEATURES = {
   chart:    { label: 'CHART',     icon: '\u{1f4c8}', desc: 'Price Chart' },
-  heatmap:  { label: 'HEATMAP',   icon: '\u{1f7e7}', desc: 'DOM Heatmap' },
   ladder:   { label: 'LADDER',    icon: '\u{1f4ca}', desc: 'Depth Ladder' },
   ocheat:   { label: 'OC HEAT',   icon: '\u{1f525}', desc: 'Option Chain Heatmap' },
   eqbook:   { label: 'EQ BOOK',   icon: '\u{1f4d6}', desc: 'QQQ Equity L2 Book' },
   opscr:    { label: 'SCREENER',  icon: '\u{1f50d}', desc: 'Options Unusual Activity' },
-  alpha:    { label: 'ALPHA',     icon: '\u{1f4a1}', desc: 'Alpha Engine Dashboard' },
   pressure: { label: 'PRESSURE',  icon: '\u{1f300}', desc: 'Navier-Stokes Pressure Field' },
   kinetic:  { label: 'KINETIC',   icon: '\u26a1',    desc: 'Kinetic HUD' },
   eqtape:   { label: 'EQ TAPE',   icon: '\u{1f3f7}', desc: 'Equity Tape (Venue Routing)' },
@@ -42,6 +40,7 @@ const FEATURES = {
   volsurf:  { label: 'VOL SURF',  icon: '\u{1f321}', desc: 'IV Surface, 3D Vol + Greek Regime' },
   optflow:  { label: 'OPT FLOW',  icon: '\u{1f4b8}', desc: 'Options Flow Feed' },
   bookms:   { label: 'BOOK MS',   icon: '\u{1f4d1}', desc: 'Book Microstructure (Venue Quality)' },
+  vpintel:  { label: 'VP INTEL',  icon: '\u{1f4ca}', desc: 'Volume Profile Intelligence — Absorption, Depth, Zones' },
 };
 const FEAT_KEYS = Object.keys(FEATURES);
 
@@ -54,16 +53,16 @@ const LAYOUTS = {
   'exec':     { label:'Execution',    slots:2, cols:2, rows:1, defaults:['chart','ladder'] },
   'scalp':    { label:'Scalp',        slots:2, cols:2, rows:1, defaults:['ladder','chart'] },
   'flow':     { label:'Flow',         slots:3, cols:3, rows:1, defaults:['chart','volsurf','optflow'] },
-  'dom':      { label:'DOM',          slots:3, cols:3, rows:1, defaults:['heatmap','ladder','eqbook'] },
-  'intel':    { label:'Intel',        slots:3, cols:2, rows:2, defaults:['chart','heatmap','volsurf'] },
+  'dom':      { label:'DOM',          slots:3, cols:3, rows:1, defaults:['vpintel','ladder','eqbook'] },
+  'intel':    { label:'Intel',        slots:3, cols:2, rows:2, defaults:['chart','vpintel','volsurf'] },
   // ── Options Desk ──
   'hedge':    { label:'Hedge',        slots:3, cols:3, rows:1, defaults:['chart','volsurf','optflow'] },
   // ── Full Station ──
-  'recon':    { label:'Recon',        slots:6, cols:3, rows:2, defaults:['chart','heatmap','ladder','eqbook','volsurf','optflow'] },
+  'recon':    { label:'Recon',        slots:6, cols:3, rows:2, defaults:['chart','vpintel','ladder','eqbook','volsurf','optflow'] },
   // ── Market Maker Workstation ──
-  'maker':    { label:'Maker',        slots:3, cols:3, rows:1, defaults:['heatmap','ladder','eqbook'] },
+  'maker':    { label:'Maker',        slots:3, cols:3, rows:1, defaults:['vpintel','ladder','eqbook'] },
   // ── God Mode ──
-  'god-mode': { label:'God Mode',     slots:5, cols:3, rows:2, defaults:['chart','chart','heatmap','alpha','ladder'] },
+  'god-mode': { label:'God Mode',     slots:5, cols:3, rows:2, defaults:['chart','chart','vpintel','volsurf','ladder'] },
   // ── Dealer Hedge ──
   'dealer-desk': { label:'Dealer Desk', slots:4, cols:2, rows:2, defaults:['chart','dealer','xdiv','optflow'] },
   'war-room':    { label:'War Room',    slots:6, cols:3, rows:2, defaults:['chart','eqtape','dealer','volsurf','xdiv','optflow'] },
@@ -161,6 +160,11 @@ function createPanes() {
     _observers.push(ro);
   }
 }
+
+window.addEventListener('beforeunload', () => {
+  for (const ro of _observers) { try { ro.disconnect(); } catch(_) {} }
+  _observers.length = 0;
+});
 
 // ═══════════════════════════════════════════════════════════════════════════
 // MOUNT / UNMOUNT LIFECYCLE
@@ -570,7 +574,7 @@ const GRID_SHAPES = [
   { id:'g32',  label:'3×2', slots:6, cols:'1fr 1fr 1fr', rows:'1fr 1fr',
     svg:'<rect x="1" y="1" width="6" height="5" rx=".6"/><rect x="9" y="1" width="6" height="5" rx=".6"/><rect x="17" y="1" width="6" height="5" rx=".6"/><rect x="1" y="8" width="6" height="5" rx=".6"/><rect x="9" y="8" width="6" height="5" rx=".6"/><rect x="17" y="8" width="6" height="5" rx=".6"/>' },
 ];
-const defaultFeatsForSlots = ['chart','heatmap','ladder','gex','dex','ivskew'];
+const defaultFeatsForSlots = ['chart','vpintel','ladder','gex','dex','ivskew'];
 let _clSelectedGrid = null;
 let _clSlotSelects = [];
 

@@ -11,8 +11,11 @@ Events emitted:
 
 import os
 import time
+import logging
 import threading
 from datetime import datetime
+
+log = logging.getLogger(__name__)
 
 # Module-level SocketIO reference (injected by server.py)
 _socketio = None
@@ -62,47 +65,30 @@ def start_schwab_bridge():
 def _run_bridge():
     """Main bridge loop — initializes auth + streamer, subscribes, and bridges."""
     global _streamer
+    # Import connectors
+    import sys
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
+    # Initialize EdgeDetector FIRST — works with TopStepX alone (NQ-native signals)
+    global _flow_classifier, _edge_detector
     try:
-        # Import connectors
-        import sys
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        if project_root not in sys.path:
-            sys.path.insert(0, project_root)
-
-        from connectors.schwab_auth import SchwabAuth
-        from connectors.schwab_streamer import SchwabStreamer
-
-        print("[SCHWAB-BRIDGE] Initializing Schwab auth...")
-        auth = SchwabAuth()
-
-        if not auth.is_authenticated():
-            print("[SCHWAB-BRIDGE] ❌ Not authenticated — run schwab_login.py first")
-            return
-
-        print("[SCHWAB-BRIDGE] Authenticated, starting streamer...")
-        _streamer = SchwabStreamer(auth)
-
-        # Register callbacks BEFORE starting (they queue until connected)
-        _streamer.on('LEVELONE_FUTURES', _on_futures_quote)
-        _streamer.on('LEVELONE_EQUITIES', _on_equity_quote)
-        _streamer.on('LEVELONE_OPTIONS', _on_options_quote)
-        _streamer.on('CHART_FUTURES', _on_chart_candle)
-        _streamer.on('CHART_EQUITY', _on_chart_candle)
-        _streamer.on('NASDAQ_BOOK', _on_nasdaq_book)
-        _streamer.on('NYSE_BOOK', _on_nyse_book)
-        _streamer.on('SCREENER_OPTION', _on_screener_option)
-
-        # Initialize FlowClassifier — attaches to NASDAQ_BOOK/OPTIONS_BOOK callbacks
-        global _flow_classifier, _edge_detector
-        from connectors.flow_classifier import FlowClassifier
-        _flow_classifier = FlowClassifier(_streamer)
-        _flow_classifier.start()
-        print("[SCHWAB-BRIDGE] FlowClassifier attached")
-
-        # Initialize EdgeDetector — cross-asset signal engine
         from connectors.edge_detector import EdgeDetector
-        _edge_detector = EdgeDetector(_streamer, _flow_classifier, _socketio)
+        _edge_detector = EdgeDetector(None, None, _socketio)
         _edge_detector.start()
+        # Wire adverse selection + NQ engine getters from l2_worker
+        try:
+            from background_engine.l2_worker import (
+                get_adverse_selection, _VPIN_ENGINES, _V2_HAWKES, _V2_KALMAN
+            )
+            _edge_detector._adverse_selection_fn = get_adverse_selection
+            _edge_detector._get_vpin = lambda sym: _VPIN_ENGINES.get(sym)
+            _edge_detector._get_hawkes = lambda sym: _V2_HAWKES.get(sym)
+            _edge_detector._get_kalman = lambda sym: _V2_KALMAN.get(sym)
+            print("[SCHWAB-BRIDGE] AdverseSelection + NQ engines → EdgeDetector wired")
+        except ImportError:
+            print("[SCHWAB-BRIDGE] ⚠️ NQ engine wiring not available")
         print("[SCHWAB-BRIDGE] EdgeDetector attached")
 
         # Initialize MMTracker — market maker withdrawal detection
@@ -150,15 +136,59 @@ def _run_bridge():
             _iv_calibrator = None
             print(f"[SCHWAB-BRIDGE] ⚠️ IVCalibrator not available: {e}")
 
-        # Wire NQ detection forwarding: l2_worker → EdgeDetector
+        # Wire NQ detection forwarding: l2_worker → EdgeDetector (works without Schwab)
         try:
-            from background_engine.l2_worker import set_detection_callback, set_cross_asset_provider, set_trade_score_callback
+            from background_engine.l2_worker import (
+                set_detection_callback, set_cross_asset_provider,
+                set_trade_score_callback, set_nq_signal_callback
+            )
             set_detection_callback(_edge_detector.on_nq_detection)
             set_cross_asset_provider(_edge_detector.get_cross_asset_context)
             set_trade_score_callback(_edge_detector.score_trade)
-            print("[SCHWAB-BRIDGE] NQ detection ↔ EdgeDetector bidirectional wired + tape scoring")
+            set_nq_signal_callback(_edge_detector.check_nq_signals)
+            print("[SCHWAB-BRIDGE] NQ detection ↔ EdgeDetector bidirectional wired + NQ signals")
         except ImportError:
             print("[SCHWAB-BRIDGE] ⚠️ l2_worker not available for NQ forwarding")
+
+    except Exception as e:
+        import traceback
+        print(f"[SCHWAB-BRIDGE] ❌ EdgeDetector init failed: {e}")
+        print(traceback.format_exc())
+
+    # ── Schwab auth + streamer (optional — NQ signals work without it) ──
+    try:
+        print("[SCHWAB-BRIDGE] Initializing Schwab auth...")
+        from connectors.schwab_auth import SchwabAuth
+        from connectors.schwab_streamer import SchwabStreamer
+
+        auth = SchwabAuth()
+        if not auth.is_authenticated():
+            print("[SCHWAB-BRIDGE] ⚠️ Schwab not authenticated — NQ-only mode (TopStepX signals active)")
+            return
+
+        print("[SCHWAB-BRIDGE] Authenticated, starting streamer...")
+        _streamer = SchwabStreamer(auth)
+
+        # Register callbacks
+        _streamer.on('LEVELONE_FUTURES', _on_futures_quote)
+        _streamer.on('LEVELONE_EQUITIES', _on_equity_quote)
+        _streamer.on('LEVELONE_OPTIONS', _on_options_quote)
+        _streamer.on('CHART_FUTURES', _on_chart_candle)
+        _streamer.on('CHART_EQUITY', _on_chart_candle)
+        _streamer.on('NASDAQ_BOOK', _on_nasdaq_book)
+        _streamer.on('NYSE_BOOK', _on_nyse_book)
+        _streamer.on('SCREENER_OPTION', _on_screener_option)
+
+        # Wire FlowClassifier + streamer into EdgeDetector (Schwab-dependent)
+        from connectors.flow_classifier import FlowClassifier
+        _flow_classifier = FlowClassifier(_streamer)
+        _flow_classifier.start()
+        _edge_detector._streamer = _streamer
+        _edge_detector._flow = _flow_classifier
+        # Re-attach Schwab book callbacks
+        _streamer.on('NASDAQ_BOOK', _edge_detector._on_book)
+        _streamer.on('SCREENER_OPTION', _edge_detector._on_screener)
+        print("[SCHWAB-BRIDGE] FlowClassifier + Schwab streams → EdgeDetector attached")
 
         # Start the WebSocket connection
         _streamer.start()
@@ -964,6 +994,14 @@ def _maybe_emit_zones():
         # ── Feed VolSurface monitor and merge regime data ─────────────────
         if _vol_surface:
             try:
+                # Feed VPIN from l2_worker into HMM regime detector
+                try:
+                    from background_engine.l2_worker import _VPIN_ENGINES
+                    _nq_vpin = _VPIN_ENGINES.get('NQ')
+                    if _nq_vpin:
+                        _vol_surface.set_vpin(_nq_vpin.vpin)
+                except Exception:
+                    pass
                 vol_state = _vol_surface.update(zone_data, realized_vol=_nq_realized_vol)
                 if vol_state:
                     zone_data['vol_regime'] = vol_state.get('regime', 'NORMAL')
@@ -980,6 +1018,25 @@ def _maybe_emit_zones():
                         zone_data['vol_alert_severity'] = severity
             except Exception as e:
                 print(f"[SCHWAB-BRIDGE] ⚠️ VolSurface error: {e}")
+
+        # ── Pull adverse selection score + copula joint confidence ───────
+        try:
+            from background_engine.l2_worker import get_adverse_selection
+            _as = get_adverse_selection('NQ')
+            if _as is not None:
+                _st = _as.get_state()
+                if _st:
+                    zone_data['adverse_selection_score'] = _st.get('adverse_selection_score', 0)
+        except Exception as e:
+            log.debug("adverse_selection fetch failed: %s", e)
+
+        try:
+            if _edge_detector is not None and getattr(_edge_detector, '_copula', None):
+                _cs = _edge_detector._copula.get_correlation_estimate()
+                zone_data['copula_joint'] = _cs.get('last_joint', 50.0)
+                zone_data['copula_rho_bar'] = _cs.get('rho_bar', 0.3)
+        except Exception as e:
+            log.debug("copula fetch failed: %s", e)
 
         _socketio.emit('zone_update', zone_data)
         _last_zone_emit = time.time()
@@ -1107,6 +1164,10 @@ def _on_chart_candle(data):
     ts = chart_time / 1000 if chart_time > 1e12 else chart_time
 
     chart_sym = symbol.lstrip('/')  # /NQ → NQ
+
+    # NQ candles come from TopStepX l2_worker — don't duplicate from Schwab
+    if chart_sym in ('NQ', 'ES'):
+        return
 
     # Emit candle_update (matches existing frontend listener exactly)
     _socketio.emit('candle_update', {

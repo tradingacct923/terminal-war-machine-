@@ -26,6 +26,10 @@ load_dotenv(os.path.join(_HERE, ".env"))
 # Allow imports from project root
 sys.path.insert(0, _HERE)
 
+# ALPHA_ENABLED gates the 8 frameworks/* stat-mech modules. They feed the
+# Alpha dashboard (currently hidden). Leave off in prod to save CPU.
+_ALPHA_ENABLED = os.getenv("ALPHA_ENABLED", "0") == "1"
+
 import copy
 from datetime import datetime, timedelta, timezone
 from background_engine.topstepx_connector import TopStepXConnector
@@ -57,13 +61,13 @@ USERNAME = os.getenv("TOPSTEPX_USERNAME", "")
 API_KEY  = os.getenv("TOPSTEPX_API_KEY",  "")
 
 # ── Symbols to stream ────────────────────────────────────────────────────────
-SYMBOLS = ["NQ", "GC"]
+SYMBOLS = ["NQ"]
 
 # ── OHLC Candle Engine ────────────────────────────────────────────────────────
 # Aggregates tick-by-tick trades into OHLC candles for multiple timeframes.
 CANDLE_TIMEFRAMES = {
     "5s": 5, "15s": 15, "30s": 30,
-    "1m": 60, "5m": 300, "15m": 900, "30m": 1800,
+    "1m": 60, "200s": 200, "5m": 300, "10m": 600, "15m": 900, "30m": 1800,
     "1h": 3600, "4h": 14400,
 }
 CANDLE_MAX = 2000  # max candles stored per timeframe per symbol (holds full 24h session)
@@ -85,11 +89,17 @@ _CURRENT_CANDLE: dict[str, dict[str, dict]] = defaultdict(dict)
 # ── Socket.IO reference (set by server.py at startup) ──
 _socketio = None
 _last_emit_time: dict = {}  # throttle: {"symbol:tf": timestamp}
-_EMIT_MIN_INTERVAL = 0.15   # max ~6.6 emits/sec per symbol/tf
+_EMIT_MIN_INTERVAL = 0.05   # max 20 emits/sec per symbol/tf (was 150ms)
+_ACTIVE_TF = "1m"           # legacy singleton — kept for back-compat, do not rely on
+_ACTIVE_TFS: set = {"1m"}   # set union of all client-requested TFs (multi-client safe)
 
 # ── Reconnect gap-fill tracking ──
 _LAST_TRADE_TS: dict[str, float] = {}   # {symbol: unix_ts of last trade}
 _connector_ref = None                    # set by start() for gap-fill access
+
+# ── Refill Speed Tracking (for VP absorption quality) ──
+_REFILL_TRACKER: dict = {}    # {symbol: {price_str: {hit_ts, avg_ms, count, classification}}}
+_LAST_DOM_DEPTH: dict = {}    # {symbol: {price_str: depth}} — previous DOM snapshot for diff
 
 # ── Bubble Profile Persistence ──
 # Saves bp data to disk each time a 1m candle closes, loads on startup.
@@ -173,6 +183,12 @@ def set_cross_asset_provider(provider_fn):
 _STICKINESS_DIST: dict = defaultdict(lambda: deque(maxlen=500))
 # {symbol: deque of recent stickiness values}
 
+# ── Empirical absorption-score distribution (Sprint 2) ──
+# Replaces hardcoded score >= 2.0 (WALL) / 1.0 (ABS) cutoffs with session
+# percentiles. WALL = top 25% of observed score×waves joint signal.
+_ABS_SCORE_DIST: dict = defaultdict(lambda: deque(maxlen=500))
+_ABS_WAVES_DIST: dict = defaultdict(lambda: deque(maxlen=500))
+
 def set_socketio(sio):
     """Called by server.py to inject the SocketIO instance for real-time push."""
     global _socketio
@@ -180,7 +196,7 @@ def set_socketio(sio):
     log.info("Socket.IO reference set for real-time candle push")
 
 def set_detection_callback(callback):
-    """Register a callback for NQ detection events (iceberg, sweep, wall_gone).
+    """Register a callback for NQ detection events (sweep, absorption).
     Called by schwab_bridge or server.py to wire EdgeDetector.
     callback(detection_type: str, detection_data: dict, symbol: str)
     """
@@ -190,6 +206,15 @@ def set_detection_callback(callback):
 
 # ── Trade scoring callback (for tape glow via EdgeDetector) ──
 _trade_score_callback = None  # callable(symbol, volume, side, price, timestamp) -> dict|None
+
+# ── NQ signal check callback (for NQ-native edge signals) ──
+_nq_signal_callback = None  # callable(symbol) — calls EdgeDetector.check_nq_signals
+
+def set_nq_signal_callback(callback):
+    """Register EdgeDetector.check_nq_signals() for NQ-native signal emission."""
+    global _nq_signal_callback
+    _nq_signal_callback = callback
+    log.info("NQ signal callback registered for TopStepX-native signals")
 
 def set_trade_score_callback(callback):
     """Register EdgeDetector.score_trade() for regime-adaptive tape glow scoring.
@@ -202,57 +227,10 @@ def set_trade_score_callback(callback):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ORDERFLOW DETECTION — Iceberg + Sweep engines
+# REGIME CLASSIFIER — Options-driven market regime state
 # ══════════════════════════════════════════════════════════════════════════════
-
-# ══════════════════════════════════════════════════════════════════════════════
-# REGIME-ADAPTIVE THRESHOLDS — Options-driven market regime classifier
-# ══════════════════════════════════════════════════════════════════════════════
-# 5 regimes, each with tuned thresholds for iceberg + drifting detection.
-# Updated by server.py whenever options data refreshes (~every 5 min).
-
-_REGIME_THRESHOLDS = {
-    # PIN / MEAN-REVERT: long gamma, high GEX, IV cheap, spot between walls
-    # Heavy MM activity, walls everywhere → strict filter or drown in signals
-    "pin_mean_revert": {
-        "ice_cv": 0.25, "ice_refill_count": 4,
-        "drift_cv": 0.25, "drift_min_fills": 7, "drift_min_spread": 5,
-    },
-    # LONG GAMMA / STABLE: long gamma, GEX positive, normal
-    # Standard range-bound. Default detection settings
-    "long_gamma_stable": {
-        "ice_cv": 0.30, "ice_refill_count": 3,
-        "drift_cv": 0.30, "drift_min_fills": 5, "drift_min_spread": 4,
-    },
-    # TRANSITION: spot near gamma flip (±0.5%)
-    # Anything goes — regime could shift mid-detection
-    "transition": {
-        "ice_cv": 0.35, "ice_refill_count": 3,
-        "drift_cv": 0.35, "drift_min_fills": 5, "drift_min_spread": 3,
-    },
-    # SHORT GAMMA / VOLATILE: short gamma, negative GEX
-    # Trending. Fewer walls, but ones that show up are significant
-    "short_gamma_volatile": {
-        "ice_cv": 0.40, "ice_refill_count": 3,
-        "drift_cv": 0.45, "drift_min_fills": 4, "drift_min_spread": 3,
-    },
-    # CRASH / TAIL RISK: short gamma, GEX < -1B, IV rich, spot below put wall
-    # Panic. Any wall is a massive signal. Catch everything
-    "crash_tail_risk": {
-        "ice_cv": 0.45, "ice_refill_count": 3,
-        "drift_cv": 0.50, "drift_min_fills": 3, "drift_min_spread": 2,
-    },
-}
-
-# Regime-adaptive est_duration: shorter in crashes (fast fills),
-# longer in pin markets (slow drip). Affects est_hidden accuracy.
-_EST_DURATION_BY_REGIME = {
-    "crash_tail_risk":      30.0,
-    "short_gamma_volatile": 45.0,
-    "transition":           60.0,
-    "long_gamma_stable":    90.0,
-    "pin_mean_revert":     120.0,
-}
+# Exposed via _CURRENT_REGIME; consumed by server.py/api_alpha and downstream
+# logging. Updated by update_regime() below whenever options data refreshes.
 
 # Current regime state — updated by update_regime() called from server.py
 _CURRENT_REGIME = "transition"  # safe default until first options refresh
@@ -327,239 +305,92 @@ def update_regime(spot: float, gamma_flip: float, total_gex: float,
                  f"gex={total_gex/1e6:.0f}M")
 
 
-def _get_regime_thresholds() -> dict:
-    """Get current adaptive thresholds based on market regime.
-    Falls back to hardcoded table during warmup."""
-    return _REGIME_THRESHOLDS.get(_CURRENT_REGIME,
-                                  _REGIME_THRESHOLDS["transition"])
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # σ-ADAPTIVE MARKET STATS ENGINE — live threshold computation
 # ══════════════════════════════════════════════════════════════════════════════
-# Tracks rolling distributions of fill rate, cluster CV, and clip size.
-# After warmup (~500 trades), replaces hardcoded thresholds with computed ones.
+# Tracks rolling distributions of trade sizes and per-level absorption samples.
+# After warmup (~500 trades), exposes session-rolling percentile cutoffs used
+# by the absorption scorer.
 
 _ADAPTIVE_WARMUP = 500  # min trades before switching to adaptive mode
 
 _MARKET_STATS: dict = defaultdict(lambda: {
-    "fill_timestamps_b": deque(maxlen=500),  # (timestamp,) for buy fills
-    "fill_timestamps_s": deque(maxlen=500),  # (timestamp,) for sell fills
-    "cluster_cvs": deque(maxlen=200),         # CV of random 5-fill clusters
-    "clip_sizes": deque(maxlen=1000),          # all recent trade sizes
-    "total_trades": 0,                         # total trades since startup
-    # Computed stats (updated every ~1s)
-    "fill_rate_b": 0.5,   # buy fills per second (60s window)
-    "fill_rate_s": 0.5,   # sell fills per second (60s window)
-    "mean_cv": 0.55,      # mean CV of random fill clusters
-    "std_cv": 0.15,       # stddev of cluster CVs
-    "mean_clip": 2.0,     # mean trade size
-    "std_clip": 1.5,      # stddev of trade sizes
-    "last_stats_ts": 0,   # throttle: recompute only every 1s
-    "last_adaptive_log": 0,  # throttle: log adaptive thresholds every 60s
-    "p_coincidence": 0.30,  # fraction of random clusters with CV < threshold (for significance test)
+    "clip_sizes": deque(maxlen=1000),         # all recent trade sizes
+    "total_trades": 0,                        # total trades since startup
+    # Absorption tier sampling (adaptive tier cutoffs)
+    "refill_samples": deque(maxlen=500),      # refill_ratio per level snapshot (t_traded >= 10)
+    "traded_samples": deque(maxlen=500),      # t_traded per level snapshot
+    "pull_samples":   deque(maxlen=300),      # pull_ratios >= 0.2 (spoof significance)
+    "last_stats_ts": 0,                       # throttle: recompute only every 1s
+    "last_adaptive_log": 0,                   # throttle: log adaptive thresholds every 60s
 })
 
 
-
 def _update_market_stats(symbol: str, volume: int, side: str, timestamp: float):
-    """Called on every trade to update rolling market stats."""
+    """Called on every trade. Feeds Kalman CV and the clip-size buffer."""
     ms = _MARKET_STATS[symbol]
     ms["total_trades"] += 1
     ms["clip_sizes"].append(volume)
-    if side == "b":
-        ms["fill_timestamps_b"].append(timestamp)
-    elif side == "s":
-        ms["fill_timestamps_s"].append(timestamp)
 
-    # Build cluster CV samples: every 5th trade, compute CV of last 5 clips
+    # Build CV samples: every 5th trade, compute CV of last 5 clips and push into Kalman
     if ms["total_trades"] % 5 == 0 and len(ms["clip_sizes"]) >= 5:
         last5 = list(ms["clip_sizes"])[-5:]
         m5 = sum(last5) / 5
         if m5 > 0:
             v5 = sum((x - m5) ** 2 for x in last5) / 5
             cv5 = math.sqrt(v5) / m5
-            ms["cluster_cvs"].append(cv5)
-            # Feed into Kalman filter for state-space CV estimation
             _KALMAN_CV[symbol].update(cv5)
 
-    # Recompute derived stats at most once per second
+    # Throttle timestamp — used by _get_adaptive_thresholds for log pacing
     if timestamp - ms["last_stats_ts"] < 1.0:
         return
     ms["last_stats_ts"] = timestamp
 
-    # Fill rates (60s window) — reverse-scan with early break (deques are time-ordered)
-    cutoff_60 = timestamp - 60.0
-    b_recent = []
-    for t in reversed(ms["fill_timestamps_b"]):
-        if t < cutoff_60:
-            break
-        b_recent.append(t)
-    s_recent = []
-    for t in reversed(ms["fill_timestamps_s"]):
-        if t < cutoff_60:
-            break
-        s_recent.append(t)
-    ms["fill_rate_b"] = max(0.1, len(b_recent) / 60.0)
-    ms["fill_rate_s"] = max(0.1, len(s_recent) / 60.0)
-
-    # Cluster CV distribution
-    cvs = list(ms["cluster_cvs"])
-    if len(cvs) >= 10:
-        ms["mean_cv"] = sum(cvs) / len(cvs)
-        var_cv = sum((c - ms["mean_cv"]) ** 2 for c in cvs) / len(cvs)
-        ms["std_cv"] = max(0.01, math.sqrt(var_cv))
-
-        # p_coincidence: what fraction of random clusters accidentally
-        # have CV below the adaptive threshold? Used for significance test.
-        # We compute threshold here using transition regime (1.5σ) as baseline
-        tentative_cv_thresh = max(0.12, ms["mean_cv"] - 1.5 * ms["std_cv"])
-        n_below = sum(1 for c in cvs if c < tentative_cv_thresh)
-        ms["p_coincidence"] = max(0.05, min(0.70, n_below / len(cvs)))
-
-    # Clip size distribution
-    clips = list(ms["clip_sizes"])
-    if len(clips) >= 20:
-        ms["mean_clip"] = sum(clips) / len(clips)
-        var_clip = sum((c - ms["mean_clip"]) ** 2 for c in clips) / len(clips)
-        ms["std_clip"] = max(0.01, math.sqrt(var_clip))
-
-
-
-# Regime → sigma multiplier (how many σ below mean CV to set threshold)
-_REGIME_SIGMA = {
-    "pin_mean_revert":      2.0,   # strict: need 2σ below normal CV
-    "long_gamma_stable":    1.5,
-    "transition":           1.5,
-    "short_gamma_volatile": 1.0,
-    "crash_tail_risk":      0.75,  # loose: 0.75σ is enough
-}
-
-# Regime → target confidence level for fill count significance test
-# Lower = more lenient (fewer fills needed), Higher = stricter
-_REGIME_CONFIDENCE = {
-    "pin_mean_revert":      0.005,  # need P(coincidence) < 0.5% — very strict
-    "long_gamma_stable":    0.01,   # need P(coincidence) < 1%
-    "transition":           0.01,   # need P(coincidence) < 1%
-    "short_gamma_volatile": 0.02,   # need P(coincidence) < 2% — more lenient
-    "crash_tail_risk":      0.05,   # need P(coincidence) < 5% — most lenient
-}
-
-
-# Regime → min tick spread for drifting
-_REGIME_SPREAD = {
-    "pin_mean_revert": 7, "long_gamma_stable": 5,
-    "transition": 4, "short_gamma_volatile": 3, "crash_tail_risk": 2,
-}
 
 
 def _get_adaptive_thresholds(symbol: str, side: str = "b") -> dict:
-    """Compute σ-adaptive thresholds from live market data.
+    """Session-rolling percentile cutoffs for the absorption scorer.
 
-    Falls back to hardcoded _REGIME_THRESHOLDS during warmup (<500 trades).
-    After warmup, thresholds are derived from rolling stats with regime
-    as a strictness multiplier.
+    During warmup (<500 trades) returns an empty dict — callers fall back to
+    hardcoded defaults in `.get(...)` calls. After warmup, exposes refill /
+    traded / pull percentile cutoffs computed from live per-level samples.
     """
     ms = _MARKET_STATS[symbol]
-    regime = _CURRENT_REGIME
-
-    # Warmup: not enough data yet, use hardcoded table
     if ms["total_trades"] < _ADAPTIVE_WARMUP:
-        return _get_regime_thresholds()
+        return {}
 
-    sigma_mult = _REGIME_SIGMA.get(regime, 1.5)
+    absorb_cutoffs: dict = {}
+    if len(ms["refill_samples"]) >= 100:
+        rs = sorted(ms["refill_samples"])
+        ts = sorted(ms["traded_samples"])
+        n_r = len(rs); n_t = len(ts)
+        absorb_cutoffs["refill_p90"] = rs[int(n_r * 0.90)]  # FORTRESS refill cutoff
+        absorb_cutoffs["refill_p75"] = rs[int(n_r * 0.75)]  # SOLID
+        absorb_cutoffs["refill_p50"] = rs[int(n_r * 0.50)]  # HELD
+        absorb_cutoffs["traded_p75"] = ts[int(n_t * 0.75)]  # FORTRESS volume
+        absorb_cutoffs["traded_p50"] = ts[int(n_t * 0.50)]  # SOLID volume
+        absorb_cutoffs["traded_p25"] = ts[int(n_t * 0.25)]  # HELD volume
+    if len(ms["pull_samples"]) >= 30:
+        ps = sorted(ms["pull_samples"])
+        absorb_cutoffs["pull_p90"] = ps[int(len(ps) * 0.90)]  # FAKE spoof cutoff
 
-    # Kalman-filtered CV threshold (replaces laggy rolling mean)
-    # Uses Kalman state estimate ± sigma_mult * uncertainty
-    kalman = _KALMAN_CV[symbol]
-    if kalman._n >= 10:
-        # Use Kalman filter: faster regime tracking than rolling mean
-        mean_cv = kalman.state
-        std_cv = kalman.uncertainty
-    else:
-        # Fallback to rolling stats during Kalman warmup
-        mean_cv = ms["mean_cv"]
-        std_cv = ms["std_cv"]
-    ice_cv = max(0.12, round(mean_cv - sigma_mult * std_cv, 3))
-    drift_cv = max(0.15, round(ice_cv + 0.05, 3))  # drift always slightly looser
-
-    # Statistical significance fill count: N > log(target) / log(p)
-    # p = fraction of random clusters that accidentally look consistent
-    # target = regime-specific confidence level (e.g., 0.01 = 99% sure)
-    fill_rate = ms["fill_rate_b"] if side == "b" else ms["fill_rate_s"]
-    p_val = ms["p_coincidence"]
-    target = _REGIME_CONFIDENCE.get(regime, 0.01)
-
-    # N > log(target) / log(p)  — how many consistent fills for significance
-    if p_val < 0.99:  # avoid log(1) = 0 division
-        sig_fills = math.ceil(math.log(target) / math.log(p_val))
-    else:
-        sig_fills = 15  # if p ≈ 1.0, everything looks consistent, max out
-
-    ice_refill_count = max(3, min(20, sig_fills))
-    drift_min_fills = max(3, min(30, sig_fills + 2))  # drift needs slightly more
-
-
-    # Tick spread for drifting
-    drift_min_spread = _REGIME_SPREAD.get(regime, 4)
-
-    # Volume anomaly floor: clip must be above market_avg + 0.5σ
-    mean_clip = ms["mean_clip"]
-    std_clip = ms["std_clip"]
-    min_clip_sigma = max(1, int(mean_clip + 0.5 * std_clip))
-
-    result = {
-        "ice_cv": ice_cv,
-        "ice_refill_count": ice_refill_count,
-        "drift_cv": drift_cv,
-        "drift_min_fills": drift_min_fills,
-        "drift_min_spread": drift_min_spread,
-        "min_clip_sigma": min_clip_sigma,
-        "_adaptive": True,  # flag: using computed thresholds
-        "_mean_cv": round(mean_cv, 3),
-        "_std_cv": round(std_cv, 3),
-        "_fill_rate": round(fill_rate, 2),
-        "_sigma_mult": sigma_mult,
-        "_p_coincidence": round(p_val, 3),
-        "_confidence_target": target,
-
-    }
-
-    # Log adaptive thresholds every 60 seconds
     now = ms["last_stats_ts"]
-    if now - ms["last_adaptive_log"] >= 60:
+    if now - ms["last_adaptive_log"] >= 60 and absorb_cutoffs:
         ms["last_adaptive_log"] = now
-        hardcoded = _get_regime_thresholds()
+        ab_r90 = absorb_cutoffs.get("refill_p90")
+        ab_r75 = absorb_cutoffs.get("refill_p75")
+        ab_r50 = absorb_cutoffs.get("refill_p50")
+        ab_t75 = absorb_cutoffs.get("traded_p75")
+        ab_p90 = absorb_cutoffs.get("pull_p90")
         log.info(
-            f"[ADAPTIVE] {symbol} regime={regime} | "
-            f"cv={ice_cv:.3f} (σ: mean={mean_cv:.3f} std={std_cv:.3f} mult={sigma_mult}) "
-            f"fills={ice_refill_count} (p={p_val:.2f} target={target}) "
-            f"drift_fills={drift_min_fills} "
-            f"min_clip={min_clip_sigma} | "
-            f"OLD cv={hardcoded['ice_cv']} fills={hardcoded['ice_refill_count']}"
+            f"[ADAPTIVE] {symbol} regime={_CURRENT_REGIME} | "
+            f"absorb[F≥{ab_r90:.2f}/{ab_t75:.0f} S≥{ab_r75:.2f} "
+            f"H≥{ab_r50:.2f} FAKE≥{ab_p90:.2f}]"
         )
 
-
-    return result
-
+    return absorb_cutoffs
 
 
-# ── Iceberg Detection Constants (defaults, overridden by regime) ──
-_ICE_REFILL_COUNT     = 3       # min refills at same price to trigger
-_ICE_CV_THRESHOLD     = 0.35    # max coefficient of variation (stddev/mean) for clip consistency
-_ICE_MIN_CLIP_FLOOR   = 1       # absolute minimum clip size (never go below 1)
-_ICE_ZONE_TICKS       = 2       # ±2 ticks = adjacent prices count as same zone
-_ICE_ABSORB_MAX_MOVE  = 2       # price must stay within ±2 ticks to be "absorbing"
-
-# Tiered detection windows: (fallback_seconds, volume_multiplier, confidence_label)
-# volume_multiplier × empirical_bucket_size = actual volume window
-# Multipliers are structural: 1× = one bucket, 3× = three buckets, 10× = ten buckets
-# These are NOT guesses — they represent "how many statistical samples back to look"
-_ICE_WINDOWS = [
-    (5.0,   1,   "high"),    # 1 bucket  back = fast refill
-    (15.0,  3,   "medium"),  # 3 buckets back = patient algo
-    (60.0,  10,  "low"),     # 10 buckets back = very patient
-]
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # VOLUME CLOCK — τ(t) = ⌊(1/V_bucket) × Σv_i⌋
@@ -805,169 +636,11 @@ except ImportError:
     _VPIN_AVAILABLE = False
 
 
-# Per-symbol, per-fill volume-clock tagged tracker:
-# {symbol: {price_str: deque of (timestamp, volume, side, tau)}}
-_ICE_TRACKER_VTAG: dict = defaultdict(lambda: defaultdict(lambda: deque(maxlen=200)))
 
 # ── Rolling Trade Size Tracker (for adaptive min clip) ──
 # {symbol: deque of recent trade sizes, max 500}
 _TRADE_SIZE_HISTORY: dict = defaultdict(lambda: deque(maxlen=500))
 
-# ── Recent Trade Price Tracker (for iceberg absorption detection) ──
-# {symbol: deque of (timestamp, price), max 200}
-_ICE_PRICE_HISTORY: dict = defaultdict(lambda: deque(maxlen=200))
-
-# ── DOM Cross-Validation State (Elite Feature #1) ──
-# {symbol: {price_str: bid_size_int}}  — latest DOM bid sizes
-_DOM_BID_SNAP: dict = defaultdict(dict)
-# {symbol: {price_str: ask_size_int}}  — latest DOM ask sizes
-_DOM_ASK_SNAP: dict = defaultdict(dict)
-# {symbol: {price_str: bid_size_int}}  — PREVIOUS DOM bid sizes
-_DOM_BID_PREV: dict = defaultdict(dict)
-# {symbol: {price_str: ask_size_int}}
-_DOM_ASK_PREV: dict = defaultdict(dict)
-# Fills between DOM snapshots: {symbol: {price_str: total_vol}}
-_DOM_FILLS_PENDING: dict = defaultdict(lambda: defaultdict(int))
-
-# ── Drifting Iceberg State (Elite Feature #4) ──
-_DRIFT_WINDOW_SEC      = 30.0   # fallback time-based window
-
-# BUG A FIX: Cooldown guard — prevents the same drifting iceberg from firing
-# 9+ times from identical ring buffer data on consecutive trades.
-# One real drifting iceberg event = one signal per side per 30 seconds.
-_DRIFT_LAST_EMIT: dict = {}  # {(symbol, side): last_emit_timestamp}
-# _DRIFT_WINDOW_VOL: derived as 5× empirical bucket (set dynamically, no hardcode)
-_DRIFT_MIN_FILLS       = 5      # need at least 5 same-side fills
-_DRIFT_MAX_CV          = 0.40   # clip consistency (looser for drift)
-_DRIFT_MIN_PRICE_SPREAD = 3     # must span 3+ distinct prices
-# {symbol: {"b": deque, "s": deque}} — now includes tau tag
-_DRIFT_TRACKER: dict = defaultdict(lambda: {"b": deque(maxlen=100),
-                                             "s": deque(maxlen=100)})
-
-# ── Level Memory State (Elite Feature #5) ──
-# {symbol: {price_str: {"count": N, "total_vol": V, "last_side": s, "last_ts": T, "avg_size": f}}}
-_ICE_LEVEL_MEMORY: dict = defaultdict(lambda: defaultdict(lambda: {
-    "count": 0, "total_vol": 0, "last_side": "", "last_ts": 0, "avg_size": 0.0
-}))
-
-# ── Post-Iceberg Prediction State (Elite Feature #6) ──
-# {symbol: deque of outcome dicts, maxlen=100}
-_ICE_OUTCOMES: dict = defaultdict(lambda: deque(maxlen=100))
-
-# ── Seller Exhaustion Memory ──
-# When a SHORT iceberg (side=b, ask wall) resolves with NEGATIVE outcome
-# (sellers tried to drive price down but it DIDN'T go down), that is a
-# seller exhaustion event. Store it so Long entries can require confirmation.
-# Data proof: Long WITH prior failed short = 69% WR vs 37% WR without (+32pp).
-# Structure: {symbol: deque of {ts, price} dicts, maxlen=20}
-_SELLER_EXHAUSTION: dict = defaultdict(lambda: deque(maxlen=20))
-
-# ── Buyer Exhaustion Memory ──
-# When a LONG iceberg (side=s, bid wall) resolves with NEGATIVE outcome
-# (buyers tried to hold a bid wall, price broke through them), that is a
-# buyer exhaustion event. Store it so Short entries can require confirmation.
-# Data proof: Short WITH prior failed long = 73% WR vs 51% WR without (+22pp).
-_BUYER_EXHAUSTION: dict = defaultdict(lambda: deque(maxlen=20))
-
-# ── Volatile CV Tier constants ──
-# Sweep of 1,957 exhaustion events: inflection at CV=0.12.
-# Below 0.12 = calm tape, WR=70%, mean=+4pt (solid baseline).
-# 0.12-0.25  = volatile tape, WR=80%, mean=+8pt (target tier).
-# Above 0.25 = shock events, WR=82% but only 90 trades in 5 days — too sparse.
-# Use volatile tier as quality filter on exhaustion events.
-_EX_CV_VOLATILE_LO: float = 0.12
-_EX_CV_VOLATILE_HI: float = 0.25
-
-# ── Level Failure Memory (Double-Rejection) ──
-# Tracks how many times the OPPOSING side has failed at a price level recently.
-# Data proof (4,161 outcome events, deduped, sequential):
-#   No prior fail             = 39% WR, mean -2.21 (base noise)
-#   1 prior fail within 3min  = 55% WR, mean +1.53 (+16pp lift)
-#   2+ prior fails within 3min= 62% WR, mean +3.02 (+23pp lift)
-# Combined with volatile CV: 67% WR, mean +2.61 on 451 clean trades.
-# Structure: {(symbol, price_bucket, side): deque of failure timestamps}
-# price_bucket = round(price/2.5)*2.5 (10-tick grid for NQ, ~2.5pt for ES)
-_LEVEL_FAIL_MEMORY: dict = defaultdict(lambda: deque(maxlen=20))
-_LEVEL_FAIL_WINDOW: float = 180.0  # 3-minute failure window
-
-# ── Cross-Symbol Co-Exhaustion (Feature 11) ──
-# When NQ AND ES fail the same directional iceberg within 30s,
-# the signal spans both contracts — highest institutional conviction.
-# Key: side ('b' or 's'); value: deque of {ts, symbol, price}
-_CROSS_SYM_EXHAUSTION: dict = defaultdict(lambda: deque(maxlen=50))
-_CROSS_SYM_WINDOW: float = 30.0
-_CROSS_SYM_SYMBOLS: set = {'NQ', 'ES', 'GC'}
-
-# ── Live Ψ Pre-Detection State (Feature 12) ──
-# Stores the most recently computed absorption coefficient per symbol.
-# Used by the pre-detection Ψ filter in _record_iceberg_completion.
-# Updated every time an iceberg fires: {symbol: {ts, psi, side}}
-_LIVE_PSI: dict = {}
-
-# ── Footprint / Cumulative Delta Engine ──
-# Tracks cumulative buy/sell volume at each exact price level within the
-# current 1-minute candle. This is the institutional absorption fingerprint.
-#
-# True Absorption fingerprint:
-#   sell_vol >> buy_vol at a level (net sellers)  -> delta is VERY negative
-#   BUT the bid price stays anchored at that level -> hidden buyer eating every seller
-#   Result: price reverses 40+ points
-#
-# False Absorption / Falling Knife:
-#   sell_vol >> buy_vol at a level (net sellers)
-#   AND the bid moves DOWN after each fill -> no buyer, thin book
-#   Result: price collapses through the level
-#
-# Structure: {symbol: {
-#     'candle_ts': int,          # current 1-min candle start timestamp
-#     'levels': {price: {
-#         'buy_vol': int,         # aggressive buy volume at this price
-#         'sell_vol': int,        # aggressive sell volume at this price
-#         'bid_anchored': int,    # times bid STAYED at this price after a sell hit
-#         'bid_dropped': int,     # times bid DROPPED after a sell hit (falling knife)
-#         'n_trades': int,
-#     }}
-# }}
-_FOOTPRINT: dict = defaultdict(lambda: {
-    'candle_ts': 0,
-    'levels': defaultdict(lambda: {
-        'buy_vol':      0,
-        'sell_vol':     0,
-        'bid_anchored': 0,  # sell hit bid, bid stayed (buyer wall holding)
-        'bid_dropped':  0,  # sell hit bid, bid moved away (falling knife)
-        'ask_anchored': 0,  # buy lifted ask, ask stayed (seller wall holding)
-        'ask_dropped':  0,  # buy lifted ask, ask moved away (exhausted ask wall)
-        'n_trades':     0,
-    })
-})
-_FOOTPRINT_CANDLE_SEC: int = 60  # 1-minute candle footprint
-_FOOTPRINT_ZONE_TICKS: int = 4   # check ±4 ticks around iceberg price for absorption zone
-# {symbol: list of pending outcome checks}
-_ICE_PENDING: dict = defaultdict(list)
-
-# BUG D FIX: Dedup guard for multi-timeframe candle loop.
-# _record_iceberg_completion is called once per candle TF (30s/60s/300s/etc)
-# for the same ice_hit — creating 3x duplicate pending outcomes at same price/ts.
-_ICE_DEDUP_SEEN: dict = {}   # {(symbol, round(price,2), side, round(ts,1)): emit_ts}
-_ICE_DEDUP_TTL  = 60.0         # purge keys older than 60s
-
-# BUG B FIX: Kill combo filter. Was declared as a local variable inside
-# _record_iceberg_completion() and _detect_iceberg(), resetting to empty set on
-# every call — making the filter permanently dead. Now module-level so it persists.
-# Re-populate after 10+ sessions of corrected-direction OOS data.
-_KILL_COMBOS: set = set()
-
-# ── Wall Gone Detection State ──
-_ICE_GONE_TIMEOUT = 3.0  # seconds without refill = wall gone
-# {symbol: {price_str: {"last_refill_ts": T, "was_active": bool, "gone_announced": bool}}}
-_ICE_WALL_STATE: dict = defaultdict(lambda: defaultdict(lambda: {
-    "last_refill_ts": 0, "was_active": False, "gone_announced": False
-}))
-
-# ── DOM Band Depth Tracking (Drifting Layer 2) ──
-# {symbol: {"b": deque of (ts, total_depth, fills_since_last), "s": deque}}
-_DOM_BAND_DEPTH: dict = defaultdict(lambda: {"b": deque(maxlen=50),
-                                              "s": deque(maxlen=50)})
 
 # ── Sweep Detection Constants ──
 _SWEEP_MIN_LEVELS     = 3       # min consecutive price levels swept
@@ -975,11 +648,9 @@ _SWEEP_WINDOW_SEC     = 0.200   # 200ms window for sweep
 _SWEEP_MIN_VOLUME     = 100     # total swept volume threshold (~$2M notional on NQ)
 
 # ── Detection State ──
-# _ICE_TRACKER: {symbol: {quantized_price_str: [(timestamp, volume, side), ...]}}
-_ICE_TRACKER: dict = defaultdict(lambda: defaultdict(lambda: deque(maxlen=200)))
 # _SWEEP_TRACKER: {symbol: [(timestamp, price, volume, side), ...]}
 _SWEEP_TRACKER: dict = defaultdict(deque)
-# Detected results attached to current candle: {symbol: {tf: {icebergs: {}, sweeps: []}}}
+# Detected results attached to current candle: {symbol: {tf: {sweeps: []}}}
 _DETECT_RESULTS: dict = defaultdict(lambda: defaultdict(dict))
 
 # ── Cumulative Delta Divergence Constants ──
@@ -1027,1264 +698,6 @@ _DOM_PREV: dict = defaultdict(dict)
 _SPOOF_TRACKER: dict = defaultdict(lambda: defaultdict(list))
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ELITE HELPER FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _dom_update_snapshots(symbol: str, dom: dict):
-    """Called from on_dom_update to store bid/ask snapshots for cross-validation."""
-    _DOM_BID_PREV[symbol] = _DOM_BID_SNAP[symbol].copy()
-    _DOM_ASK_PREV[symbol] = _DOM_ASK_SNAP[symbol].copy()
-    new_bids = {}
-    new_asks = {}
-    for lvl in dom.get("bids", []):
-        if isinstance(lvl, dict):
-            p = str(lvl.get("price", ""))
-            if p:
-                new_bids[p] = lvl.get("size", 0)
-    for lvl in dom.get("asks", []):
-        if isinstance(lvl, dict):
-            p = str(lvl.get("price", ""))
-            if p:
-                new_asks[p] = lvl.get("size", 0)
-    _DOM_BID_SNAP[symbol] = new_bids
-    _DOM_ASK_SNAP[symbol] = new_asks
-    # Resolve pending fill validations
-    _DOM_FILLS_PENDING[symbol].clear()
-
-
-def _dom_cross_validate(symbol: str, price_str: str,
-                        volume: int, side: str):
-    """DOM cross-validation: check if order book refilled after a fill.
-    Returns (dom_confidence, refill_amount)."""
-    _DOM_FILLS_PENDING[symbol][price_str] += volume
-    if side == "b":
-        # Buyer lifted the ask → check ask side
-        dom_before = _DOM_ASK_PREV[symbol].get(price_str, 0)
-        dom_after = _DOM_ASK_SNAP[symbol].get(price_str, 0)
-    else:
-        # Seller hit the bid → check bid side
-        dom_before = _DOM_BID_PREV[symbol].get(price_str, 0)
-        dom_after = _DOM_BID_SNAP[symbol].get(price_str, 0)
-    if dom_before == 0:
-        return ("unconfirmed", 0)
-    expected = max(0, dom_before - volume)
-    refill = dom_after - expected
-    if refill <= 0:
-        return ("unconfirmed", 0)
-    ratio = refill / max(volume, 1)
-    if ratio > 0.8:
-        return ("confirmed", refill)
-    elif ratio > 0.3:
-        return ("likely", refill)
-    elif ratio > 0.0:
-        return ("possible", refill)
-    return ("unconfirmed", 0)
-
-
-def _analyze_fill_timing(fills_in_window):
-    """Inter-fill timing analysis (IAT Variance Test).
-    Tests whether a sequence of fills exhibits the statistical
-    signature of algorithmic execution:
-    1. Low/Moderate CV on inter-arrival times (pacing, not uniform).
-    2. Autocorrelation near zero (not a simple timer loop).
-    Returns (iat_confidence_float, timing_label_str).
-    """
-    if len(fills_in_window) < 3:
-        return (0.0, "insufficient")
-    timestamps = sorted([f[0] for f in fills_in_window])
-    gaps = [timestamps[i + 1] - timestamps[i] for i in range(len(timestamps) - 1)]
-    gaps = [g for g in gaps if g > 0]
-    
-    if not gaps:
-        return (0.0, "instant")
-        
-    n_gaps = len(gaps)
-    mean_gap = sum(gaps) / n_gaps
-    if mean_gap == 0:
-        return (0.0, "instant")
-        
-    variance = sum((g - mean_gap) ** 2 for g in gaps) / n_gaps
-    gap_cv = (variance ** 0.5) / mean_gap
-    
-    # Lag-1 Autocorrelation (do consecutive gaps correlate?)
-    autocorr = 0.0
-    if n_gaps >= 3 and variance > 0:
-        num = sum((gaps[i] - mean_gap) * (gaps[i+1] - mean_gap) for i in range(n_gaps - 1))
-        # strictly should trace variances but this is a fast approximation
-        autocorr = num / (variance * (n_gaps - 1))
-        
-    # Classification:
-    # Naive algo (loop): CV near 0, autocorr near 0/undefined
-    # Modern algo (TWAP randomized): CV 0.3 - 0.8, autocorr near 0 (independent draws)
-    # Retail / Panic: CV > 1.0 (bursty), autocorr positive (clustering)
-    abs_ac = abs(autocorr)
-    
-    if gap_cv < 0.2:
-        return (0.4, "naive_loop")  # Too perfect, easily gamable bot
-    elif 0.2 <= gap_cv <= 0.8 and abs_ac < 0.4:
-        return (0.9, "algo_confirmed")  # Randomized pacing, independent
-    elif gap_cv < 1.2:
-        return (0.6, "algo_likely")
-    else:
-        return (0.2, "random")
-
-
-def _detect_drifting_iceberg(symbol: str, price_f: float, volume: int,
-                              timestamp: float, side: str):
-    """Drifting iceberg detection — 3-layer multi-level detection.
-    Layer 1: Behavioral fingerprint (clip CV across all prices)
-    Layer 2: DOM total depth anomaly (depth_leak_ratio)
-    Layer 3: Timing regularity (gap CV)
-    """
-    if side == "n":
-        return None
-    # ── σ-adaptive thresholds (falls back to hardcoded during warmup) ──
-    _rt = _get_adaptive_thresholds(symbol, side)
-    drift_min_fills = _rt["drift_min_fills"]
-    drift_min_spread = _rt["drift_min_spread"]
-    drift_cv_max = _rt["drift_cv"]
-
-    tracker = _DRIFT_TRACKER[symbol][side]
-    tracker.append((timestamp, price_f, volume))
-
-    # ── Volume Clock windowing (primary) vs time-based (fallback) ──
-    vclock = _VOLUME_CLOCKS[symbol]
-    if vclock.warm:
-        # Drift uses 5× bucket multiplier (between iceberg 3× and 10×)
-        drift_ticks_back = 5
-        avg_bucket_sec = vclock.get_avg_bucket_duration()
-        if avg_bucket_sec > 0:
-            approx_sec = drift_ticks_back * avg_bucket_sec
-            cutoff = timestamp - approx_sec
-        else:
-            cutoff = timestamp - _DRIFT_WINDOW_SEC
-    else:
-        cutoff = timestamp - _DRIFT_WINDOW_SEC
-
-    recent = [(t, p, v) for t, p, v in tracker if t >= cutoff]
-    if len(recent) < drift_min_fills:
-        return None
-    prices = set(round(p, 2) for _, p, _ in recent)
-    # Price RANGE check in ticks (not just count of distinct prices)
-    # Requires the drift to span a meaningful range, not just walk the book
-    tick_size = TICK_SIZES.get(symbol, DEFAULT_TICK_SIZE)
-    price_range_ticks = (max(prices) - min(prices)) / tick_size
-    if price_range_ticks < drift_min_spread:
-        return None
-
-    vols = [v for _, _, v in recent]
-    mean_v = sum(vols) / len(vols)
-    if mean_v == 0:
-        return None
-    var = sum((v - mean_v) ** 2 for v in vols) / len(vols)
-    cv = (var ** 0.5) / mean_v
-    if cv > drift_cv_max:
-        return None
-
-    # ── Layer 2: DOM Total Depth Anomaly ──
-    # Check if total bid/ask depth in the band barely dropped despite fills
-    band_low = min(p for _, p, _ in recent)
-    band_high = max(p for _, p, _ in recent)
-    dom_leak = None
-    dom_snap = _DOM_BID_SNAP[symbol] if side == "s" else _DOM_ASK_SNAP[symbol]
-    if dom_snap:
-        # Total current depth across the band
-        actual_depth = 0
-        for ps, sz in dom_snap.items():
-            try:
-                pf = float(ps)
-                if band_low <= pf <= band_high:
-                    actual_depth += sz
-            except (ValueError, TypeError):
-                pass
-        total_fills = sum(vols)
-        # Check depth history for this side
-        depth_history = _DOM_BAND_DEPTH[symbol][side]
-        if depth_history:
-            # Use the oldest depth snapshot in our window
-            oldest_depth = depth_history[0][1]
-            expected_depth = max(0, oldest_depth - total_fills)
-            if total_fills > 0:
-                dom_leak = round((actual_depth - expected_depth) / total_fills, 2)
-        # Record current depth for future comparisons
-        depth_history.append((timestamp, actual_depth, sum(vols)))
-
-    # ── Layer 3: Timing analysis ──
-    iat_confidence, timing = _analyze_fill_timing([(t, 0, "") for t, _, _ in recent])
-
-    # ── Composite confidence (all 3 layers) ──
-    score = 0
-    # Layer 1: Clip consistency
-    if cv < 0.25:
-        score += 2
-    elif cv < 0.40:
-        score += 1
-    # Layer 2: DOM depth anomaly
-    if dom_leak is not None and dom_leak > 0.5:
-        score += 2  # hidden liquidity confirmed
-    elif dom_leak is not None and dom_leak > 0.2:
-        score += 1  # some hidden liquidity
-    # Layer 3: Timing regularity
-    if timing in ("algo_confirmed",):
-        score += 2
-    elif timing in ("algo_likely",):
-        score += 1
-
-    drift_conf = "confirmed" if score >= 4 else "likely" if score >= 2 else "possible"
-
-    # BUG A FIX: Cooldown guard — one drifting iceberg = one signal per 30s per (symbol, side).
-    # Without this, every consecutive trade re-checks the same ring buffer data and
-    # re-fires the detection (confirmed: 9+ identical vol=103 signals in server.log).
-    _cooldown_sec = 30.0
-    _emit_key = (symbol, side)
-    _last_emit = _DRIFT_LAST_EMIT.get(_emit_key, 0)
-    if timestamp - _last_emit < _cooldown_sec:
-        return None  # suppress duplicate — same ring buffer, same signal
-    _DRIFT_LAST_EMIT[_emit_key] = timestamp
-
-    return {
-        "type": "drifting",
-        "fills": len(recent),
-        "prices_hit": len(prices),
-        "band_low": round(band_low, 2),
-        "band_high": round(band_high, 2),
-        "band_range": round(band_high - band_low, 2),
-        "total_vol": sum(vols),
-        "avg_clip": round(mean_v, 1),
-        "cv": round(cv, 3),
-        "side": side,
-        "iat_confidence": iat_confidence,
-        "timing": timing,
-        "dom_leak": dom_leak,
-        "drift_confidence": drift_conf,
-    }
-
-
-def _update_level_memory(symbol: str, price_str: str, iceberg_result: dict):
-    """Record iceberg detection at this level for historical tracking."""
-    mem = _ICE_LEVEL_MEMORY[symbol][price_str]
-    mem["count"] += 1
-    mem["total_vol"] += iceberg_result.get("est_hidden", 0)
-    mem["last_side"] = iceberg_result.get("side", "")
-    mem["last_ts"] = time.time()
-    mem["avg_size"] = mem["total_vol"] / max(mem["count"], 1)
-
-
-def _record_iceberg_completion(symbol: str, price: float, side: str,
-                                ts: float, size_rank: str, confidence: str,
-                                state_vector: dict = None):
-    """Schedule outcome checks for post-iceberg prediction.
-    state_vector: snapshot of detection-time features for JSONL logging.
-    """
-    # BUG D FIX: Dedup guard — multi-TF candle loop calls this once per timeframe
-    # for the SAME detection, producing 3 identical pending outcomes.
-    _now = time.time()
-    _dedup_key = (symbol, round(price, 2), side, round(ts, 1))
-    if _dedup_key in _ICE_DEDUP_SEEN:
-        return  # already registered this detection
-    _ICE_DEDUP_SEEN[_dedup_key] = _now
-    # ── Phase 6 Alpha Filters (universal choke point) ──
-    # NOTE: Kill combos were reset after discovering direction inversion bug.
-    # Old combos were calibrated on inverted PnL — they were killing WINNING signals.
-    # With correct direction semantics:
-    #   side="s" = bid iceberg → LONG  (buyer wall absorbing sellers)
-    #   side="b" = ask iceberg → SHORT (seller wall absorbing buyers)
-    # Fresh kill combos will be re-derived from corrected OOS data.
-    # BUG B FIX: _KILL_COMBOS is now module-level (not re-declared here as local).
-    # Previous local `_KILL_COMBOS: set = set()` reset to empty on every call.
-    current_regime = _CURRENT_REGIME
-    if state_vector:
-        current_regime = state_vector.get('regime', _CURRENT_REGIME)
-    if (current_regime, side) in _KILL_COMBOS:
-        return  # suppress toxic combo entirely
-
-    # ── Seller Exhaustion Gate for LONG signals ──
-    # Data: Long WITH prior failed short nearby = 69% WR vs 37% WR without (+32pp).
-    # Require at least one seller exhaustion event in the past 120s within 5pts
-    # of the current entry price before allowing a LONG to fire.
-    # This filters out "catching falling knives" — only Longs after sellers FAIL.
-    #
-    # Exception: skip this gate if we have no exhaustion history yet (< 10 resolved
-    # outcomes in memory) to avoid blocking valid signals during session warmup.
-    _LONG_ALLOWED_REGIMES  = {"short_gamma_volatile", "crash_tail_risk", "transition"}
-    _SHORT_ALLOWED_REGIMES = {"long_gamma_stable", "pin_mean_revert", "transition"}
-    _exhaustion_window     = 120.0  # seconds
-    _exhaustion_band       = 5.0    # pts price proximity
-    _warmed                = len(_ICE_OUTCOMES.get(symbol, [])) >= 10
-
-    def _check_exhaustion_gate(direction: str) -> bool:
-        """Return False (block) if exhaustion gate not satisfied. direction='long' or 'short'."""
-        is_long       = direction == "long"
-        allowed       = _LONG_ALLOWED_REGIMES if is_long else _SHORT_ALLOWED_REGIMES
-        label         = "LONG" if is_long else "SHORT"
-        ex_dict       = _SELLER_EXHAUSTION if is_long else _BUYER_EXHAUSTION
-        co_side_key   = "b" if is_long else "s"
-        opp_label     = "seller" if is_long else "buyer"
-
-        if current_regime not in allowed:
-            log.debug(f"[REGIME-GATE] BLOCKED {label} in regime={current_regime}")
-            return False
-        if not _warmed:
-            return True
-        recent = ex_dict.get(symbol)
-        if not recent:
-            log.debug(f"[EXHAUSTION-GATE] BLOCKED {label} @ {price:.2f} — no {opp_label} exhaustion memory")
-            return False
-        volatile = any(
-            ts - e["ts"] <= _exhaustion_window
-            and abs(price - e["price"]) <= _exhaustion_band
-            and _EX_CV_VOLATILE_LO <= e.get("cv", 0) <= _EX_CV_VOLATILE_HI
-            for e in recent
-        )
-        any_ex = volatile or any(
-            ts - e["ts"] <= _exhaustion_window
-            and abs(price - e["price"]) <= _exhaustion_band
-            for e in recent
-        )
-        if not any_ex:
-            log.debug(f"[EXHAUSTION-GATE] BLOCKED {label} @ {price:.2f} — no {opp_label} exhaustion")
-            return False
-        if not volatile:
-            log.debug(f"[CV-PREFER] {label} @ {price:.2f} — calm-tape exhaustion (weaker)")
-        # Cross-symbol co-exhaustion boost (Feature 11 — log only, no hard gate yet)
-        co = [e for e in _CROSS_SYM_EXHAUSTION.get(co_side_key, [])
-              if e["symbol"] != symbol and ts - e["ts"] <= _CROSS_SYM_WINDOW]
-        if co:
-            log.info(f"[CO-EXHAUST] {label} confirmed by {co[-1]['symbol']} {opp_label} exhaustion")
-        return True
-
-    if side == "s" and not _check_exhaustion_gate("long"):
-        return
-    elif side == "b" and not _check_exhaustion_gate("short"):
-        return
-
-    # CV Gate: low Kalman CV = noise, not signal
-    # Re-evaluate threshold after collecting corrected-direction OOS data.
-    kalman = _KALMAN_CV.get(symbol)
-    if kalman and kalman._n > 250 and kalman.state < 0.04:
-        return  # suppress noise-regime signals
-
-    # ── Directional Gate: Cross-Asset Consensus ──
-    # Iceberg gives +6.6 pts entry alpha but no directional edge.
-    # GEX/MM/0DTE from EdgeDetector provides the directional bias.
-    # BLOCK when cross-asset signals contradict iceberg direction.
-    #
-    # Direction semantics (corrected):
-    #   side="s" (sell aggressor hitting bid) → bid iceberg → buyer wall → LONG
-    #   side="b" (buy aggressor lifting ask) → ask iceberg → seller wall → SHORT
-    if _cross_asset_provider:
-        try:
-            ctx = _cross_asset_provider(symbol)
-            if ctx:
-                iceberg_is_long = (side != 'b')  # side="s" → LONG, side="b" → SHORT
-
-                # MM withdrawal direction: -1=bearish (pulled bids), +1=bullish, 0=neutral
-                mm_bias = ctx.get('mm_pull_bias', 0)
-                gex_zone = ctx.get('gex_zone', 'NO_DATA')
-                gex_factor = ctx.get('gex_factor', 1.0)
-
-                # HARD BLOCK: MM consensus directly contradicts iceberg direction
-                # AND GEX structure confirms the contra-move
-                #   LONG iceberg + MM bearish + below gamma flip = likely steamrolled
-                #   SHORT iceberg + MM bullish + above gamma flip = likely short-squeezed
-                if iceberg_is_long and mm_bias == -1:
-                    # MMs pulling bids → bearish. Is GEX also against us?
-                    gex_contra = gex_zone in (
-                        'AT_PUT_WALL_BREAKOUT',  # near put wall breaking down
-                        'SHORT_GAMMA_ZONE',       # below flip → amplified downside
-                        'AT_GAMMA_FLIP',          # at flip → volatile, direction unclear
-                    )
-                    if gex_contra or gex_factor < 0.8:
-                        log.info(
-                            f"[DIRECTIONAL-GATE] BLOCKED LONG iceberg @ {price}: "
-                            f"MM={mm_bias} GEX={gex_zone}({gex_factor:.2f})"
-                        )
-                        return
-
-                elif not iceberg_is_long and mm_bias == 1:
-                    # MMs pulling asks → bullish. Is GEX also against us?
-                    gex_contra = gex_zone in (
-                        'AT_CALL_WALL_BREAKOUT',  # near call wall breaking up
-                        'LONG_GAMMA_ZONE',         # above flip → dampened downside
-                    )
-                    if gex_contra or gex_factor < 0.8:
-                        log.info(
-                            f"[DIRECTIONAL-GATE] BLOCKED SHORT iceberg @ {price}: "
-                            f"MM={mm_bias} GEX={gex_zone}({gex_factor:.2f})"
-                        )
-                        return
-
-                # Log cross-asset context for all passed trades (for future analysis)
-                # Note: safe to mutate — caller creates a fresh dict each time,
-                # and pending.update(dict(state_vector)) copies at line 1478.
-                if state_vector is not None:
-                    state_vector['mm_bias_at_detect'] = mm_bias
-                    state_vector['gex_zone_at_detect'] = gex_zone
-                    state_vector['gex_factor_at_detect'] = gex_factor
-        except Exception as e:
-            log.debug(f"[DIRECTIONAL-GATE] Cross-asset check error: {e}")
-            # Don't block if cross-asset data is unavailable
-
-    # FIX 9: Capture mid-price at detection time for realized spread computation.
-    # realized_spread = |outcome_price - mid_at_detect| = actual MM edge realized
-    # BUG 4 FIX: Was reading L2_STATE["dom"][symbol] without _L2_LOCK (race condition).
-    # mid_prices dict is written under _L2_LOCK — must read under lock too.
-    with _L2_LOCK:
-        _mid_detect = L2_STATE["mid_prices"].get(symbol, price)
-
-    # ── Double-Rejection: count prior failures of opposing side at this level ──
-    # Opposing side key: the side that WOULD FAIL to produce this signal
-    #   LONG signal (side=s) → prior seller failures (side=b) at same level
-    #   SHORT signal (side=b) → prior buyer failures (side=s) at same level
-    _opp_side      = "b" if side == "s" else "s"
-    _px_b          = round(price / 2.5) * 2.5
-    _fail_key_opp  = (symbol, _px_b, _opp_side)
-    _prior_fails   = [t for t in _LEVEL_FAIL_MEMORY.get(_fail_key_opp, [])
-                      if ts - t <= _LEVEL_FAIL_WINDOW]
-    _n_prior_fails = len(_prior_fails)
-
-    # Determine signal quality tier
-    _cur_cv = _KALMAN_CV[symbol].state if symbol in _KALMAN_CV else 0.0
-    _is_volatile_cv = _EX_CV_VOLATILE_LO <= _cur_cv <= _EX_CV_VOLATILE_HI
-    _true_abs = state_vector.get("true_absorption", False) if state_vector else False
-    if _true_abs:
-        # True absorption confirmed by footprint: bid held under massive sell pressure.
-        # This is the strongest structural signal we can produce. Always HQ.
-        _sig_tier = "HQ"   # Footprint-confirmed: bid held against negative delta
-    elif _n_prior_fails >= 2 and _is_volatile_cv:
-        _sig_tier = "HQ"   # 67% WR, +2.61 mean — double rejection in volatile tape
-    elif _n_prior_fails >= 1 or _is_volatile_cv:
-        _sig_tier = "MQ"   # 55-62% WR — one condition met
-    else:
-        _sig_tier = "LQ"   # 39-50% WR — baseline, no prior failure context
-
-    pending = {
-        "side": side, "price": price, "ts": ts,
-        "size_rank": size_rank, "confidence": confidence,
-        "n_prior_fails": _n_prior_fails,   # opposing-side failure count at this level
-        "signal_tier": _sig_tier,          # HQ / MQ / LQ
-        "check_10s": ts + 10, "check_30s": ts + 30, "check_60s": ts + 60,
-        "outcome_10s": None, "outcome_30s": None, "outcome_60s": None,
-        # Intra-window MAE/MFE tracking
-        "mfe": 0.0, "mae": 0.0,
-        "mfe_10s": None, "mae_10s": None,
-        "mfe_30s": None, "mae_30s": None,
-        "mfe_60s": None, "mae_60s": None,
-        # Realized spread
-        "mid_at_detect": round(_mid_detect, 4),
-        "realized_spread_10s": None,
-        "realized_spread_30s": None,
-        "realized_spread_60s": None,
-    }
-    if state_vector:
-        pending.update(dict(state_vector))  # copy to prevent mutation leak
-    _ICE_PENDING[symbol].append(pending)
-
-
-def _check_pending_outcomes(symbol: str, current_price: float, current_ts: float):
-    """Resolve pending post-iceberg outcome checks and track intra-window MFE/MAE.
-    Phase 7: Also tracks dynamic SL = max(3.0, CV*100) exit simulation.
-
-    DIRECTION SEMANTICS (critical):
-      p["side"] is the AGGRESSOR side — who is hitting the iceberg.
-      side="s" (sell aggressor repeatedly hitting bid) → BID ICEBERG → buyer's wall → LONG
-      side="b" (buy aggressor repeatedly lifting ask) → ASK ICEBERG → seller's wall → SHORT
-      Therefore: direction = -1 if side=="b" else 1
-      (Trade WITH the iceberg, AGAINST the aggressor.)
-    """
-    still_pending = []
-    for p in _ICE_PENDING[symbol]:
-        direction = -1 if p["side"] == "b" else 1   # FIXED: was 1 if "b" else -1 (inverted)
-        pnl = round((current_price - p["price"]) * direction, 2)
-
-        # Continually update MFE/MAE while trade is active
-        p["mfe"] = max(p["mfe"], pnl)
-        p["mae"] = min(p["mae"], pnl)
-
-        # ── Dynamic SL: cv-adaptive, floored at 2pts ──
-        # Computed ONCE at entry. cv*100 = Kalman volatility estimate in pts.
-        # floor at 2.0 so fast scalp markets don't get stopped out by noise.
-        if "dynamic_sl" not in p:
-            cv = _KALMAN_CV[symbol].state if symbol in _KALMAN_CV else 0.05
-            p["dynamic_sl"] = round(max(2.0, cv * 100), 2)
-            p["dynamic_sl_hit"] = False
-            p["dynamic_sl_hit_ts"] = None
-            p["dynamic_sl_pnl"] = None
-
-        if not p["dynamic_sl_hit"] and pnl <= -p["dynamic_sl"]:
-            p["dynamic_sl_hit"] = True
-            p["dynamic_sl_hit_ts"] = current_ts
-            p["dynamic_sl_pnl"] = round(-p["dynamic_sl"], 2)
-
-        # ── BUG C FIX: If SL was hit, cap realized PnL at stop level ──
-        # Previously dynamic_sl_hit was RECORDED but never applied — pnl kept
-        # bleeding to -10pts over 60s even after stop was triggered.
-        # Data shows 80% of LONG losers hit -2pts MAE; mean loser bleeds to -7.88.
-        # Cap at the stop so outcome windows reflect actual realized loss.
-        if p["dynamic_sl_hit"]:
-            pnl = min(pnl, p["dynamic_sl_pnl"])  # can't be worse than stop
-        # Emergency floor: if dynamic_sl somehow missed initialization, -4pt hard stop
-        pnl = max(pnl, -4.0)
-
-        if p["outcome_10s"] is None and current_ts >= p["check_10s"]:
-            p["outcome_10s"] = pnl
-            p["mfe_10s"] = p["mfe"]
-            p["mae_10s"] = p["mae"]
-            if p.get("mid_at_detect") is not None:
-                p["realized_spread_10s"] = round(abs(current_price - p["mid_at_detect"]), 4)
-
-            # ── Exhaustion memory: write at 10s resolution, not 60s ──
-            # OOS backtest (deduped, no look-ahead, 30% holdout):
-            #   60s exhaustion → only 27 allowed trades, barely enough signal
-            #   10s exhaustion → 368 allowed trades, 62% WR, +713 pts on OOS set
-            # Threshold -0.5pt at 10s is sufficient — if price didn't move half a pt
-            # in the direction the opposing iceberg predicted within 10 seconds,
-            # those traders are already exhausted. No need to wait 60s.
-            _EX_THRESH = -0.5
-            _ex_cv = _KALMAN_CV[symbol].state if symbol in _KALMAN_CV else 0.0
-            if p["side"] == "b" and pnl < _EX_THRESH:
-                _SELLER_EXHAUSTION[symbol].append({"ts": current_ts, "price": p["price"], "cv": _ex_cv})
-                log.debug(f"[EXHAUSTION-10s] Seller @ {p['price']:.2f} cv={_ex_cv:.3f}")
-                # FEATURE 11: Cross-symbol co-exhaustion write
-                if symbol in _CROSS_SYM_SYMBOLS:
-                    _CROSS_SYM_EXHAUSTION["b"].append({"ts": current_ts, "symbol": symbol, "price": p["price"]})
-            elif p["side"] == "s" and pnl < _EX_THRESH:
-                _BUYER_EXHAUSTION[symbol].append({"ts": current_ts, "price": p["price"], "cv": _ex_cv})
-                log.debug(f"[EXHAUSTION-10s] Buyer  @ {p['price']:.2f} cv={_ex_cv:.3f}")
-                # FEATURE 11: Cross-symbol co-exhaustion write
-                if symbol in _CROSS_SYM_SYMBOLS:
-                    _CROSS_SYM_EXHAUSTION["s"].append({"ts": current_ts, "symbol": symbol, "price": p["price"]})
-
-            # ── Level Failure Memory: track failures for double-rejection signal ──
-            if pnl < _EX_THRESH:
-                _px_bucket = round(p["price"] / 2.5) * 2.5
-                _fail_key  = (symbol, _px_bucket, p["side"])
-                _LEVEL_FAIL_MEMORY[_fail_key].append(current_ts)
-                # Purge entries older than the window
-                while _LEVEL_FAIL_MEMORY[_fail_key] and \
-                      current_ts - _LEVEL_FAIL_MEMORY[_fail_key][0] > _LEVEL_FAIL_WINDOW:
-                    _LEVEL_FAIL_MEMORY[_fail_key].popleft()
-
-        if p["outcome_30s"] is None and current_ts >= p["check_30s"]:
-            p["outcome_30s"] = pnl
-            p["mfe_30s"] = p["mfe"]
-            p["mae_30s"] = p["mae"]
-            if p.get("mid_at_detect") is not None:
-                p["realized_spread_30s"] = round(abs(current_price - p["mid_at_detect"]), 4)
-
-        if p["outcome_60s"] is None and current_ts >= p["check_60s"]:
-            p["outcome_60s"] = pnl
-            p["mfe_60s"] = p["mfe"]
-            p["mae_60s"] = p["mae"]
-            if p.get("mid_at_detect") is not None:
-                p["realized_spread_60s"] = round(abs(current_price - p["mid_at_detect"]), 4)
-            _ICE_OUTCOMES[symbol].append(p)
-            # ── Persist to JSONL ──
-            _persist_iceberg_outcome(symbol, p)
-            continue
-            
-        still_pending.append(p)
-    _ICE_PENDING[symbol] = still_pending
-
-
-def _persist_iceberg_outcome(symbol, outcome):
-    """Append completed iceberg outcome to JSONL log file."""
-    try:
-        import os, json
-        log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        log_path = os.path.join(log_dir, "iceberg_outcomes.jsonl")
-
-        # State vector for future RL training
-        kalman = _KALMAN_CV[symbol]
-        vclock = _VOLUME_CLOCKS[symbol]
-        bucket_ma = sum(vclock._interval_volumes) / max(len(vclock._interval_volumes), 1) \
-                    if vclock._interval_volumes else vclock.bucket_size
-        bucket_ratio = round(vclock.bucket_size / max(bucket_ma, 1), 3)
-
-        record = {
-            "symbol": symbol,
-            "side": outcome["side"],
-            "price": outcome["price"],
-            "ts": outcome["ts"],
-            "ts_human": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(outcome["ts"])),
-            "size_rank": outcome.get("size_rank", ""),
-            "confidence": outcome.get("confidence", ""),
-            "outcome_10s": outcome["outcome_10s"],
-            "outcome_30s": outcome["outcome_30s"],
-            "outcome_60s": outcome["outcome_60s"],
-            "win_10s": outcome["outcome_10s"] is not None and outcome["outcome_10s"] > 0,
-            "win_30s": outcome["outcome_30s"] is not None and outcome["outcome_30s"] > 0,
-            "win_60s": outcome["outcome_60s"] is not None and outcome["outcome_60s"] > 0,
-            # Sub-window Excursion Tracking (MAE/MFE)
-            "mfe_10s": outcome.get("mfe_10s", 0),
-            "mae_10s": outcome.get("mae_10s", 0),
-            "mfe_30s": outcome.get("mfe_30s", 0),
-            "mae_30s": outcome.get("mae_30s", 0),
-            "mfe_60s": outcome.get("mfe_60s", 0),
-            "mae_60s": outcome.get("mae_60s", 0),
-            # State-Space Engine: state vector (s_t for SAC training)
-            # Use detection-time snapshot to avoid T+60s lookahead bias
-            "kalman_cv": outcome.get("kalman_cv_at_detect", round(kalman.state, 4)),
-            "kalman_P": outcome.get("kalman_P_at_detect", round(kalman.P, 6)),
-            "psi": outcome.get("psi", 0),
-            "vclock_bucket": vclock.bucket_size,
-            "bucket_ratio": bucket_ratio,
-            "regime": outcome.get("regime", _CURRENT_REGIME),
-            "stickiness": outcome.get("stickiness", 0),
-            "absorption_ratio": outcome.get("absorption_ratio", 0),
-            "urgency": outcome.get("urgency", 0),
-            # VPIN Toxicity
-            "vpin": round(_VPIN_ENGINES[symbol].vpin, 4) if _VPIN_ENGINES and symbol in _VPIN_ENGINES else 0,
-            "vpin_regime": _VPIN_ENGINES[symbol].get_regime_modifier() if _VPIN_ENGINES and symbol in _VPIN_ENGINES else 'NEUTRAL',
-            # Phase 7: Dynamic Exit Simulation
-            "dynamic_sl": outcome.get("dynamic_sl", 0),
-            "dynamic_sl_hit": outcome.get("dynamic_sl_hit", False),
-            "dynamic_sl_pnl": outcome.get("dynamic_sl_pnl"),
-            # Footprint / True Absorption (Feature #2 from MM gap analysis)
-            "fp_delta":            outcome.get("fp_delta", 0),
-            "fp_total":            outcome.get("fp_total", 0),
-            "fp_absorption_score": outcome.get("fp_absorption_score", 0.0),
-            "true_absorption":     outcome.get("true_absorption", False),
-            "fp_anchor_ratio":     outcome.get("fp_anchor_ratio", 0.0),
-            # Signal quality tier (HQ/MQ/LQ) and double-rejection count
-            "signal_tier":   outcome.get("signal_tier", "LQ"),
-            "n_prior_fails": outcome.get("n_prior_fails", 0),
-        }
-        with open(log_path, "a") as f:
-            f.write(json.dumps(record) + "\n")
-    except Exception as e:
-        print(f"[ICE] Outcome persist error: {e}")
-
-
-def _get_prediction(symbol: str, side: str):
-    """Get statistical prediction from historical iceberg outcomes."""
-    outcomes = [o for o in _ICE_OUTCOMES[symbol] if o["side"] == side]
-    if len(outcomes) < 5:
-        return None
-    moves = [o["outcome_30s"] for o in outcomes if o["outcome_30s"] is not None]
-    if not moves:
-        return None
-    avg_move = sum(moves) / len(moves)
-    wins = sum(1 for m in moves if m > 0)
-    n = len(moves)
-    win_rate = wins / n
-    pred_conf = "high" if n >= 20 else "medium" if n >= 10 else "low"
-    return {
-        "avg_move_30s": round(avg_move, 2),
-        "win_rate": round(win_rate * 100, 1),
-        "sample_size": n,
-        "pred_confidence": pred_conf,
-    }
-
-
-def _check_wall_gone(symbol: str, current_ts: float):
-    """Check if any active icebergs stopped refilling → wall gone."""
-    alerts = []
-    for price_str, state in list(_ICE_WALL_STATE[symbol].items()):
-        if not state["was_active"]:
-            continue
-        if current_ts - state["last_refill_ts"] >= _ICE_GONE_TIMEOUT:
-            if not state["gone_announced"]:
-                state["gone_announced"] = True
-                state["was_active"] = False
-                alerts.append({
-                    "type": "wall_gone", "price": price_str, "ts": current_ts,
-                })
-                # Record completion for prediction tracking
-                _record_iceberg_completion(
-                    symbol, float(price_str), state.get("side", "b"),
-                    current_ts, "unknown", "unknown"
-                )
-    return alerts
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAIN ICEBERG DETECTION — v4 FULL INTELLIGENCE
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _detect_iceberg(symbol: str, price_str: str, volume: int,
-                    timestamp: float, side: str):
-    """Iceberg detection v4 — full elite trading intelligence.
-
-    Returns enriched iceberg dict with ~30 fields if detected, else None.
-    Includes: zone, decay, absorption, size rank, urgency, pressure,
-    DOM cross-validation, inter-fill timing, countdown, level memory,
-    prediction, and drifting detection.
-    """
-    if side == "n":
-        return None
-
-    price_f = float(price_str)
-
-    # Track trade size + price for adaptive thresholds and absorption
-    _TRADE_SIZE_HISTORY[symbol].append(volume)
-    _ICE_PRICE_HISTORY[symbol].append((timestamp, price_f))
-
-    # Update σ-adaptive market stats on every trade
-    _update_market_stats(symbol, volume, side, timestamp)
-
-    # Check pending prediction outcomes on every trade
-    _check_pending_outcomes(symbol, price_f, timestamp)
-
-    # Adaptive min clip: use σ-based floor if available, else 50% of average
-    trade_hist = _TRADE_SIZE_HISTORY[symbol]
-    if len(trade_hist) > 10:
-        avg_trade = sum(trade_hist) / len(trade_hist)
-        min_clip = max(_ICE_MIN_CLIP_FLOOR, int(avg_trade * 0.5))
-    else:
-        avg_trade = float(volume)
-        min_clip = _ICE_MIN_CLIP_FLOOR
-
-    if volume < min_clip:
-        return None
-
-
-    # Track this fill at this price (with volume-clock tag)
-    vclock = _VOLUME_CLOCKS[symbol]
-    current_tau = vclock.tau
-    tracker = _ICE_TRACKER[symbol][price_str]
-    tracker.append((timestamp, volume, side))
-
-    # Also store in volume-tagged tracker
-    vtag_tracker = _ICE_TRACKER_VTAG[symbol][price_str]
-    vtag_tracker.append((timestamp, volume, side, current_tau))
-
-    # Prune oldest fills beyond widest window (both time and volume)
-    max_window_sec = _ICE_WINDOWS[-1][0]  # 60s
-    cutoff_prune = timestamp - max_window_sec
-    while tracker and tracker[0][0] < cutoff_prune:
-        tracker.popleft()
-    # Volume-based prune: keep fills within widest volume window (multiplier + 2 margin)
-    max_window_mult = _ICE_WINDOWS[-1][1]  # widest multiplier (10)
-    vol_cutoff_tau = max(0, current_tau - max_window_mult - 2)
-    while vtag_tracker and vtag_tracker[0][3] < vol_cutoff_tau:
-        vtag_tracker.popleft()
-
-    # ── ZONE DETECTION: collect fills from adjacent ±N ticks ──
-    tick_size = TICK_SIZES.get(symbol, DEFAULT_TICK_SIZE)
-    zone_fills_all = []
-    zone_fills_vtag = []  # volume-tagged zone fills
-    zone_levels_hit = set()
-
-    for offset in range(-_ICE_ZONE_TICKS, _ICE_ZONE_TICKS + 1):
-        adj_price = round(price_f + offset * tick_size, 2)
-        adj_key = str(adj_price)
-        adj_fills = _ICE_TRACKER[symbol].get(adj_key, [])
-        adj_vtag = _ICE_TRACKER_VTAG[symbol].get(adj_key, [])
-        if adj_fills:
-            zone_levels_hit.add(adj_key)
-            zone_fills_all.extend(adj_fills)
-            zone_fills_vtag.extend(adj_vtag)
-
-    is_zone = len(zone_levels_hit) > 1
-
-    # Try each window tier from tightest to widest
-    for window_sec, window_vol, confidence in _ICE_WINDOWS:
-
-        # ── Volume Clock windowing (primary) vs time-based (fallback) ──
-        window_cutoff = timestamp - window_sec  # always defined (used by absorption/psi below)
-        if vclock.warm:
-            # window_vol is the multiplier (1, 3, 10): look back that many buckets
-            tau_cutoff = max(0, current_tau - window_vol)
-            raw_vtag = zone_fills_vtag if is_zone else list(vtag_tracker)
-            fills_in_window = [(t, v, s) for t, v, s, tau in raw_vtag if tau >= tau_cutoff]
-        else:
-            # Time-based fallback
-            window_cutoff = timestamp - window_sec
-            raw_fills = zone_fills_all if is_zone else list(tracker)
-            fills_in_window = [f for f in raw_fills if f[0] >= window_cutoff]
-
-        # ── σ-adaptive thresholds (falls back to hardcoded during warmup) ──
-        fill_sides = [f[2] for f in fills_in_window]
-        dominant_side = fill_sides[0] if fill_sides else "b"
-        _rt = _get_adaptive_thresholds(symbol, dominant_side)
-        if len(fills_in_window) < _rt["ice_refill_count"]:
-            continue
-
-        if len(set(fill_sides)) != 1:
-            continue
-
-        vols = [f[1] for f in fills_in_window]
-        mean_vol = sum(vols) / len(vols)
-        if mean_vol == 0:
-            continue
-        variance = sum((v - mean_vol) ** 2 for v in vols) / len(vols)
-        stddev_vol = variance ** 0.5
-        cv = stddev_vol / mean_vol
-
-        if cv > _rt["ice_cv"]:
-            continue
-
-        # ── Volume anomaly gate: clip size must be above market mean + 0.5σ ──
-        min_clip_sigma = _rt.get("min_clip_sigma", 1)
-        if mean_vol < min_clip_sigma:
-            continue
-
-
-        # ═══════════════ ICEBERG DETECTED — COMPUTE ALL INTELLIGENCE ═══════════
-
-        visible_total = sum(vols)
-        n_fills = len(fills_in_window)
-        time_elapsed = max(fills_in_window[-1][0] - fills_in_window[0][0], 0.01)
-        fill_rate = n_fills / time_elapsed
-        avg_clip = mean_vol
-        # Regime-adaptive est_duration uses module-level _EST_DURATION_BY_REGIME
-        est_duration = _EST_DURATION_BY_REGIME.get(_CURRENT_REGIME, 60.0)
-        est_remaining_fills = max(0.0, fill_rate * (est_duration - max(time_elapsed, 0.1)))
-        est_hidden = int(visible_total + est_remaining_fills * avg_clip)
-        fill_pct = min(1.0, visible_total / max(est_hidden, 1))
-        est_remaining_sec = max(0.0, est_duration - time_elapsed)
-
-        # ── Fill exhaustion (linear regression slope) ──
-        decay = "holding"
-        slope = 0.0
-        if n_fills >= 3 and time_elapsed > 0.1:
-            t_start = fills_in_window[0][0]
-            xs = [(f[0] - t_start) / time_elapsed for f in fills_in_window]
-            ys = vols
-            x_mean = sum(xs) / len(xs)
-            y_mean = mean_vol
-            num = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys))
-            den = sum((x - x_mean) ** 2 for x in xs)
-            if den > 0 and y_mean > 0:
-                raw_slope = num / den
-                slope = round(raw_slope / y_mean, 3)
-                if slope < -0.15:
-                    decay = "exhausting"
-                elif slope > 0.15:
-                    decay = "strengthening"
-
-        # ── Absorption context + price stickiness score ──
-        absorbing = False
-        stickiness = 0.0
-        prices_during = [p for t, p in _ICE_PRICE_HISTORY[symbol] if t >= window_cutoff]
-        if len(prices_during) >= 2:
-            price_range = max(prices_during) - min(prices_during)
-            # BUG #5 FIX: single definition for 'absorbing' — price range only.
-            # Previously a broken stickiness calculation could override this,
-            # marking falling knives as 'absorbing'. Now only the price-range
-            # criterion determines whether price is holding (absorbing) or not.
-            if price_range / tick_size <= _ICE_ABSORB_MAX_MOVE:
-                absorbing = True
-
-            # BUG #2 FIX: Stickiness denominator — count actual CONTRACTS, not price ticks.
-            # Old code: sum(1 for t,_ in _ICE_PRICE_HISTORY) → counts price events, not vol.
-            # Fix: sum all fills from _ICE_TRACKER across all prices in window.
-            total_window_vol = sum(
-                v for _, v, _ in (
-                    f for f in _ICE_TRACKER[symbol].get(price_str, [])
-                    if f[0] >= window_cutoff
-                )
-            )
-            # Total market volume in window = sum of ALL fills across ALL prices
-            total_mkt_vol = sum(
-                _mkt_v
-                for _px_fills in _ICE_TRACKER[symbol].values()
-                for _mkt_ts, _mkt_v, _ in _px_fills
-                if _mkt_ts >= window_cutoff
-            )
-            # Stickiness = fraction of candle volume at THIS level (0.0 → 1.0)
-            if total_mkt_vol > 0:
-                stickiness = round(visible_total / max(total_mkt_vol, 1), 3)
-            # Record distribution for empirical P75 reporting (log only, not signal)
-            _STICKINESS_DIST[symbol].append(stickiness)
-            stick_vals = list(_STICKINESS_DIST[symbol])
-            if len(stick_vals) >= 30:
-                stick_vals_sorted = sorted(stick_vals)
-                p75_idx = int(len(stick_vals_sorted) * 0.75)
-                stickiness_threshold = stick_vals_sorted[p75_idx]
-            else:
-                stickiness_threshold = 0.3
-            # Note: stickiness is now purely diagnostic — it does NOT override
-            # 'absorbing'. Use it for correlation analysis vs 40pt reversal targets.
-
-
-        # ── Opposition volume & absorption ratio ──
-        opp_side = "s" if fill_sides[0] == "b" else "b"
-        opposition_vol = 0
-        # Split into bid-side and ask-side absorption for Ψ coefficient
-        bid_absorbed = 0  # Volume consumed at bid with no price decline
-        ask_absorbed = 0  # Volume consumed at ask with no price advance
-        for offset in range(-_ICE_ZONE_TICKS, _ICE_ZONE_TICKS + 1):
-            adj_price = round(price_f + offset * tick_size, 2)
-            adj_key = str(adj_price)
-            for ts_o, vol_o, s_o in _ICE_TRACKER[symbol].get(adj_key, []):
-                if s_o == opp_side and ts_o >= window_cutoff:
-                    opposition_vol += vol_o
-                # Ψ calculation: classify absorbed volume by side
-                if ts_o >= window_cutoff:
-                    # Check if price moved after this fill
-                    future_prices = [p for t, p in _ICE_PRICE_HISTORY[symbol]
-                                     if ts_o < t <= ts_o + 2.0]
-                    if future_prices:
-                        price_after = future_prices[-1]
-                        if s_o == "b" and price_after <= adj_price:
-                            bid_absorbed += vol_o  # Buy absorbed, no advance
-                        elif s_o == "s" and price_after >= adj_price:
-                            ask_absorbed += vol_o  # Sell absorbed, no decline
-        absorption_ratio = round(opposition_vol / max(visible_total, 1), 2)
-
-        # ── Dark Pool Absorption Coefficient (Ψ) — from State-Space spec ──
-        # Ψ = Σ V_bid(no decline) / Σ V_ask(no advance)
-        # Ψ > 1.0 → buy-side absorption dominance (passive institutional buying)
-        # Ψ < 1.0 → sell-side absorption dominance (passive institutional selling)
-        # Ψ ≈ 1.0 → balanced flow (no conviction)
-        psi = round(bid_absorbed / max(ask_absorbed, 1), 3)
-
-        # ── FOOTPRINT: True Absorption vs Falling Knife ──
-        # Scan ±_FOOTPRINT_ZONE_TICKS around the iceberg price for:
-        #
-        # BID iceberg (side='s' — sellers hitting, buyers holding):
-        #   True Absorption: heavy sell vol + bid held (bid_anchored >> bid_dropped)
-        #   Falling Knife:   heavy sell vol + bid moving away (bid_dropped >> bid_anchored)
-        #
-        # ASK iceberg (side='b' — buyers lifting, sellers holding):
-        #   True Absorption: heavy buy vol + ask held (ask_anchored >> ask_dropped)
-        #   Exhausted Wall:  heavy buy vol + ask moving up (ask_dropped >> ask_anchored)
-        fp_zone_buy   = 0
-        fp_zone_sell  = 0
-        fp_bid_anchor = 0
-        fp_bid_drop   = 0
-        fp_ask_anchor = 0
-        fp_ask_drop   = 0
-        _fp = _FOOTPRINT.get(symbol)
-        if _fp and _fp['levels']:
-            for _t in range(-_FOOTPRINT_ZONE_TICKS, _FOOTPRINT_ZONE_TICKS + 1):
-                _scan_px = round(price_f + _t * tick_size, 2)
-                _lvl = _fp['levels'].get(_scan_px)
-                if _lvl:
-                    fp_zone_buy   += _lvl['buy_vol']
-                    fp_zone_sell  += _lvl['sell_vol']
-                    fp_bid_anchor += _lvl['bid_anchored']
-                    fp_bid_drop   += _lvl['bid_dropped']
-                    fp_ask_anchor += _lvl['ask_anchored']
-                    fp_ask_drop   += _lvl['ask_dropped']
-
-        fp_delta = fp_zone_buy - fp_zone_sell  # negative = net sellers
-        fp_total = fp_zone_buy + fp_zone_sell
-
-        # Anchor ratios: separate bid vs ask anchoring (correct per side)
-        fp_bid_anchor_ratio = fp_bid_anchor / max(fp_bid_anchor + fp_bid_drop, 1)
-        fp_ask_anchor_ratio = fp_ask_anchor / max(fp_ask_anchor + fp_ask_drop, 1)
-        fp_sell_dominance   = fp_zone_sell / max(fp_total, 1)
-        fp_buy_dominance    = fp_zone_buy  / max(fp_total, 1)
-
-        # Canonical anchor_ratio for log/display (side-appropriate)
-        if fill_sides[0] == 'b':  # Ask iceberg: ask anchoring matters
-            fp_anchor_ratio = fp_ask_anchor_ratio
-        else:                     # Bid iceberg: bid anchoring matters
-            fp_anchor_ratio = fp_bid_anchor_ratio
-
-        if fill_sides[0] == 'b':  # Ask iceberg — buyers lifting, ask wall holds
-            # True absorption: buyers aggressively lifting, but ask stays anchored.
-            # Score = (fraction of vol that is buys) × (fraction of times ask held)
-            fp_absorption_score = fp_buy_dominance * fp_ask_anchor_ratio
-        else:  # Bid iceberg (side='s') — sellers hitting, bid wall holds
-            # True absorption: sellers hitting bid, but bid stays anchored.
-            fp_absorption_score = fp_sell_dominance * fp_bid_anchor_ratio
-
-        fp_absorption_score = round(fp_absorption_score, 3)
-
-        # Hard threshold for 'true absorption' classification:
-        # - BID iceberg (side='s'): sellers hitting bid, bid holds → long setup
-        # - ASK iceberg (side='b'): buyers lifting ask, ask holds → short setup
-        # Each uses its own side-appropriate anchor ratio (not crossed data).
-        true_absorption = (
-            fp_total >= 20
-            and fp_sell_dominance >= 0.6      # sellers clearly dominating
-            and fp_bid_anchor_ratio >= 0.7    # bid holds 70%+ of the time
-            and fill_sides[0] == 's'          # bid iceberg → we look for buyer wall
-        ) or (
-            fp_total >= 20
-            and fp_buy_dominance >= 0.6       # buyers clearly dominating
-            and fp_ask_anchor_ratio >= 0.7    # ask holds 70%+ of the time
-            and fill_sides[0] == 'b'          # ask iceberg → we look for seller wall
-        )
-
-        # ── BUG E FIX: Use session baseline for trade sizes ──
-        # Previously used `trade_hist` which only contained the 5-15 fills from THIS
-        # single iceberg detection. sigma was always ~0, making everything "retail".
-        # Now uses the rolling 100 recent clip sizes from _DRIFT_TRACKER for baseline.
-        recent_fills = [v for _, _, v in _DRIFT_TRACKER[symbol][side]]
-        size_rank = "retail"
-        if len(recent_fills) > 20:
-            th_mean = sum(recent_fills) / len(recent_fills)
-            th_var = sum((v - th_mean) ** 2 for v in recent_fills) / len(recent_fills)
-            th_std = max(th_var ** 0.5, 0.01)
-            sigma = (avg_clip - th_mean) / th_std
-            if sigma >= 3.0:
-                size_rank = "whale"
-            elif sigma >= 2.0:
-                size_rank = "institutional"
-            elif sigma >= 1.0:
-                size_rank = "professional"
-
-        # ── Prediction (Elite #6 — feeds into urgency) ──
-        prediction = _get_prediction(symbol, fill_sides[0])
-
-        # ── Urgency score (0-1 composite, outcome-weighted) ──
-        time_factor = min(fill_rate / 2.0, 1.0)
-        size_factor = min(avg_clip / max(avg_trade, 1), 1.0)
-        remaining_factor = 1.0 - fill_pct
-        base_urgency = time_factor * 0.4 + size_factor * 0.3 + remaining_factor * 0.3
-
-        # Outcome-weighted adjustment: if historical win rate is known,
-        # boost urgency for high-accuracy sides, reduce for low-accuracy
-        outcome_modifier = 1.0
-        if prediction and prediction.get('sample_size', 0) >= 10:
-            wr = prediction.get('win_rate', 50.0)
-            if wr >= 65.0:
-                outcome_modifier = 1.15  # historically profitable side
-            elif wr <= 35.0:
-                outcome_modifier = 0.80  # historically losing side
-
-        # Cross-asset modifier: boost if GEX/MM/stop cluster aligns
-        cross_asset_modifier = 1.0
-        cross_context = None
-        if _cross_asset_provider:
-            try:
-                cross_context = _cross_asset_provider(symbol)
-                if cross_context:
-                    gex_factor = cross_context.get('gex_factor', 1.0)
-                    cross_asset_modifier *= gex_factor
-                    # If near a stop cluster on our side, boost urgency
-                    if cross_context.get('near_stop_cluster'):
-                        cluster_side = cross_context.get('stop_cluster_side', '')
-                        if (cluster_side == 'SELL' and fill_sides[0] == 's') or \
-                           (cluster_side == 'BUY' and fill_sides[0] == 'b'):
-                            cross_asset_modifier *= 1.2  # iceberg near relevant stop cluster
-                    # If MM withdrawal agrees with our direction, boost
-                    mm_bias = cross_context.get('mm_pull_bias', 0)
-                    if (mm_bias < 0 and fill_sides[0] == 's') or \
-                       (mm_bias > 0 and fill_sides[0] == 'b'):
-                        cross_asset_modifier *= 1.1  # MM consensus agrees
-            except Exception:
-                pass
-
-        urgency = round(min(1.0, base_urgency * outcome_modifier * cross_asset_modifier), 3)
-
-        # ── Pressure signal (decision tree + outcome-informed) ──
-        if decay == "exhausting" and fill_pct > 0.5:
-            pressure = "wall_exhausted"
-        elif decay == "exhausting" and not absorbing:
-            pressure = "wall_breaking"
-        elif absorbing:
-            pressure = "bullish_wall" if fill_sides[0] == "b" else "bearish_wall"
-        elif fill_pct < 0.2:
-            pressure = "wall_fresh"
-        else:
-            pressure = "wall_active"
-
-        # Outcome-informed pressure override: if this side has <35% win rate,
-        # downgrade to "low_edge" regardless of other signals
-        if prediction and prediction.get('sample_size', 0) >= 15:
-            wr = prediction.get('win_rate', 50.0)
-            if wr <= 35.0 and pressure not in ('wall_exhausted', 'wall_breaking'):
-                pressure = 'low_edge_' + pressure
-
-        # ── DOM cross-validation (Elite #1) ──
-        dom_conf, dom_refill = _dom_cross_validate(symbol, price_str, volume, side)
-
-        # ── Inter-fill timing (Elite #2) ──
-        iat_confidence, timing_conf = _analyze_fill_timing(fills_in_window)
-
-        # Upgrade/downgrade confidence based on timing
-        final_confidence = confidence
-        if timing_conf == "algo_confirmed" and confidence != "high":
-            final_confidence = "high" if confidence == "medium" else "medium"
-        elif timing_conf == "random" and confidence == "high":
-            final_confidence = "medium"
-
-        # ── Completion countdown state (Elite #3) ──
-        if fill_pct < 0.15:
-            ice_state = "fresh"
-        elif fill_pct < 0.50:
-            ice_state = "active"
-        elif fill_pct < 0.85:
-            ice_state = "depleting"
-        else:
-            ice_state = "critical"
-        depletes_in = round(est_remaining_sec, 1)
-
-        # ── Level memory (Elite #5) ──
-        level_mem = _ICE_LEVEL_MEMORY[symbol].get(price_str, {})
-        level_ice_count = level_mem.get("count", 0)
-        level_avg_size = int(level_mem.get("avg_size", 0))
-
-        # ── Update wall state for gone detection ──
-        wall_st = _ICE_WALL_STATE[symbol][price_str]
-        wall_st["last_refill_ts"] = timestamp
-        wall_st["was_active"] = True
-        wall_st["gone_announced"] = False
-        wall_st["side"] = fill_sides[0]
-
-        # ── Update level memory ──
-        result = {
-            # Core detection — all from real L2 data
-            "clips": n_fills,
-            "est_total": visible_total,
-            "avg_clip": round(avg_clip, 1),
-            "cv": round(cv, 3),
-            "confidence": final_confidence,
-            "side": fill_sides[0],
-            "size_rank": size_rank,
-            # Notional dollar value (real: clips × avg_clip × price × $20 NQ multiplier)
-            "notional": round(visible_total * price_f * 20, 0),
-            # Zone
-            "zone": is_zone,
-            "zone_levels": len(zone_levels_hit) if is_zone else 1,
-            # Exhaustion
-            "decay": decay,
-            "slope": slope,
-            # Absorption
-            "absorbing": absorbing,
-            "stickiness": stickiness,
-            "opposition_vol": opposition_vol,
-            "absorption_ratio": absorption_ratio,
-            "psi": psi,  # Dark Pool Absorption Coefficient (Ψ)
-            # DOM cross-validation (Elite #1)
-            "dom_confirmed": dom_conf,
-            "dom_refill": dom_refill,
-            # Inter-fill timing (Elite #2)
-            "iat_confidence": iat_confidence,
-            "timing": timing_conf,
-            # Urgency + Pressure (now outcome-weighted)
-            "urgency": urgency,
-            "pressure": pressure,
-            "outcome_modifier": round(outcome_modifier, 2),
-            "cross_asset_modifier": round(cross_asset_modifier, 2),
-            # Level memory (Elite #5)
-            "level_ice_count": level_ice_count,
-            "level_avg_size": level_avg_size,
-            # Prediction (Elite #6 — now feeds back into urgency)
-            "prediction": prediction,
-            # Cross-asset context (from EdgeDetector)
-            "cross_context": cross_context,
-            # Regime + adaptive thresholds
-            "regime": _CURRENT_REGIME,
-            "adaptive": _rt.get("_adaptive", False),
-            "adaptive_cv_threshold": _rt.get("ice_cv"),
-            "adaptive_fill_threshold": _rt.get("ice_refill_count"),
-            # State-Space Engine: Kalman + Volume Clock
-            "kalman_cv": round(_KALMAN_CV[symbol].state, 4),
-            "kalman_P": round(_KALMAN_CV[symbol].P, 6),
-            "vclock_bucket": _VOLUME_CLOCKS[symbol].bucket_size,
-            "vclock_tau": _VOLUME_CLOCKS[symbol].tau,
-            # Footprint / True Absorption
-            "fp_delta":           fp_delta,            # cumulative delta in zone (neg=net sellers)
-            "fp_total":           fp_total,            # total volume in zone this candle
-            "fp_absorption_score": fp_absorption_score, # 0.0-1.0 (1.0 = perfect absorption)
-            "true_absorption":    true_absorption,     # bool: structural absorption confirmed
-            "fp_anchor_ratio":    round(fp_anchor_ratio, 3),   # fraction of bids that held
-            # VPIN Toxicity
-            "vpin": round(_VPIN_ENGINES[symbol].vpin, 4) if _VPIN_ENGINES and symbol in _VPIN_ENGINES else 0,
-            "vpin_regime": _VPIN_ENGINES[symbol].get_regime_modifier() if _VPIN_ENGINES and symbol in _VPIN_ENGINES else 'NEUTRAL',
-        }
-        _update_level_memory(symbol, price_str, result)
-
-        # Record outcome at detection time — HIGH confidence only (audit: med/unknown = negative EV)
-        # + Dynamic directional filter: Volume Clock-scaled (replaces static 5-pt threshold)
-        if final_confidence == "high":
-            recent_prices = _ICE_PRICE_HISTORY[symbol]
-            counter_trend = False
-            if len(recent_prices) >= 10:
-                prices_30s = [(ts, px) for ts, px in recent_prices if timestamp - ts <= 30]
-                if len(prices_30s) >= 5:
-                    trend_move = prices_30s[-1][1] - prices_30s[0][1]
-
-                    # Dynamic threshold: scale with Volume Clock stress
-                    # When volume spikes (bucket_ratio > 1), threshold TIGHTENS
-                    # (less price movement needed to confirm trend)
-                    vclock = _VOLUME_CLOCKS[symbol]
-                    bucket_ma = sum(vclock._interval_volumes) / max(len(vclock._interval_volumes), 1) \
-                                if vclock._interval_volumes else vclock.bucket_size
-                    bucket_ratio = vclock.bucket_size / max(bucket_ma, 1)
-                    dynamic_threshold = 5.0 / max(bucket_ratio, 0.5)  # 5pt base, tighter when hot
-
-                    if abs(trend_move) > dynamic_threshold:
-                        trending_up = trend_move > 0
-                        signal_is_long = (side == "s")  # side="s"→LONG (bid iceberg), side="b"→SHORT
-                        counter_trend = (trending_up and not signal_is_long) or \
-                                        (not trending_up and signal_is_long)
-
-            if not counter_trend:
-                # ── Phase 6 Alpha Filters ──
-                # Kill Filter: reset — previous combos calibrated on inverted direction.
-                # With corrected direction (side="s"→LONG, side="b"→SHORT), all prior
-                # combo PnL figures are sign-flipped. Re-derive from corrected OOS data.
-                # BUG B FIX: _KILL_COMBOS is now module-level (not re-declared here as local).
-                current_regime = result.get("regime", _CURRENT_REGIME)
-                if (current_regime, side) in _KILL_COMBOS:
-                    log.debug(f"[ALPHA-FILTER] KILLED {current_regime}+{side} "
-                              f"(negative EV combo)")
-                    return result
-
-                # CV Gate: low Kalman CV = noise — re-evaluate threshold with corrected data.
-                kalman_cv = _KALMAN_CV[symbol].state
-                if kalman_cv < 0.04 and _KALMAN_CV[symbol]._n > 250:
-                    log.debug(f"[ALPHA-FILTER] CV_GATE blocked (cv={kalman_cv:.4f} < 0.04)")
-                    return result
-
-                # ── FEATURE 10: Clip Size Decay Detector ──
-                # Linear regression slope already computed above (slope, decay).
-                # slope < -0.25 = active ammo depletion while iceberg is STILL LIVE.
-                clip_decay_active = (decay == "exhausting" and slope < -0.25)
-                if clip_decay_active:
-                    log.debug(f"[CLIP-DECAY] {side} @ {price_f:.2f} slope={slope:.3f}")
-
-                # ── FEATURE 12: Pre-detection Ψ filter ──
-                # SHORT (side=b) into Ψ > 1.5 = buyers absorbing = risky short
-                # LONG  (side=s) into Ψ < 0.5 = sellers absorbing = risky long
-                _lp           = _LIVE_PSI.get(symbol, {})
-                _live_psi_val = _lp.get("psi", 1.0)
-                _psi_stale    = (timestamp - _lp.get("ts", 0)) > 30.0
-                _psi_warn     = False
-                if not _psi_stale:
-                    if side == "b" and _live_psi_val > 1.5:
-                        log.debug(f"[PSI-GATE] SHORT into Ψ={_live_psi_val:.2f}")
-                        _psi_warn = True
-                    elif side == "s" and _live_psi_val < 0.5:
-                        log.debug(f"[PSI-GATE] LONG into Ψ={_live_psi_val:.2f}")
-                        _psi_warn = True
-                _LIVE_PSI[symbol] = {"ts": timestamp, "psi": psi, "side": side}
-
-                # Snapshot state vector at detection time for JSONL persistence
-                # CRITICAL: captured NOW to avoid T+60s lookahead bias
-                sv = {
-                    "psi":              result.get("psi", 0),
-                    "stickiness":       result.get("stickiness", 0),
-                    "absorption_ratio": result.get("absorption_ratio", 0),
-                    "urgency":          result.get("urgency", 0),
-                    "regime":           result.get("regime", _CURRENT_REGIME),
-                    "kalman_cv_at_detect":     round(_KALMAN_CV[symbol].state, 4),
-                    "kalman_P_at_detect":      round(_KALMAN_CV[symbol].P, 6),
-                    "vclock_bucket_at_detect": _VOLUME_CLOCKS[symbol].bucket_size,
-                    # Feature 10: clip size decay
-                    "clip_slope":        slope,
-                    "clip_decay":        decay,
-                    "clip_decay_active": clip_decay_active,
-                    # Feature 12: pre-detection psi
-                    "psi_warn":  _psi_warn,
-                    "live_psi":  round(_live_psi_val, 3),
-                    # Footprint: true absorption fingerprint at detection time
-                    "fp_delta":            result.get("fp_delta", 0),
-                    "fp_total":            result.get("fp_total", 0),
-                    "fp_absorption_score": result.get("fp_absorption_score", 0.0),
-                    "true_absorption":     result.get("true_absorption", False),
-                    "fp_anchor_ratio":     result.get("fp_anchor_ratio", 0.0),
-                }
-                _record_iceberg_completion(
-                    symbol, price_f, side, timestamp,
-                    size_rank,
-                    final_confidence,
-                    state_vector=sv,
-                )
-
-        return result
-
-    return None
 
 
 def _detect_sweep(symbol: str, price: float, volume: int,
@@ -2551,13 +964,6 @@ def _cleanup_detection_state():
     _last_cleanup_time = now
 
     for sym in list(SYMBOLS):
-        # ── ICE_TRACKER: remove price keys with no recent fills ──
-        ice_sym = _ICE_TRACKER.get(sym, {})
-        stale_prices = [p for p, fills in ice_sym.items()
-                        if not fills or (now - fills[-1][0]) > _ICE_WINDOWS[-1][0] * 3]
-        for p in stale_prices:
-            del ice_sym[p]
-
         # ── SWEEP_TRACKER: hard cap at 100 entries ──
         sweep = _SWEEP_TRACKER.get(sym, [])
         if len(sweep) > 100:
@@ -2585,63 +991,6 @@ def _cleanup_detection_state():
             dh = _DELTA_HISTORY.get(sym, {}).get(tf, [])
             if len(dh) > 50:
                 _DELTA_HISTORY[sym][tf] = dh[-50:]
-
-    # ── ICE_DEDUP_SEEN: purge stale dedup keys ──
-    stale_dedup = [k for k, t in _ICE_DEDUP_SEEN.items() if now - t > _ICE_DEDUP_TTL]
-    for k in stale_dedup:
-        del _ICE_DEDUP_SEEN[k]
-
-    # ── DOM_PREV: naturally bounded (replaced each DOM update) ──
-    # No cleanup needed.
-
-    # ── DRIFT_TRACKER: prune old fills ──
-    for sym in list(_DRIFT_TRACKER.keys()):
-        for s in ["b", "s"]:
-            tracker = _DRIFT_TRACKER[sym][s]
-            while tracker and tracker[0][0] < now - _DRIFT_WINDOW_SEC:
-                tracker.popleft()
-
-    # ── WALL_STATE: prune old walls ──
-    for sym in list(_ICE_WALL_STATE.keys()):
-        stale = [p for p, st in _ICE_WALL_STATE[sym].items()
-                 if now - st["last_refill_ts"] > 300]
-        for p in stale:
-            del _ICE_WALL_STATE[sym][p]
-
-    # ── LEVEL_MEMORY: prune levels older than 4 hours ──
-    for sym in list(_ICE_LEVEL_MEMORY.keys()):
-        stale = [p for p, m in _ICE_LEVEL_MEMORY[sym].items()
-                 if now - m["last_ts"] > 14400]
-        for p in stale:
-            del _ICE_LEVEL_MEMORY[sym][p]
-
-    # ── PENDING OUTCOMES: prune stale ──
-    for sym in list(_ICE_PENDING.keys()):
-        _ICE_PENDING[sym] = [p for p in _ICE_PENDING[sym]
-                             if now - p["ts"] < 120]
-
-    # ── DOM_BAND_DEPTH: prune old entries ──
-    for sym in list(_DOM_BAND_DEPTH.keys()):
-        for s in ["b", "s"]:
-            dq = _DOM_BAND_DEPTH[sym][s]
-            while dq and dq[0][0] < now - _DRIFT_WINDOW_SEC * 2:
-                dq.popleft()
-
-    # ── LEVEL_FAIL_MEMORY: prune stale price buckets ──
-    for key in list(_LEVEL_FAIL_MEMORY.keys()):
-        dq = _LEVEL_FAIL_MEMORY[key]
-        while dq and now - dq[0] > _LEVEL_FAIL_WINDOW:
-            dq.popleft()
-        if not dq:
-            del _LEVEL_FAIL_MEMORY[key]
-
-    # ── ICE_TRACKER_VTAG: prune stale price keys (mirrors ICE_TRACKER cleanup) ──
-    for sym in list(SYMBOLS):
-        vtag_sym = _ICE_TRACKER_VTAG.get(sym, {})
-        stale_vtag = [p for p, fills in vtag_sym.items()
-                      if not fills or (now - fills[-1][0]) > _ICE_WINDOWS[-1][0] * 3]
-        for p in stale_vtag:
-            del vtag_sym[p]
 
 
 # Dedicated lock for candle data — separate from _L2_LOCK to avoid
@@ -2688,7 +1037,8 @@ def _feed_candle(symbol: str, price: float, volume: int, timestamp: float,
             _book_sz = float(_dom.get("bids", {}).get(qp, 0))
         # side == "n": neutral/unknown — leave _book_sz = 0 (no meaningful book context)
 
-    _pending_emits = []   # collect candle_update payloads to emit outside lock
+    _pending_emits = []       # collect fast OHLCV payloads (no heavy computation)
+    _pending_enriched = []    # collect enriched payloads (bp, depth_deltas, etc.) at 5Hz
 
     with _CANDLE_LOCK:
         for tf, seconds in CANDLE_TIMEFRAMES.items():
@@ -2718,6 +1068,24 @@ def _feed_candle(symbol: str, price: float, volume: int, timestamp: float,
                     div_hit = _detect_delta_divergence(symbol, tf)
                     if div_hit:
                         cur["delta_div"] = div_hit
+
+                    # ── Snapshot absorption + depth_deltas onto closing candle ──
+                    # So history bars carry this data for frontend rendering.
+                    candle_bp_keys = list(cur.get("bp", {}).keys())
+                    if candle_bp_keys:
+                        _dd = _compute_depth_deltas(symbol, cur["t"], timestamp, candle_bp_keys)
+                        if _dd:
+                            cur["depth_deltas"] = _dd
+                        # Snapshot absorption scores for prices in this candle's range
+                        _abs_global = L2_STATE["absorption"].get(symbol, {})
+                        if _abs_global:
+                            _abs_snap = {}
+                            for pk in candle_bp_keys:
+                                if pk in _abs_global:
+                                    _abs_snap[pk] = _abs_global[pk]
+                            if _abs_snap:
+                                cur["absorption"] = _abs_snap
+
                     frozen = _freeze_candle(cur)
                     _CANDLES[symbol][tf].append(frozen)
                     # Persist bubble profile to disk (1m only) so it survives restarts
@@ -2727,7 +1095,7 @@ def _feed_candle(symbol: str, price: float, volume: int, timestamp: float,
                 bp = {}
                 bp[qp] = [volume if side == "b" else 0,
                           volume if side == "s" else 0,
-                          None, None,   # [2]=fp_score, [3]=true_abs (set by iceberg detector)
+                          None, None,   # [2], [3] reserved
                           _book_sz]     # [4]=book_size_at_trade
                 _CURRENT_CANDLE[symbol][tf] = {
                     "t": boundary,
@@ -2760,20 +1128,38 @@ def _feed_candle(symbol: str, price: float, volume: int, timestamp: float,
                     else:
                         bp[qp] = [volume if side == "b" else 0,
                                   volume if side == "s" else 0,
-                                  None, None,   # [2]=fp_score, [3]=true_abs
+                                  None, None,   # [2], [3] reserved
                                   _book_sz]     # [4]=book_size_at_trade
 
-            # ── Emit candle update via Socket.IO (throttled) ──
-            # Snapshot candle data inside lock; depth_deltas computed outside lock
-            # to avoid holding _CANDLE_LOCK during the expensive T0 history search.
-            if _socketio is not None:
+                # ── bp_large: same as bp but only trades >= threshold ──
+                _LARGE_THRESHOLD = {"NQ": 10, "ES": 20}
+                _lt = _LARGE_THRESHOLD.get(symbol, 10)
+                if volume >= _lt:
+                    if "bp_large" not in cur:
+                        cur["bp_large"] = {}
+                    bpl = cur["bp_large"]
+                    if qp in bpl:
+                        if side == "b":
+                            bpl[qp][0] += volume
+                        elif side == "s":
+                            bpl[qp][1] += volume
+                    else:
+                        bpl[qp] = [volume if side == "b" else 0,
+                                   volume if side == "s" else 0]
+
+            # ── Emit candle OHLCV fast (20Hz) + enriched slow (5Hz) ──
+            # Fast path: lightweight OHLCV only — matches DOM speed
+            # Enriched path: bp, signals, depth_deltas — heavy computation at 5Hz
+            if _socketio is not None and tf in _ACTIVE_TFS:
                 emit_key = f"{symbol}:{tf}"
+                enrich_key = f"{symbol}:{tf}:enrich"
                 now = time.time()
                 last = _last_emit_time.get(emit_key, 0)
                 if now - last >= _EMIT_MIN_INTERVAL:
                     _last_emit_time[emit_key] = now
                     cur = _CURRENT_CANDLE[symbol].get(tf)
                     if cur:
+                        # Fast OHLCV — emitted immediately, no heavy computation
                         _pending_emits.append({
                             "symbol": symbol,
                             "tf": tf,
@@ -2783,41 +1169,56 @@ def _feed_candle(symbol: str, price: float, volume: int, timestamp: float,
                             "low": cur["l"],
                             "close": cur["c"],
                             "volume": cur["v"],
-                            "bp": cur.get("bp"),
-                            "icebergs": cur.get("icebergs"),
-                            "sweeps": cur.get("sweeps"),
-                            "delta_div": cur.get("delta_div"),
-                            "ignition": cur.get("ignition"),
-                            "spoofs": cur.get("spoofs"),
-                            "drifting_iceberg": cur.get("drifting_iceberg"),
-                            "wall_gone": cur.get("wall_gone"),
-                            "absorption": cur.get("absorption"),
-                            "micro_ofi": _MICRO_OFI[symbol].ofi if symbol in _MICRO_OFI else None,
-                            # FIX F2: Pass backend Hawkes (Kirchner 2017 bivariate)
-                            # to frontend instead of frontend recomputing with broken heuristic
-                            "hawkes": _V2_HAWKES[symbol].get_state() if symbol in _V2_HAWKES else None,
-                            # FIX M8: depth velocity at price levels (lots/sec drain rate)
-                            "depth_vel": _DEPTH_VEL_CACHE.get(symbol),
-                            # book_imbalance + depth_deltas computed outside lock below
+                            "_emit_ts": now,
                         })
+                        # Enriched payload at 5Hz (200ms) — bp, signals, depth
+                        last_enrich = _last_emit_time.get(enrich_key, 0)
+                        if now - last_enrich >= 0.2:
+                            _last_emit_time[enrich_key] = now
+                            _pending_enriched.append({
+                                "symbol": symbol,
+                                "tf": tf,
+                                "time": cur["t"],
+                                "close": cur["c"],
+                                "bp": cur.get("bp"),
+                                "sweeps": cur.get("sweeps"),
+                                "delta_div": cur.get("delta_div"),
+                                "ignition": cur.get("ignition"),
+                                "spoofs": cur.get("spoofs"),
+                                "micro_ofi": _MICRO_OFI[symbol].ofi if symbol in _MICRO_OFI else None,
+                                "hawkes": _V2_HAWKES[symbol].get_state() if symbol in _V2_HAWKES else None,
+                                "depth_vel": _DEPTH_VEL_CACHE.get(symbol),
+                            })
 
-    # ── Emit outside _CANDLE_LOCK to avoid blocking trades ──
-    for _emit_candle in _pending_emits:
-        bp_data = _emit_candle.get("bp")
-        if bp_data:
-            _emit_candle["depth_deltas"] = _compute_depth_deltas(
-                symbol, _emit_candle["time"], time.time(),
-                bp_data.keys()
-            )
-            # Book imbalance: compute under L2_LOCK (reads DOM)
-            with _L2_LOCK:
-                _emit_candle["book_imbalance"] = _compute_book_imbalance(
-                    symbol, bp_data.keys()
+    # ── Emit fast OHLCV outside lock — no computation, instant ──
+    # Double-check _ACTIVE_TF at emit time (may have changed since queue time)
+    if _socketio is not None:
+        for _emit_candle in _pending_emits:
+            if _emit_candle.get("tf") not in _ACTIVE_TFS:
+                continue  # stale — no client wants this tf anymore
+            try:
+                _socketio.emit("candle_update", _emit_candle, namespace="/")
+            except Exception:
+                pass
+
+    # ── Emit enriched data at 5Hz — heavy computation here ──
+    if _socketio is not None and _pending_enriched:
+        _pending_enriched = [e for e in _pending_enriched if e.get("tf") in _ACTIVE_TFS]
+        for _emit_enrich in _pending_enriched:
+            bp_data = _emit_enrich.get("bp")
+            if bp_data:
+                _emit_enrich["depth_deltas"] = _compute_depth_deltas(
+                    symbol, _emit_enrich["time"], time.time(),
+                    bp_data.keys()
                 )
-        try:
-            _socketio.emit("candle_update", _emit_candle, namespace="/")
-        except Exception as e:
-            log.warning("candle_update emit failed: %s", e)
+                with _L2_LOCK:
+                    _emit_enrich["book_imbalance"] = _compute_book_imbalance(
+                        symbol, bp_data.keys()
+                    )
+            try:
+                _socketio.emit("candle_enriched", _emit_enrich, namespace="/")
+            except Exception as e:
+                log.warning("candle_enriched emit failed: %s", e)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2888,9 +1289,6 @@ def _freeze_candle(candle: dict) -> dict:
         if clean:
             snap["bp"] = clean
     # ── Orderflow detection results ──
-    icebergs = candle.get("icebergs")
-    if icebergs:
-        snap["icebergs"] = icebergs
     sweeps = candle.get("sweeps")
     if sweeps:
         snap["sweeps"] = sweeps
@@ -2903,12 +1301,12 @@ def _freeze_candle(candle: dict) -> dict:
     spoofs = candle.get("spoofs")
     if spoofs:
         snap["spoofs"] = spoofs
-    drifting_iceberg = candle.get("drifting_iceberg")
-    if drifting_iceberg:
-        snap["drifting_iceberg"] = drifting_iceberg
-    wall_gone = candle.get("wall_gone")
-    if wall_gone:
-        snap["wall_gone"] = wall_gone
+    absorption = candle.get("absorption")
+    if absorption:
+        snap["absorption"] = absorption
+    depth_deltas = candle.get("depth_deltas")
+    if depth_deltas:
+        snap["depth_deltas"] = depth_deltas
     return snap
 
 
@@ -2929,6 +1327,12 @@ def get_candles(symbol: str, tf: str) -> list:
     # Lightweight Charts strictly requires chronological data.
     closed.sort(key=lambda c: c["t"])
     return closed
+
+def get_refill_stats(symbol: str) -> dict:
+    """Return refill speed data per price for VP overlay.
+    {price_str: {avg_ms, count, classification}}"""
+    return dict(_REFILL_TRACKER.get(symbol, {}))
+
 
 # ── Shared signal store (read by server.py /api/l2 endpoint) ─────────────────
 # This dict is updated by the worker thread and read by Flask.
@@ -3453,45 +1857,80 @@ _PREV_DOM_SNAP: dict = {}              # {sym: {bids:{p:sz}, asks:{p:sz}}}
 _ABSORPTION_HALF_LIFE = 20.0           # exponential decay half-life in seconds
 _WAVE_GAP_SEC = 2.0                    # ≥2s gap = new attack wave
 
+# ═══════════════════════════════════════════════════════════════════
+# ABSORPTION ENGINE v2 — consumed/pulled/refilled math
+# ═══════════════════════════════════════════════════════════════════
+# Between two DOM snapshots at a given price level, three things can happen:
+#   depth_drop = max(prev_size - curr_size, 0)     ← depth that disappeared
+#   traded     = sum of trades at this price between snapshots
+#
+#   consumed = min(depth_drop, traded)            ← real absorption by trades
+#   pulled   = max(depth_drop - traded, 0)        ← MM yanked orders (spoof)
+#   refilled = max(traded - depth_drop, 0)        ← reload → TRUE absorption
+#
+# Aggregate over time → ratios:
+#   refill_ratio = total_refilled / total_traded    (0→1, higher = stronger absorption)
+#   pull_ratio   = total_pulled   / (consumed+pulled) (higher = spoofier wall)
+#
+# Tiering:
+#   FORTRESS: refill ≥ 0.7, traded ≥ 100 → immovable wall
+#   SOLID:    refill ≥ 0.5, traded ≥ 50  → strong absorption
+#   HELD:     refill ≥ 0.3, traded ≥ 30  → moderate absorption
+#   FAKE:     pull_ratio ≥ 0.6, pulled ≥ 30 → spoof — fade this
+
 
 def _track_absorption_trade(symbol, price_key, volume, side, ts):
     """
-    Called on every trade. Accumulate side-aware aggressive volume.
+    Called on every trade. Buffers traded volume per price level for
+    reconciliation against DOM delta on next _compute_absorption_scores call.
 
-    side == 'b' → aggressive buyer LIFTED an ask → attack on ASK wall
-    side == 's' → aggressive seller HIT a bid   → attack on BID wall
+    side == 'b' → aggressive buyer LIFTED an ask → attack on ASK level
+    side == 's' → aggressive seller HIT a bid   → attack on BID level
     """
     tracker = _ABSORPTION[symbol]
     if price_key not in tracker:
         tracker[price_key] = {
-            "buy_vol": 0, "sell_vol": 0,
-            "hits": 0, "buy_hits": 0, "sell_hits": 0,
+            "side": "ask" if side == "b" else "bid" if side == "s" else None,
             "first_ts": ts, "last_ts": ts,
+            "hits": 0, "buy_hits": 0, "sell_hits": 0,
+            "buy_vol": 0, "sell_vol": 0,
+            # Per-window buffer (reset each DOM snap):
+            "traded_buffer": 0,
+            # Cumulative (over entry's lifetime):
+            "total_traded":   0,
+            "total_consumed": 0,
+            "total_pulled":   0,
+            "total_refilled": 0,
+            # Book state:
+            "peak_passive": 0,
+            # Wave tracking:
             "waves": 1, "last_wave_ts": ts,
-            "passive_consumed": 0, "peak_passive": 0,
-            "side_flag": "ask" if side == "b" else "bid",
         }
 
     e = tracker[price_key]
 
-    # ── Side-aware volume accumulation ──
+    # Side determination: latest trade side governs which book side we track.
+    # If side flips mid-lifetime, this level has switched from offer→bid or vice versa,
+    # which means the absorption regime has changed. We don't reset (keeps history)
+    # but the reconciliation will naturally re-align.
     if side == "b":
-        e["buy_vol"] += volume
+        e["buy_vol"]  += volume
         e["buy_hits"] += 1
-        e["side_flag"] = "ask"  # buyers attack ask walls
+        e["side"] = "ask"
     elif side == "s":
-        e["sell_vol"] += volume
+        e["sell_vol"]  += volume
         e["sell_hits"] += 1
-        e["side_flag"] = "bid"  # sellers attack bid walls
+        e["side"] = "bid"
     else:
-        # Neutral / unknown side: split evenly (conservative)
         half = volume // 2 or 1
-        e["buy_vol"] += half
+        e["buy_vol"]  += half
         e["sell_vol"] += half
 
+    # Buffer the trade volume — reconciled against DOM delta next snap
+    e["traded_buffer"] += volume
     e["hits"] += 1
 
-    # ── Wave detection: new burst if gap ≥ WAVE_GAP_SEC ──
+    # Wave detection: new burst if ≥ WAVE_GAP_SEC since last trade
     if ts - e["last_wave_ts"] >= _WAVE_GAP_SEC:
         e["waves"] += 1
         e["last_wave_ts"] = ts
@@ -3501,15 +1940,28 @@ def _track_absorption_trade(symbol, price_key, volume, side, ts):
 
 def _compute_absorption_scores(symbol, dom):
     """
-    Called on every DOM update. Cross-references DOM delta against
-    accumulated aggressive volume using 6 institutional metrics:
+    Called on every DOM update. Reconciles buffered trades against
+    DOM delta using consumed/pulled/refilled decomposition.
 
-    1. Side-aware: only counts aggression on the relevant book side
-    2. O(1) lookup: direct dict.get() instead of linear scan
-    3. Flow-through: tracks total passive consumed, not just net delta
-    4. Intensity: hits_per_second for burst detection
-    5. Exponential decay: score fades with half-life, not hard cutoff
-    6. Wave count: distinct attack bursts = conviction
+    For each tracked price level between previous DOM snap and now:
+        depth_drop = max(prev_size - curr_size, 0)   # depth lost
+        traded     = trades buffered since last snap
+
+        consumed = min(depth_drop, traded)           # real absorption
+        pulled   = max(depth_drop - traded, 0)       # spoof (MM pulled)
+        refilled = max(traded - depth_drop, 0)       # reload (TRUE absorption)
+
+    Aggregate → refill_ratio = refilled/traded, pull_ratio = pulled/(pulled+consumed)
+
+    Tier cutoffs are ADAPTIVE (Sprint 1 — session-rolling percentiles):
+        FORTRESS (3): refill ≥ P90(refill_samples) AND total_traded ≥ P75(traded_samples)
+        SOLID    (2): refill ≥ P75 AND total_traded ≥ P50
+        HELD     (1): refill ≥ P50 AND total_traded ≥ P25
+        FAKE     (0, fake=True): pull_ratio ≥ P90(pull_samples) AND total_pulled ≥ 30
+
+    During warmup (<500 trades OR <100 refill samples) falls back to the
+    hardcoded 0.7/0.5/0.3 refill + 100/50/30 traded constants for continuity
+    with older behavior.
     """
     now = time.time()
     tick_size = TICK_SIZES.get(symbol, DEFAULT_TICK_SIZE)
@@ -3523,12 +1975,24 @@ def _compute_absorption_scores(symbol, dom):
     scores = {}
     purge_keys = []
 
+    # Sprint 1: hoist adaptive-threshold lookup out of the per-level loop.
+    # Single call per DOM tick, shared across every price level.
+    _adapt = _get_adaptive_thresholds(symbol)
+    _f_refill = _adapt.get("refill_p90", 0.7)
+    _s_refill = _adapt.get("refill_p75", 0.5)
+    _h_refill = _adapt.get("refill_p50", 0.3)
+    _f_vol    = max(int(_adapt.get("traded_p75", 100)), 30)
+    _s_vol    = max(int(_adapt.get("traded_p50", 50)),  20)
+    _h_vol    = max(int(_adapt.get("traded_p25", 30)),  10)
+    _fake_pull = _adapt.get("pull_p90", 0.6)
+
     for price_key, entry in list(tracker.items()):
         age = now - entry["first_ts"]
 
-        # ── Exponential decay: purge if effective weight < 5% ──
-        decay_factor = _math.exp(-0.693 * age / _ABSORPTION_HALF_LIFE)  # ln(2)≈0.693
-        if decay_factor < 0.05:
+        # Exponential decay for relevance weighting (does NOT shrink ratios)
+        decay_factor = _math.exp(-0.693 * age / _ABSORPTION_HALF_LIFE)
+        # Purge levels with no recent activity and low weight
+        if decay_factor < 0.05 and (now - entry["last_ts"]) > _ABSORPTION_HALF_LIFE:
             purge_keys.append(price_key)
             continue
 
@@ -3536,78 +2000,126 @@ def _compute_absorption_scores(symbol, dom):
         if entry["hits"] < 2:
             continue
 
-        # ── O(1) DOM lookup: direct key match ──
-        side_flag = entry["side_flag"]
-        if side_flag == "bid":
+        side = entry.get("side")
+        if side is None:
+            continue
+
+        # O(1) DOM lookup on current and previous snapshots
+        if side == "bid":
             curr_size = bids.get(price_key, 0)
             prev_size = prev_bids.get(price_key, 0)
         else:
             curr_size = asks.get(price_key, 0)
             prev_size = prev_asks.get(price_key, 0)
 
-        # Keys are already normalized via _norm_pk — O(1) lookup is sufficient.
+        # ── Core reconciliation ──
+        traded     = entry["traded_buffer"]
+        depth_drop = max(prev_size - curr_size, 0)
 
-        # ── Flow-through: track CUMULATIVE passive consumption ──
-        shrinkage = max(prev_size - curr_size, 0)  # only count shrinkage, not growth
-        entry["passive_consumed"] += shrinkage
+        consumed = min(depth_drop, traded)
+        pulled   = max(depth_drop - traded, 0)
+        refilled = max(traded - depth_drop, 0)
+
+        # Accumulate cumulative totals
+        entry["total_traded"]   += traded
+        entry["total_consumed"] += consumed
+        entry["total_pulled"]   += pulled
+        entry["total_refilled"] += refilled
+
+        # Reset per-window buffer
+        entry["traded_buffer"] = 0
+
         if curr_size > entry["peak_passive"]:
             entry["peak_passive"] = curr_size
 
-        # ── Side-aware aggression volume ──
-        if side_flag == "bid":
-            agg_vol = entry["sell_vol"]  # sellers attacking bid wall
-        else:
-            agg_vol = entry["buy_vol"]   # buyers attacking ask wall
+        # Per-level aggregate stats
+        t_traded   = entry["total_traded"]
+        t_consumed = entry["total_consumed"]
+        t_pulled   = entry["total_pulled"]
+        t_refilled = entry["total_refilled"]
 
-        # ── Core Score: agg_vol / flow-through consumption ──
-        consumed = max(entry["passive_consumed"], 1)
-        raw_score = agg_vol / consumed
+        # Ratios (0→1 scale)
+        refill_ratio   = t_refilled / max(t_traded, 1)
+        consumed_ratio = t_consumed / max(t_traded, 1)
+        pull_base      = t_pulled + t_consumed
+        pull_ratio     = t_pulled / max(pull_base, 1)
 
-        # ── Apply exponential decay ──
-        effective_score = raw_score * decay_factor
-
-        # ── Intensity: hits per second (burst detection) ──
-        duration = max(age, 0.1)
-        side_hits = entry["sell_hits"] if side_flag == "bid" else entry["buy_hits"]
-        intensity = side_hits / duration
-
-        # ── Pre-Classification (Tiering) ──
-        # Integrates Kalman OFI divergence if available:
-        div_multiplier = 1.0
+        # Kalman OFI confluence — price stuck under heavy flow boosts conviction
         kalman = _KALMAN_OFI.get(symbol)
-        if kalman and kalman.ready:
-            if abs(kalman.theta) < 0.2:
-                div_multiplier = 1.25  # Absorption confirmed (flow is heavy, price is stuck)
-            elif abs(kalman.theta) > 0.6:
-                div_multiplier = 0.7   # Price is moving with flow (not true absorption)
+        kalman_confirm = False
+        if kalman and kalman.ready and abs(kalman.theta) < 0.2:
+            kalman_confirm = True  # flow heavy but price not moving → absorption
 
-        adj_score = effective_score * div_multiplier
+        # ── Sprint 1: sample refill/traded/pull into rolling distribution ──
+        # Noise floor t_traded >= 10 ignores micro levels dominated by book noise.
+        if t_traded >= 10:
+            _ms_sample = _MARKET_STATS[symbol]
+            _ms_sample["refill_samples"].append(refill_ratio)
+            _ms_sample["traded_samples"].append(t_traded)
+            if pull_ratio >= 0.2:
+                _ms_sample["pull_samples"].append(pull_ratio)
+
+        # ── Tiering (adaptive thresholds — session-rolling percentiles) ──
+        # Cutoffs hoisted above the loop for perf.
         tier = 0
         label = ""
-        if adj_score >= 15.0:
-            tier = 3; label = "SUPER_WALL"
-        elif adj_score >= 6.0:
-            tier = 2; label = "WALL"
-        elif adj_score >= 2.0:
-            tier = 1; label = "ABS"
+        fake = False
+
+        if pull_ratio >= _fake_pull and t_pulled >= 30:
+            fake = True
+            label = "FAKE"
+        elif refill_ratio >= _f_refill and t_traded >= _f_vol:
+            tier = 3; label = "FORTRESS"
+        elif refill_ratio >= _s_refill and t_traded >= _s_vol:
+            tier = 2; label = "SOLID"
+        elif refill_ratio >= _h_refill and t_traded >= _h_vol:
+            tier = 1; label = "HELD"
+
+        # Kalman confirm boosts HELD → SOLID if refill is strong but volume low
+        if kalman_confirm and tier == 1 and refill_ratio >= 0.5:
+            tier = 2; label = "SOLID"
+
+        # Intensity: trades per second (burst detection)
+        duration = max(age, 0.1)
+        side_hits = entry["sell_hits"] if side == "bid" else entry["buy_hits"]
+        intensity = side_hits / duration
+
+        # Backward-compatible "score" for frontend sort/filter.
+        # 0→10 scale, dominated by refill_ratio, boosted by volume
+        vol_boost = min(_math.log10(t_traded + 1) / 2.0, 1.5)  # caps at traded=1000
+        legacy_score = refill_ratio * 10.0 * (1.0 + vol_boost * 0.3)
 
         scores[price_key] = {
-            "score": round(effective_score, 2),
+            # Primary signal fields
             "tier": tier,
             "label": label,
-            "raw_score": round(raw_score, 2),
-            "buy_vol": entry["buy_vol"],
-            "sell_vol": entry["sell_vol"],
+            "fake": fake,
+            "side": side,
+            # Ratios (the real signal)
+            "refill_ratio":   round(refill_ratio, 3),
+            "consumed_ratio": round(consumed_ratio, 3),
+            "pull_ratio":     round(pull_ratio, 3),
+            # Cumulative totals
+            "total_traded":   t_traded,
+            "total_consumed": t_consumed,
+            "total_pulled":   t_pulled,
+            "total_refilled": t_refilled,
+            # Book state
+            "curr_passive": curr_size,
+            "peak_passive": entry["peak_passive"],
+            # Tape stats
             "hits": entry["hits"],
             "side_hits": side_hits,
-            "passive_consumed": entry["passive_consumed"],
-            "peak_passive": entry["peak_passive"],
-            "curr_passive": curr_size,
+            "buy_vol": entry["buy_vol"],
+            "sell_vol": entry["sell_vol"],
             "intensity": round(intensity, 2),
             "waves": entry["waves"],
             "age": round(age, 1),
             "decay": round(decay_factor, 3),
-            "side": side_flag,
+            # Legacy compatibility (frontend sort/filter)
+            "score": round(legacy_score, 2),
+            "raw_score": round(refill_ratio * 10.0, 2),
+            "passive_consumed": t_consumed,
         }
 
     # Cleanup decayed entries
@@ -3620,9 +2132,147 @@ def _compute_absorption_scores(symbol, dom):
         "asks": {str(k): v for k, v in asks.items()},
     }
 
+    # ── Cluster adjacent same-side levels (within 2 ticks) ──
+    clustered = _cluster_absorption_levels(scores, tick_size)
+
     # Publish
     with _L2_LOCK:
-        L2_STATE["absorption"][symbol] = scores
+        L2_STATE["absorption"][symbol] = clustered
+
+
+def _cluster_absorption_levels(scores: dict, tick_size: float) -> dict:
+    """
+    Merge adjacent same-side absorption levels within 2 ticks into composite clusters.
+    A single wall spanning 26330.00, 26330.25, 26330.50 becomes ONE cluster.
+
+    Anchor = price with highest total_refilled in the cluster.
+    Cluster stats = sum of all members.
+    Cluster tier = max tier among members (FORTRESS wins over SOLID).
+    Cluster fake = True only if ALL members are fake.
+
+    Returns dict keyed by anchor price with 'members' list for transparency.
+    """
+    if not scores:
+        return {}
+
+    # Separate by side so we don't merge bid + ask at same price
+    by_side = {"bid": [], "ask": []}
+    for pk, data in scores.items():
+        side = data.get("side")
+        if side in ("bid", "ask"):
+            try:
+                by_side[side].append((float(pk), pk, data))
+            except (ValueError, TypeError):
+                continue
+
+    merged = {}
+    cluster_radius = tick_size * 2.0  # 2 ticks tolerance
+
+    for side, levels in by_side.items():
+        if not levels:
+            continue
+        # Sort by price ascending
+        levels.sort(key=lambda x: x[0])
+
+        cluster = None  # {"members": [(price, pk, data), ...], "min": p, "max": p}
+        cluster_list = []
+
+        for price, pk, data in levels:
+            if cluster is None:
+                cluster = {"members": [(price, pk, data)], "min": price, "max": price}
+            elif price - cluster["max"] <= cluster_radius:
+                cluster["members"].append((price, pk, data))
+                cluster["max"] = price
+            else:
+                cluster_list.append(cluster)
+                cluster = {"members": [(price, pk, data)], "min": price, "max": price}
+        if cluster is not None:
+            cluster_list.append(cluster)
+
+        # Collapse each cluster into one output entry
+        for c in cluster_list:
+            members = c["members"]
+            if len(members) == 1:
+                # Singleton — emit as-is but add cluster metadata
+                _, pk, data = members[0]
+                data["cluster_size"]   = 1
+                data["cluster_span"]   = 0.0
+                data["cluster_prices"] = [members[0][0]]
+                merged[pk] = data
+                continue
+
+            # Composite cluster
+            sum_traded   = sum(m[2]["total_traded"]   for m in members)
+            sum_consumed = sum(m[2]["total_consumed"] for m in members)
+            sum_pulled   = sum(m[2]["total_pulled"]   for m in members)
+            sum_refilled = sum(m[2]["total_refilled"] for m in members)
+
+            # Anchor = member with highest refilled
+            anchor_member = max(members, key=lambda m: m[2]["total_refilled"])
+            anchor_pk = anchor_member[1]
+            anchor_data = dict(anchor_member[2])  # copy
+
+            # Recompute ratios from sums
+            refill_ratio   = sum_refilled / max(sum_traded, 1)
+            consumed_ratio = sum_consumed / max(sum_traded, 1)
+            pull_base      = sum_pulled + sum_consumed
+            pull_ratio     = sum_pulled / max(pull_base, 1)
+
+            # Max tier across members
+            max_tier = max((m[2]["tier"] for m in members), default=0)
+            # Fake only if all members fake
+            all_fake = all(m[2].get("fake", False) for m in members)
+
+            # Rebuild label from aggregate
+            label = ""
+            fake = False
+            if all_fake and pull_ratio >= 0.6 and sum_pulled >= 30:
+                fake = True
+                label = "FAKE"
+            elif refill_ratio >= 0.7 and sum_traded >= 100:
+                label = "FORTRESS"; max_tier = 3
+            elif refill_ratio >= 0.5 and sum_traded >= 50:
+                label = "SOLID"; max_tier = max(max_tier, 2)
+            elif refill_ratio >= 0.3 and sum_traded >= 30:
+                label = "HELD"; max_tier = max(max_tier, 1)
+
+            # Sum volumes and hits
+            sum_buy_vol  = sum(m[2]["buy_vol"]  for m in members)
+            sum_sell_vol = sum(m[2]["sell_vol"] for m in members)
+            sum_hits     = sum(m[2]["hits"]     for m in members)
+            sum_curr     = sum(m[2]["curr_passive"] for m in members)
+            sum_peak     = sum(m[2]["peak_passive"] for m in members)
+
+            # Recompute legacy score
+            vol_boost = min(_math.log10(sum_traded + 1) / 2.0, 1.5)
+            legacy_score = refill_ratio * 10.0 * (1.0 + vol_boost * 0.3)
+
+            anchor_data.update({
+                "tier": max_tier,
+                "label": label,
+                "fake": fake,
+                "refill_ratio":   round(refill_ratio, 3),
+                "consumed_ratio": round(consumed_ratio, 3),
+                "pull_ratio":     round(pull_ratio, 3),
+                "total_traded":   sum_traded,
+                "total_consumed": sum_consumed,
+                "total_pulled":   sum_pulled,
+                "total_refilled": sum_refilled,
+                "buy_vol":  sum_buy_vol,
+                "sell_vol": sum_sell_vol,
+                "hits":     sum_hits,
+                "curr_passive": sum_curr,
+                "peak_passive": sum_peak,
+                "passive_consumed": sum_consumed,
+                "score":     round(legacy_score, 2),
+                "raw_score": round(refill_ratio * 10.0, 2),
+                "cluster_size":   len(members),
+                "cluster_span":   round(c["max"] - c["min"], 2),
+                "cluster_prices": [m[0] for m in members],
+            })
+            merged[anchor_pk] = anchor_data
+
+    return merged
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3763,29 +2413,37 @@ class HawkesBranchingRatio:
             self._last_rho_std = None
             return
 
-        # ── Moment-matching estimator for G (Kirchner 2017) ──
-        # Cross-excitation: count how often a buy follows a sell within decay window
-        # and vice versa. This is cheaper and more stable than full MLE.
+        # ── Volume-weighted moment-matching for G (Kirchner 2017, modified) ──
+        # Weight each triggering event by sqrt(volume / median_volume)
+        # so large trades contribute proportionally more excitation.
         n = len(self._events)
         G = [[0.0, 0.0], [0.0, 0.0]]  # [buy→buy, sell→buy; buy→sell, sell→sell]
-        count = [[0, 0], [0, 0]]
+        weight_sum = [[0.0, 0.0], [0.0, 0.0]]
+
+        # Compute median volume for mark normalization
+        vols = [v for _, _, v in self._events]
+        vols_sorted = sorted(vols)
+        median_vol = vols_sorted[len(vols_sorted) // 2] if vols_sorted else 1.0
+        median_vol = max(median_vol, 1.0)
 
         for i in range(1, n):
-            t_i, s_i, _ = self._events[i]
-            for j in range(i - 1, max(i - 30, -1), -1):  # look back max 30 events
-                t_j, s_j, _ = self._events[j]
+            t_i, s_i, v_i = self._events[i]
+            for j in range(i - 1, max(i - 50, -1), -1):  # look back up to 50 events
+                t_j, s_j, v_j = self._events[j]
                 dt = t_i - t_j
                 if dt > 5.0:  # beyond 5 seconds, excitation is negligible
                     break
                 kernel = _math.exp(-self.decay * dt)
-                G[s_j][s_i] += kernel
-                count[s_j][s_i] += 1
+                # Volume mark: f(v) = sqrt(v / median_v) — sub-linear scaling
+                mark = _math.sqrt(v_j / median_vol)
+                G[s_j][s_i] += kernel * mark
+                weight_sum[s_j][s_i] += mark
 
-        # Normalize by count to get average excitation
+        # Normalize by total volume-weighted count
         for i2 in range(2):
             for j2 in range(2):
-                if count[i2][j2] > 0:
-                    G[i2][j2] /= count[i2][j2]
+                if weight_sum[i2][j2] > 0:
+                    G[i2][j2] /= weight_sum[i2][j2]
 
         # ── Eigenvalues of 2×2 matrix (closed-form, no numpy needed) ──
         # For [[a, b], [c, d]]: eigenvalues = (trace ± sqrt(trace² - 4det)) / 2
@@ -3813,20 +2471,28 @@ class HawkesBranchingRatio:
         # G[1][1] = sell→sell kernel (sell-side self-excitation)
         self._last_g_diag = [round(G[0][0], 4), round(G[1][1], 4)]
 
-        # ── Bootstrap standard error (fast approximation) ──
-        # Poisson approximation: std ≈ rho / sqrt(n_events)
-        rho_std = rho / max(_math.sqrt(n), 1.0)
+        # ── Standard error via jackknife (fast O(1) approximation) ──
+        # For self-exciting process, effective sample size < n due to clustering.
+        # Use volume-weighted effective n: n_eff = (Σw)² / Σw² where w=sqrt(v/med)
+        marks = [_math.sqrt(v / median_vol) for _, _, v in self._events]
+        sum_w = sum(marks)
+        sum_w2 = sum(m * m for m in marks)
+        n_eff = (sum_w * sum_w) / max(sum_w2, 1.0) if sum_w2 > 0 else n
+        rho_std = rho / max(_math.sqrt(n_eff), 1.0)
 
         self._prev_rho = self._last_rho
         self._last_rho = round(rho, 4)
         self._last_rho_std = round(rho_std, 4)
 
-        if rho < 0.8:
+        # σ-adaptive phase classification: ρ's distance from criticality
+        # measured in units of ρ's own sampling std, not a hardcoded 0.8/1.0.
+        band = max(2 * rho_std, 0.05)  # floor to avoid zero-std overcommit
+        if rho < 1.0 - band:
             self._last_phase = "subcritical"
-        elif rho < 1.0:
-            self._last_phase = "near_critical"
-        else:
+        elif rho > 1.0 + band:
             self._last_phase = "supercritical"
+        else:
+            self._last_phase = "near_critical"
 
     def get_state(self):
         """Return current state for v2_signals emit."""
@@ -3865,6 +2531,10 @@ class HawkesBranchingRatio:
 # ── Per-symbol V2 signal instances ──
 _V2_KALMAN: dict = {}   # {symbol: AdaptiveKalmanOFI}
 _V2_HAWKES: dict = {}   # {symbol: HawkesBranchingRatio}
+
+# ── Adverse Selection Engine (Kyle lambda, Glosten-Harris, Huang-Stoll) ──
+from connectors.adverse_selection import AdverseSelectionEngine
+_ADVERSE_SELECTION: dict = {}   # {symbol: AdverseSelectionEngine}
 
 # VPIN bucket size calibration by instrument
 # bucket_size = ~1 minute of average RTH volume (contracts/min)
@@ -4035,6 +2705,22 @@ def _record_dom_snapshot(symbol, dom):
     abs_tiers = {}
     with _L2_LOCK:
         abs_data = L2_STATE.get("absorption", {}).get(symbol, {})
+
+        # Sprint 2: pre-compute WALL/ABS cutoffs ONCE from rolling score distribution.
+        # Hoisted out of the per-level loop — O(N log N) once instead of per level.
+        _sd_list = list(_ABS_SCORE_DIST[symbol])
+        _wd_list = list(_ABS_WAVES_DIST[symbol])
+        if len(_sd_list) >= 50:
+            _sd_sorted = sorted(_sd_list)
+            _wd_sorted = sorted(_wd_list)
+            _wall_score_cut = _sd_sorted[int(len(_sd_sorted) * 0.75)]
+            _wall_waves_cut = max(_wd_sorted[int(len(_wd_sorted) * 0.75)], 3)
+            _abs_score_cut  = _sd_sorted[int(len(_sd_sorted) * 0.50)]
+            _abs_waves_cut  = max(_wd_sorted[int(len(_wd_sorted) * 0.50)], 2)
+        else:
+            _wall_score_cut, _wall_waves_cut = 2.0, 3
+            _abs_score_cut,  _abs_waves_cut  = 1.0, 2
+
         for pk, av in abs_data.items():
             if isinstance(av, dict) and av.get("hits", 0) >= 2:
                 score = av.get("score", 0)
@@ -4070,13 +2756,20 @@ def _record_dom_snapshot(symbol, dom):
                     crack_threshold = 0.3  # fallback only during the first ~20 DOM events
 
                 _abs_side = av.get("side", "")
+
+                # Sprint 2: sample score/waves into rolling deque for percentile cutoffs.
+                # Cutoffs themselves are computed once above the loop.
+                if score > 0:
+                    _ABS_SCORE_DIST[symbol].append(score)
+                    _ABS_WAVES_DIST[symbol].append(waves)
+
                 if raw_score < crack_threshold and shock_count >= 3:
                     abs_tiers[pk] = {"tier": -1, "score": round(score, 2), "label": "CRACK", "waves": waves, "sd": _abs_side}
                     _telemetry.log_event(symbol, "ABSORPTION_CRACK", {"price": pk, "score": round(score, 2), "waves": waves, "shock_hits": shock_count})
-                elif score >= 2.0 and waves >= 3:
+                elif score >= _wall_score_cut and waves >= _wall_waves_cut:
                     abs_tiers[pk] = {"tier": 2, "score": round(score, 2), "label": "WALL", "waves": waves, "sd": _abs_side}
                     _telemetry.log_event(symbol, "ABSORPTION_WALL", {"price": pk, "score": round(score, 2), "waves": waves})
-                elif score >= 1.0 and waves >= 2:
+                elif score >= _abs_score_cut and waves >= _abs_waves_cut:
                     abs_tiers[pk] = {"tier": 1, "score": round(score, 2), "label": "ABS", "waves": waves, "sd": _abs_side}
 
     # ── Model Engines: Queue Dynamics, Trade Toxicity, Level Survival ──
@@ -4158,66 +2851,7 @@ def _record_dom_snapshot(symbol, dom):
     if vclock and vclock.warm:
         v2_sigs["tape_floor"] = round(vclock.bucket_size, 1)
 
-    # ── Push to frontend via WebSocket ──
-    if _socketio is not None:
-        try:
-            # Compute live spread from snapshot.
-            # Spread = best_ask - best_bid in tick units.
-            # Critical market-maker signal: widening spread = thin book = don't quote.
-            _snap_best_bid = max((float(k) for k in snap_bids), default=0.0)
-            _snap_best_ask = min((float(k) for k in snap_asks), default=0.0)
-            _snap_spread   = round(_snap_best_ask - _snap_best_bid, 4) if _snap_best_ask > _snap_best_bid else 0.0
-
-            payload = {
-                "sym":      symbol,
-                "ts":       now,
-                "bids":     snap_bids,
-                "asks":     snap_asks,
-                "trades":   compact_trades,
-                "abs":      compact_abs,
-                "best_bid": _snap_best_bid,
-                "best_ask": _snap_best_ask,
-                "spread":   _snap_spread,
-            }
-            # Only include depth_vel if non-empty (avoid payload bloat)
-            if depth_vel:
-                payload["depth_vel"] = depth_vel
-            # Only include abs_tiers if non-empty (avoid payload bloat)
-            if abs_tiers:
-                payload["abs_tiers"] = abs_tiers
-            # ── Model engine outputs ──
-            qd = _QUEUE_DYNAMICS.get(symbol)
-            if qd:
-                qd_state = qd.get_state()
-                if qd_state:
-                    payload["queue_dynamics"] = qd_state
-            tox = _TRADE_TOXICITY.get(symbol)
-            if tox:
-                tox_state = tox.get_state()
-                if tox_state:
-                    payload["trade_toxicity"] = tox_state
-            surv = _LEVEL_SURVIVAL.get(symbol)
-            if surv:
-                _mid = (_snap_best_bid + _snap_best_ask) / 2 if _snap_best_bid > 0 and _snap_best_ask > 0 else 0
-                surv_state = surv.get_survival(
-                    snap_bids, snap_asks, _mid,
-                    payload.get("queue_dynamics"),
-                    payload.get("trade_toxicity"),
-                )
-                if surv_state:
-                    payload["level_survival"] = surv_state
-            _socketio.emit("dom_snapshot", payload, namespace="/")
-        except Exception as e:
-            log.debug("dom_snapshot emit error: %s", e)
-
-        # ── V2 Signals: separate channel at ~2Hz (same cadence as dom_snapshot) ──
-        if v2_sigs:
-            try:
-                v2_sigs["sym"] = symbol
-                v2_sigs["ts"] = now
-                _socketio.emit("v2_signals", v2_sigs, namespace="/")
-            except Exception:
-                pass
+    # dom_snapshot + v2_signals removed — all DOM data flows via l2_update push loop
 
     # ── T1: Downsample (every 2s) ──
     last_t1 = _DOM_HIST_LAST_T1.get(symbol, 0)
@@ -4342,6 +2976,8 @@ def _init_frameworks():
 
 # ── Callbacks ─────────────────────────────────────────────────────────────────
 
+_DIRECT_DOM_LAST = {}  # {symbol: last_emit_time} — throttle direct DOM push
+
 def on_dom_update(symbol: str, dom: dict):
     """Called by connector every time a DOM level changes."""
     global _shannon, _ising, _reynolds
@@ -4360,8 +2996,19 @@ def on_dom_update(symbol: str, dom: dict):
         _reynolds.update(price=mid, spread=spr, volume=float(tot))
 
     with _L2_LOCK:
-        # Deep copy to prevent connector thread from mutating nested bids/asks
-        L2_STATE["dom"][symbol]        = copy.deepcopy(dom)
+        # Shallow copy bids/asks dicts (sufficient — values are numbers, not nested)
+        _dom_copy = {
+            "bids": dict(dom.get("bids", {})),
+            "asks": dict(dom.get("asks", {})),
+            "best_bid": dom.get("best_bid", 0),
+            "best_ask": dom.get("best_ask", 0),
+            "mid_price": mid,
+            "spread": spr,
+            "bid_total": dom.get("bid_total", 0),
+            "ask_total": dom.get("ask_total", 0),
+            "imbalance": imb,
+        }
+        L2_STATE["dom"][symbol]        = _dom_copy
         L2_STATE["imbalance"][symbol]  = imb
         L2_STATE["mid_prices"][symbol] = mid
         L2_STATE["last_update"]        = time.time()
@@ -4371,8 +3018,46 @@ def on_dom_update(symbol: str, dom: dict):
         if _reynolds and mid > 0:
             L2_STATE["signals"]["reynolds_number"] = _reynolds.get_signal()
 
-    # ── DOM snapshot for iceberg cross-validation (Elite #1) ──
-    _dom_update_snapshots(symbol, dom)
+    # Direct DOM push — bypasses the 80ms push loop thread.
+    # Throttled to 50ms (20Hz) to prevent flooding Socket.IO.
+    if _socketio and mid > 0:
+        _now = time.time()
+        _last_dom = _DIRECT_DOM_LAST.get(symbol, 0)
+        if _now - _last_dom >= 0.05:  # 50ms = 20Hz
+            _DIRECT_DOM_LAST[symbol] = _now
+            try:
+                # Send trimmed DOM directly — 30 levels each side
+                _DOM_LVL = 50
+                raw_bids = dom.get("bids", {})
+                raw_asks = dom.get("asks", {})
+                if len(raw_bids) > _DOM_LVL:
+                    _tb = sorted(raw_bids.items(), key=lambda x: float(x[0]), reverse=True)[:_DOM_LVL]
+                    _bids = dict(_tb)
+                else:
+                    _bids = raw_bids
+                if len(raw_asks) > _DOM_LVL:
+                    _ta = sorted(raw_asks.items(), key=lambda x: float(x[0]))[:_DOM_LVL]
+                    _asks = dict(_ta)
+                else:
+                    _asks = raw_asks
+                _socketio.emit("l2_update", {
+                    "connected": True,
+                    "dom": {symbol: {
+                        "bids": _bids, "asks": _asks,
+                        "best_bid": dom.get("best_bid", 0),
+                        "best_ask": dom.get("best_ask", 0),
+                        "mid_price": mid, "spread": spr,
+                        "bid_total": dom.get("bid_total", 0),
+                        "ask_total": dom.get("ask_total", 0),
+                        "imbalance": imb,
+                    }},
+                    "imbalance": {symbol: imb},
+                    "mid_prices": {symbol: mid},
+                    "last_update": _now,
+                    "signals": {},
+                }, namespace="/")
+            except Exception:
+                pass
 
     # ── 2D DOM Heatmap: record snapshot for historical heatmap ──
     try:
@@ -4385,6 +3070,59 @@ def on_dom_update(symbol: str, dom: dict):
         _compute_absorption_scores(symbol, dom)
     except Exception as e:
         log.debug(f"Absorption compute error: {e}")
+
+    # ── Refill Speed Tracking — measures how fast DOM reloads after hits ──
+    try:
+        now_rf = time.time()
+        _rf_bids = dom.get("bids", {})
+        _rf_asks = dom.get("asks", {})
+        # Use normalized price keys (round to 2 decimal places)
+        cur_depth = {}
+        for ps, sz in _rf_bids.items():
+            pk = str(round(float(ps), 2))
+            cur_depth[pk] = cur_depth.get(pk, 0) + sz
+        for ps, sz in _rf_asks.items():
+            pk = str(round(float(ps), 2))
+            cur_depth[pk] = cur_depth.get(pk, 0) + sz
+
+        prev = _LAST_DOM_DEPTH.get(symbol, {})
+        if symbol not in _REFILL_TRACKER:
+            _REFILL_TRACKER[symbol] = {}
+        rt = _REFILL_TRACKER[symbol]
+
+        for ps, cur_sz in cur_depth.items():
+            prev_sz = prev.get(ps, 0)
+            # Hit detection: depth decreased by 2+ contracts (not percentage — works on thin books)
+            if prev_sz >= 2 and cur_sz < prev_sz - 1:
+                rt[ps] = {"hit_ts": now_rf, "avg_ms": rt.get(ps, {}).get("avg_ms", 0),
+                          "count": rt.get(ps, {}).get("count", 0), "classification": "gone"}
+            # Refill detection: was hit, now depth increased
+            elif ps in rt and rt[ps].get("hit_ts", 0) > 0 and cur_sz > prev_sz:
+                hit_ts = rt[ps]["hit_ts"]
+                ms = (now_rf - hit_ts) * 1000
+                if ms < 10000:  # only count refills within 10s
+                    old_avg = rt[ps].get("avg_ms", ms)
+                    old_count = rt[ps].get("count", 0)
+                    new_count = old_count + 1
+                    new_avg = (old_avg * old_count + ms) / new_count
+                    cls = "instant" if new_avg < 150 else "fast" if new_avg < 1000 else "slow"
+                    rt[ps] = {"hit_ts": 0, "avg_ms": round(new_avg, 0), "count": new_count, "classification": cls}
+
+        # Expire stale entries (>10s since hit with no refill = gone)
+        stale = [ps for ps, v in rt.items() if v.get("hit_ts", 0) > 0 and now_rf - v["hit_ts"] > 10]
+        for ps in stale:
+            rt[ps]["classification"] = "gone"
+            rt[ps]["hit_ts"] = 0
+
+        # Cap tracker size (prevent unbounded growth)
+        if len(rt) > 500:
+            oldest = sorted(rt.items(), key=lambda x: x[1].get("count", 0))[:200]
+            for k, _ in oldest:
+                del rt[k]
+
+        _LAST_DOM_DEPTH[symbol] = cur_depth
+    except Exception:
+        pass
 
     # ── Upgrade C: Micro-OFI — per-level order flow imbalance ──
     try:
@@ -4404,6 +3142,13 @@ def on_dom_update(symbol: str, dom: dict):
                     if "spoofs" not in cur:
                         cur["spoofs"] = []
                     cur["spoofs"].extend(spoof_hits)
+
+    # ── NQ-native signal check (VPIN, Hawkes, Kyle, OFI) — NQ only ──
+    if _nq_signal_callback and symbol == 'NQ':
+        try:
+            _nq_signal_callback(symbol)
+        except Exception:
+            pass
 
 
 def on_quote(symbol: str, quote: dict):
@@ -4505,42 +3250,8 @@ def on_trade(symbol: str, trade: dict):
             _VPIN_ENGINES[symbol].on_trade(symbol, vol, side if side in ('b', 's') else 'n', ts)
             log.info(f"[VPIN] Engine bootstrapped on first trade for {symbol} (bucket={bucket})")
 
-        # ── Footprint Engine: cumulative delta per price level ──
-        # Feed every trade into the candle footprint so iceberg detection
-        # can compute true absorption vs falling knife at detection time.
         tick_size = TICK_SIZES.get(symbol, DEFAULT_TICK_SIZE)
         qp = str(round(round(price / tick_size) * tick_size, 2))
-        if side in ('b', 's'):
-            _candle_ts = int(ts / _FOOTPRINT_CANDLE_SEC) * _FOOTPRINT_CANDLE_SEC
-            _fp = _FOOTPRINT[symbol]
-            if _candle_ts != _fp['candle_ts']:
-                # New candle: clear the footprint (keep only current candle's data)
-                _fp['candle_ts'] = _candle_ts
-                _fp['levels'].clear()
-            _fp_level = _fp['levels'][round(price, 2)]
-            _fp_level['n_trades'] += 1
-            if side == 'b':
-                _fp_level['buy_vol'] += vol
-                # Ask-hold check: did the ask stay at this price after the buy lift?
-                # If ask stayed → seller wall absorbing buyers (short setup)
-                with _L2_LOCK:
-                    _cur_ask = L2_STATE['dom'].get(symbol, {}).get('best_ask', 0.0)
-                if _cur_ask > 0:
-                    if abs(_cur_ask - price) <= tick_size:  # ask still AT this level
-                        _fp_level['ask_anchored'] += vol
-                    else:
-                        _fp_level['ask_dropped'] += vol    # ask moved away
-            else:
-                _fp_level['sell_vol'] += vol
-                # Bid-hold check: did the bid stay at this price after the sell?
-                # If bid stayed → buyer wall absorbing sellers (long setup)
-                with _L2_LOCK:
-                    _cur_bid = L2_STATE['dom'].get(symbol, {}).get('best_bid', 0.0)
-                if _cur_bid > 0:
-                    if abs(_cur_bid - price) <= tick_size:  # bid still AT this level
-                        _fp_level['bid_anchored'] += vol
-                    else:
-                        _fp_level['bid_dropped'] += vol    # bid moved away
 
         # ── Orderflow Detection (runs before candle update) ──
 
@@ -4556,6 +3267,9 @@ def on_trade(symbol: str, trade: dict):
             tox.record_trade(ts, price, side, qp)
 
         # ── V2 Signal Engines: feed every trade ──
+        # Pre-define BBO variables for use by downstream code (adverse selection)
+        best_bid_px = 0.0
+        best_ask_px = 0.0
         try:
             _ensure_v2_engines(symbol)
 
@@ -4608,69 +3322,16 @@ def on_trade(symbol: str, trade: dict):
         except Exception as e:
             log.debug(f"V2 signal engine error: {e}")
 
-        # Iceberg detection
-        ice_hit = _detect_iceberg(symbol, qp, vol, ts, side)
-        if ice_hit:
-            with _CANDLE_LOCK:
-                for tf in CANDLE_TIMEFRAMES:
-                    cur = _CURRENT_CANDLE[symbol].get(tf)
-                    if cur:
-                        if "icebergs" not in cur:
-                            cur["icebergs"] = {}
-                        cur["icebergs"][qp] = ice_hit
-                        # Stamp the bp entry with footprint data so the bubble
-                        # renderer can visually distinguish true absorption.
-                        # bp[qp] = [buyVol, sellVol, fp_score, true_abs, book_size_at_trade]
-                        _bp = cur.get("bp", {})
-                        if qp in _bp:
-                            entry = _bp[qp]
-                            # Extend bp entry with footprint metadata at index 2, 3
-                            while len(entry) < 4:
-                                entry.append(None)
-                            _fp_score = ice_hit.get("fp_absorption_score", 0.0)
-                            _t_abs    = 1 if ice_hit.get("true_absorption", False) else 0
-                            entry[2]  = round(_fp_score, 3)
-                            entry[3]  = _t_abs
-            # Forward to EdgeDetector
-            if _detection_callback:
-                try:
-                    _detection_callback('iceberg', ice_hit, symbol)
-                except Exception:
-                    pass
-
-        # Drifting iceberg detection (Elite #4)
-        drift_hit = _detect_drifting_iceberg(symbol, price, vol, ts, side)
-        if drift_hit:
-            with _CANDLE_LOCK:
-                for tf in CANDLE_TIMEFRAMES:
-                    cur = _CURRENT_CANDLE[symbol].get(tf)
-                    if cur:
-                        cur["drifting_iceberg"] = drift_hit
-            # Forward to EdgeDetector
-            if _detection_callback:
-                try:
-                    _detection_callback('drifting_iceberg', drift_hit, symbol)
-                except Exception:
-                    pass
-
-        # Wall Gone detection (Elite #3)
-        wall_gone_alerts = _check_wall_gone(symbol, ts)
-        if wall_gone_alerts:
-            with _CANDLE_LOCK:
-                for tf in CANDLE_TIMEFRAMES:
-                    cur = _CURRENT_CANDLE[symbol].get(tf)
-                    if cur:
-                        if "wall_gone" not in cur:
-                            cur["wall_gone"] = []
-                        if len(cur["wall_gone"]) < 200:
-                            cur["wall_gone"].extend(wall_gone_alerts)
-            # Forward each wall_gone alert to EdgeDetector
-            if _detection_callback:
-                for wg in wall_gone_alerts:
-                    try:
-                        _detection_callback('wall_gone', wg, symbol)
-                    except Exception:
-                        pass
+        # ── Adverse Selection: feed every classified trade ──
+        if side in ('b', 's'):
+            try:
+                if symbol not in _ADVERSE_SELECTION:
+                    _ADVERSE_SELECTION[symbol] = AdverseSelectionEngine()
+                mid = (best_bid_px + best_ask_px) / 2.0 if best_bid_px > 0 and best_ask_px > 0 else price
+                sprd = (best_ask_px - best_bid_px) if best_ask_px > best_bid_px else 0.0
+                _ADVERSE_SELECTION[symbol].on_trade(mid, price, sprd, vol, side, ts)
+            except Exception as e:
+                log.debug(f"Adverse selection error: {e}")
 
         # Sweep detection
         sweep_hit = _detect_sweep(symbol, price, vol, ts, side)
@@ -4742,6 +3403,7 @@ def on_trade(symbol: str, trade: dict):
                 "volume": vol,
                 "side": side,
                 "timestamp": iso_ts,
+                "_emit_ts": time.time(),
             }, namespace="/")
         except Exception as e:
             log.debug("trade_tick emit error: %s", e)
@@ -4831,7 +3493,7 @@ def _heavy_compute_loop():
 
 
 # ── L2 State WebSocket Push (replaces frontend REST polling) ────────────────
-_L2_PUSH_INTERVAL = 0.4  # 400ms — faster than old 500ms REST poll
+_L2_PUSH_INTERVAL = 0.08  # 80ms — 12.5Hz L2 state push (was 400ms)
 
 def _l2_push_loop():
     """Push L2 state via Socket.IO every 400ms.
@@ -4848,21 +3510,16 @@ def _l2_push_loop():
             continue
         try:
             with _L2_LOCK:
-                # Build a LEAN state — only what other events don't cover
+                # Push loop: skip DOM bids/asks entirely — direct emit from
+                # on_dom_update handles DOM at 20Hz. This loop only sends signals.
                 dom_meta = {}
-                for k, v in L2_STATE["dom"].items():
-                    if isinstance(v, dict):
-                        dom_meta[k] = {
-                            "bids": dict(v.get("bids", {})) if isinstance(v.get("bids"), dict) else {},
-                            "asks": dict(v.get("asks", {})) if isinstance(v.get("asks"), dict) else {},
-                            "best_bid": v.get("best_bid", 0),
-                            "best_ask": v.get("best_ask", 0),
-                            "mid_price": v.get("mid_price", 0),
-                            "spread": v.get("spread", 0),
-                            "bid_total": v.get("bid_total", 0),
-                            "ask_total": v.get("ask_total", 0),
-                            "imbalance": v.get("imbalance", 0),
-                        }
+                # Inject adverse selection state into signals
+                for _as_sym, _as_eng in _ADVERSE_SELECTION.items():
+                    if _as_eng.warm:
+                        _as_state = _as_eng.get_state()
+                        for _as_k, _as_v in _as_state.items():
+                            L2_STATE["signals"][f"{_as_sym}_as_{_as_k}"] = _as_v
+
                 state = {
                     "connected":     bool(L2_STATE["connected"]),
                     "dom":           dom_meta,
@@ -4902,7 +3559,10 @@ def start_l2_worker() -> TopStepXConnector:
     log.info("  User: %s", USERNAME)
     log.info("=" * 55)
 
-    _init_frameworks()
+    if _ALPHA_ENABLED:
+        _init_frameworks()
+    else:
+        log.info("L2: frameworks disabled (set ALPHA_ENABLED=1 to enable)")
 
     _connector = TopStepXConnector(
         username=USERNAME,
@@ -5035,11 +3695,12 @@ def start_l2_worker() -> TopStepXConnector:
             _bp_restore_candles(_sym)
 
         # Start heavy-framework background loop (daemon — dies with main thread)
-        _heavy_thread = threading.Thread(
-            target=_heavy_compute_loop, daemon=True, name="HeavyFrameworks"
-        )
-        _heavy_thread.start()
-        log.info("L2 worker: heavy framework pre-compute loop started (60s interval)")
+        if _ALPHA_ENABLED:
+            _heavy_thread = threading.Thread(
+                target=_heavy_compute_loop, daemon=True, name="HeavyFrameworks"
+            )
+            _heavy_thread.start()
+            log.info("L2 worker: heavy framework pre-compute loop started (60s interval)")
 
         # Start L2 state WebSocket push loop (replaces frontend REST polling)
         _l2_push_thread = threading.Thread(
@@ -5047,6 +3708,160 @@ def start_l2_worker() -> TopStepXConnector:
         )
         _l2_push_thread.start()
         log.info("L2 worker: WebSocket push loop started (%.0fms interval)", _L2_PUSH_INTERVAL * 1000)
+
+        # ── Tick-level bp backfill: fetch 1s bars, rebuild buy/sell per price ──
+        def _backfill_tick_bp(connector, sym, cid, session_open_dt):
+            """Fetch 1-second bars in chunks, rebuild bp for each 1m candle.
+
+            Uses Lee-Ready tick rule for buy/sell classification:
+            price up from prior bar → buy, price down → sell, unchanged → inherit.
+            """
+            import time as _bt
+            from datetime import timedelta as _td, timezone as _tz
+
+            session_start_utc = session_open_dt.astimezone(_tz.utc)
+            now_utc = datetime.now(_tz.utc)
+            total_seconds = (now_utc - session_start_utc).total_seconds()
+
+            if total_seconds <= 0:
+                log.info("Tick backfill %s: session hasn't started yet", sym)
+                return
+
+            # Chunk into 4-hour windows (max ~14,400 1s bars per chunk, under 20k limit)
+            CHUNK_HOURS = 4
+            chunk_secs = CHUNK_HOURS * 3600
+            chunks = []
+            cursor = session_start_utc
+            while cursor < now_utc:
+                chunk_end = min(cursor + _td(seconds=chunk_secs), now_utc)
+                chunks.append((cursor, chunk_end))
+                cursor = chunk_end
+
+            log.info("Tick backfill %s: %d chunks covering %.1f hours",
+                     sym, len(chunks), total_seconds / 3600)
+
+            # Collect all 1s bars
+            all_ticks = []
+            for i, (c_start, c_end) in enumerate(chunks):
+                start_iso = c_start.isoformat()
+                ticks = connector.retrieve_bars(
+                    cid, start_time=start_iso,
+                    unit=1, unit_number=1, limit=20000
+                )
+                if ticks:
+                    # Filter to only ticks within this chunk's window
+                    for tk in ticks:
+                        try:
+                            dt = datetime.fromisoformat(tk["t"].replace("Z", "+00:00"))
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=_tz.utc)
+                            if dt < c_end:
+                                tk["_ts"] = dt.timestamp()
+                                all_ticks.append(tk)
+                        except Exception:
+                            continue
+
+                    truncated = len(ticks) >= 20000
+                    log.info("Tick backfill %s chunk %d/%d: %d ticks%s",
+                             sym, i + 1, len(chunks), len(ticks),
+                             " (TRUNCATED — may have gaps)" if truncated else "")
+                else:
+                    log.info("Tick backfill %s chunk %d/%d: 0 ticks", sym, i + 1, len(chunks))
+
+                _bt.sleep(0.5)  # Rate limit between API calls
+
+            if not all_ticks:
+                log.info("Tick backfill %s: no tick data returned", sym)
+                return
+
+            # Sort by timestamp
+            all_ticks.sort(key=lambda t: t["_ts"])
+            log.info("Tick backfill %s: %d total 1s bars, building bp...", sym, len(all_ticks))
+
+            # ── Lee-Ready tick rule: classify buy/sell ──
+            # Group ticks into 1m boundaries, build bp per minute
+            bp_per_minute = {}  # {boundary_ts: {price_str: [buy_vol, sell_vol]}}
+            prev_close = 0
+            prev_side = "buy"
+
+            for tk in all_ticks:
+                ts = tk["_ts"]
+                price = float(tk.get("c", 0))
+                vol = int(tk.get("v", 0))
+                if price <= 0 or vol <= 0:
+                    continue
+
+                # Lee-Ready: classify based on price movement
+                if prev_close > 0:
+                    if price > prev_close:
+                        side = "buy"
+                    elif price < prev_close:
+                        side = "sell"
+                    else:
+                        side = prev_side  # unchanged → inherit
+                else:
+                    side = "buy"
+                prev_close = price
+                prev_side = side
+
+                # Also use OHLC within the 1s bar for finer distribution
+                # Distribute volume across the high-low range
+                o = float(tk.get("o", price))
+                h = float(tk.get("h", price))
+                l = float(tk.get("l", price))
+                tick_size = 0.25
+
+                boundary = _candle_boundary(ts, 60)
+                if boundary not in bp_per_minute:
+                    bp_per_minute[boundary] = {}
+                bp = bp_per_minute[boundary]
+
+                if h == l:
+                    # Single price tick
+                    pk = f"{price:.2f}"
+                    if pk not in bp:
+                        bp[pk] = [0, 0]
+                    if side == "buy":
+                        bp[pk][0] += vol
+                    else:
+                        bp[pk][1] += vol
+                else:
+                    # Multi-price 1s bar — distribute volume across range
+                    prices_in_bar = []
+                    p = l
+                    while p <= h + tick_size * 0.01:
+                        prices_in_bar.append(round(p, 2))
+                        p += tick_size
+                    if not prices_in_bar:
+                        prices_in_bar = [price]
+                    vol_per_level = max(1, vol // len(prices_in_bar))
+                    remainder = vol - vol_per_level * len(prices_in_bar)
+                    for j, pp in enumerate(prices_in_bar):
+                        pk = f"{pp:.2f}"
+                        if pk not in bp:
+                            bp[pk] = [0, 0]
+                        v_alloc = vol_per_level + (1 if j < remainder else 0)
+                        if side == "buy":
+                            bp[pk][0] += v_alloc
+                        else:
+                            bp[pk][1] += v_alloc
+
+            # ── Patch existing candles with reconstructed bp ──
+            patched = 0
+            skipped_live = 0
+            with _CANDLE_LOCK:
+                candles = _CANDLES.get(sym, {}).get("1m", [])
+                for candle in candles:
+                    ct = candle.get("t", 0)
+                    if "bp" in candle and candle["bp"]:
+                        skipped_live += 1
+                        continue  # Live candle already has real bp — don't overwrite
+                    if ct in bp_per_minute:
+                        candle["bp"] = bp_per_minute[ct]
+                        patched += 1
+
+            log.info("Tick backfill %s: patched %d candles with real bp (skipped %d live)",
+                     sym, patched, skipped_live)
 
         # Backfill price history + candle chart from retrieveBars API
         def _backfill():
@@ -5203,7 +4018,22 @@ def start_l2_worker() -> TopStepXConnector:
                     log.info("L2 backfill: %s seeded %d bars → %d total candles across all TFs",
                              sym, len(bars), candle_count)
 
-                log.info("L2 backfill: complete for all symbols")
+                log.info("L2 backfill: 1m bars complete — starting tick bp backfill...")
+
+                # ── Phase 2: Tick-level bp backfill ──
+                # Fetch 1-second bars in chunks, rebuild buy/sell per price (bp)
+                # for each 1m candle. This gives the VP real volume-at-price
+                # instead of the estimated 60/40 split.
+                for sym in SYMBOLS:
+                    cid = _connector._symbol_to_contract.get(sym)
+                    if not cid:
+                        continue
+                    try:
+                        _backfill_tick_bp(_connector, sym, cid, session_open)
+                    except Exception as tick_err:
+                        log.warning("L2 tick backfill failed for %s: %s", sym, tick_err)
+
+                log.info("L2 backfill: complete for all symbols (1m + tick bp)")
             except Exception as e:
                 import traceback
                 log.warning("L2 backfill FAILED: %s\n%s", e, traceback.format_exc())
@@ -5220,6 +4050,11 @@ def start_l2_worker() -> TopStepXConnector:
 
 def get_connector() -> TopStepXConnector:
     return _connector
+
+
+def get_adverse_selection(symbol: str):
+    """Return the AdverseSelectionEngine for a symbol, or None if not yet created."""
+    return _ADVERSE_SELECTION.get(symbol)
 
 
 # ── Standalone execution ──────────────────────────────────────────────────────
