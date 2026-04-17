@@ -815,12 +815,13 @@ def _schwab_chain_raw(ticker, exp_date):
     return options, data.get("underlyingPrice", 0)
 
 
-@app.route("/api/flow")
-def api_flow():
-    """Return snapshot of signed + unsigned Δ notional flow per ticker.
+@app.route("/api/option_flow")
+def api_option_flow():
+    """Snapshot of signed + unsigned Δ notional flow per ticker, from FlowAccumulator.
 
-    Powers initial hydration when the flow pane mounts (live updates
-    arrive via the 'flow_update' socketio event).
+    Powers initial hydration when the flow pane mounts. Live updates
+    after hydration arrive via the 'flow_update' socketio event.
+    Separate from /api/flow (which is FlowClassifier's L2-book scores).
     """
     try:
         from connectors.flow_accumulator import get_accumulator

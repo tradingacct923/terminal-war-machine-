@@ -2870,6 +2870,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     if (typeof OptionsFlowPane !== 'undefined') OptionsFlowPane.init(slotEl);
                 } else if (featureKey === 'vpintel') {
                     if (typeof VPIntelPane !== 'undefined') VPIntelPane.init(slotEl);
+                } else if (featureKey === 'flow') {
+                    if (typeof FlowPane !== 'undefined') FlowPane.init(slotEl);
                 } else if (featureKey === 'ocheat') {
                     // Options Chain GEX Heatmap (Canvas2D)
                     slotEl.innerHTML = `<div style="width:100%;height:100%;background:#070a14;position:relative">
@@ -2984,6 +2986,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (featureKey === 'volsurf' && typeof VolSurfacePane !== 'undefined') VolSurfacePane.destroy();
                 if (featureKey === 'optflow' && typeof OptionsFlowPane !== 'undefined') OptionsFlowPane.destroy();
                 if (featureKey === 'vpintel' && typeof VPIntelPane !== 'undefined') VPIntelPane.destroy(slotEl);
+                if (featureKey === 'flow' && typeof FlowPane !== 'undefined') FlowPane.destroy();
             };
 
             AltarisLayout.triggerInitialMounts();
