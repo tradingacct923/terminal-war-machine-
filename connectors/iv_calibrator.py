@@ -65,20 +65,40 @@ class IVCalibrator:
             self._thread.join(timeout=5)
 
     def get_calibration(self):
-        """Get latest IV calibration data (thread-safe)."""
+        """Get latest IV calibration data with freshness check (thread-safe)."""
         with self._lock:
-            return dict(self._latest)
+            data = dict(self._latest)
+        ts = data.get('timestamp')
+        if not ts:
+            data['freshness'] = 'UNINIT'
+            return data
+        try:
+            age = (datetime.now() - datetime.fromisoformat(ts)).total_seconds()
+            if age > self._poll_interval * 4:
+                data['freshness'] = 'DEAD'
+            elif age > self._poll_interval * 2:
+                data['freshness'] = 'STALE'
+            else:
+                data['freshness'] = 'FRESH'
+            data['age_seconds'] = int(age)
+        except Exception:
+            data['freshness'] = 'UNKNOWN'
+        return data
 
     def _poll_loop(self):
-        """Background polling loop."""
-        # Initial delay: let other systems start up
+        """Background polling loop with exponential backoff on failure."""
         time.sleep(10)
+        fail_count = 0
         while self._running:
             try:
                 self._poll_tradier()
+                fail_count = 0
+                time.sleep(self._poll_interval)
             except Exception as e:
-                print(f"[IV-CAL] ⚠️ Poll failed: {e}")
-            time.sleep(self._poll_interval)
+                fail_count += 1
+                backoff = min(self._poll_interval * (2 ** min(fail_count, 4)), 3600)
+                print(f"[IV-CAL] ⚠️ Poll failed ({fail_count}x): {e} — backing off {backoff}s")
+                time.sleep(backoff)
 
     def _poll_tradier(self):
         """Fetch Tradier chain with greeks=true, extract IV surface."""

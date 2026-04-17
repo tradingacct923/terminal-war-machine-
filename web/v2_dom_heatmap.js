@@ -11,14 +11,12 @@
 // ═══════════════════════════════════════════════════════════════════════════
 const HM_DEFAULTS = {
     imbalance: true, bidColor: '#00ff96', askColor: '#ff4030', imbalanceOpacity: 75,
-    wallglow: false, wallglowBlur: 8,
     wallColor: '#ffffff', wallBlend: 90,
     densityBoost: 100,
     midprice: true, midpriceColor: '#ffdc00', midpriceWidth: 2,
     microprice: true, micropriceColor: '#00dcff', micropriceWidth: 3,
-    trades: false, buyColor: '#00ff78', sellColor: '#ff3246', tradesSize: 6,
+    buyColor: '#00ff78', sellColor: '#ff3246',
     delta: true, deltaHeight: 40,
-    spread: false, spreadHeight: 14,
     persistence: true,
     velocity: true,
     depthMax: 0,
@@ -27,7 +25,6 @@ const HM_DEFAULTS = {
     persistMid: 5,
     persistHigh: 20,
     velSigma: 10,
-    wallglowPct: 90,
     ewmaAlpha: 5,
     flickerFilter: 0,
     bboBar: true,
@@ -35,6 +32,17 @@ const HM_DEFAULTS = {
 };
 
 const HeatmapSettings = { ...HM_DEFAULTS };
+
+try {
+    const saved = localStorage.getItem('heatmapSettings');
+    if (saved) Object.assign(HeatmapSettings, JSON.parse(saved));
+} catch (_) {}
+
+if (window.AltarisEvents) {
+    window.AltarisEvents.on('hms:updated', (next) => {
+        try { Object.assign(HeatmapSettings, next || {}); } catch (_) {}
+    });
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // HELPERS
@@ -63,8 +71,7 @@ function _cachedRgba(r, g, b, a) {
 // ═══════════════════════════════════════════════════════════════════════════
 class HeatmapStateManager {
     constructor() {
-        this.socketRef = null;
-        this.HISTORY_LIMIT = 2500;
+        this.HISTORY_LIMIT = 600; // 60s at 10Hz — prevents 50-100MB leak over 2hrs
         this.CURRENT_COL_WIDTH = 12;
 
         this._snapshots = [];
@@ -366,73 +373,37 @@ const DOM2D_STATE = new HeatmapStateManager();
 // ═══════════════════════════════════════════════════════════════════════════
 // LIFECYCLE / CONNECTIONS
 // ═══════════════════════════════════════════════════════════════════════════
+let _domHistoryAbort = null;
+let _domHistorySymbol = '';
 function _fetchDomHistory(symbol) {
     if (!symbol) return;
-    fetch(`/api/l2/dom-history?symbol=${encodeURIComponent(symbol)}&limit=150`)
+    if (_domHistoryAbort) { try { _domHistoryAbort.abort(); } catch (_) {} }
+    const ctrl = new AbortController();
+    _domHistoryAbort = ctrl;
+    _domHistorySymbol = symbol;
+    fetch(`/api/l2/dom-history?symbol=${encodeURIComponent(symbol)}&limit=150`, { signal: ctrl.signal })
         .then(res => res.json())
         .then(data => {
+            if (ctrl.signal.aborted || _domHistorySymbol !== symbol) return;
             if (!data.history || !Array.isArray(data.history)) return;
             DOM2D_STATE.destroy();
             data.history.forEach(rawBody => {
                 DOM2D_STATE.pushSnapshot(rawBody);
             });
         })
-        .catch(err => console.error("DOM history fetch fail:", err));
+        .catch(err => { if (err.name !== 'AbortError') console.error("DOM history fetch fail:", err); });
 }
 
 function startDomHistory(symbol) {
+    // REST backfill: fetch historical snapshots. Live updates need a rewire
+    // from the removed dom_snapshot event onto l2_update — heatmap is static
+    // until that lands.
     DOM2D_STATE.destroy();
-
-    // REST backfill: fetch historical snapshots
     _fetchDomHistory(symbol);
-
-    // Close any existing raw socket
-    if (DOM2D_STATE.socketRef) {
-        try { DOM2D_STATE.socketRef.close(); } catch(e) {}
-        DOM2D_STATE.socketRef = null;
-    }
-
-    // Use Socket.IO (same transport the backend supports via dom_snapshot events)
-    function _attachSio() {
-        const sio = window._sio;
-        if (!sio) {
-            // Retry until Socket.IO is ready (page load timing)
-            setTimeout(_attachSio, 300);
-            return;
-        }
-        // Remove only OUR previous heatmap listener (not v2_integration's)
-        if (DOM2D_STATE._domSnapshotHandler) {
-            sio.off('dom_snapshot', DOM2D_STATE._domSnapshotHandler);
-        }
-        DOM2D_STATE._domSnapshotHandler = (data) => {
-            if (!data || data.sym !== symbol) return;
-            // Store absorption buffer for v2_integration
-            if (data.abs) window._v2AbsBuffer = data.abs;
-            // Store pre-classified backend tiers (P0 upgrade)
-            if (data.abs_tiers) window.domSnapshotAbsTiers = data.abs_tiers;
-            DOM2D_STATE.pushSnapshot({
-                ts: data.ts,
-                bids: data.bids || {},
-                asks: data.asks || {},
-                trades: data.trades || [],
-                absorption: data.abs || {},
-            });
-        };
-        sio.on('dom_snapshot', DOM2D_STATE._domSnapshotHandler);
-        DOM2D_STATE.socketRef = sio; // store reference so stopDomHistory can clean up
-        console.log('[v2_dom_heatmap] Socket.IO dom_snapshot listener active for', symbol);
-    }
-    _attachSio();
 }
 
 function stopDomHistory() {
     DOM2D_STATE.destroy();
-    // Remove only OUR heatmap listener (preserve v2_integration's listener)
-    if (window._sio && DOM2D_STATE._domSnapshotHandler) {
-        window._sio.off('dom_snapshot', DOM2D_STATE._domSnapshotHandler);
-        DOM2D_STATE._domSnapshotHandler = null;
-    }
-    DOM2D_STATE.socketRef = null;
     const tt = document.getElementById('dom2d-tooltip');
     if (tt) tt.style.display = 'none';
 }
@@ -576,7 +547,6 @@ function renderDomHeatmap2D(canvas, safePriceToY = null, midPrice = 0, chartComp
 
     const intensityScale = HeatmapSettings.densityBoost / 100;
     const blendFactor = HeatmapSettings.wallBlend / 100;
-    const wallThreshold = HeatmapSettings.depthMax > 0 ? HeatmapSettings.depthMax : DOM2D_STATE._ewmaMean + 1.5 * DOM2D_STATE._ewmaStdDev;
 
     for (let col = 0; col < numCols; col++) {
         const snap = displaySnaps[col];
@@ -592,7 +562,8 @@ function renderDomHeatmap2D(canvas, safePriceToY = null, midPrice = 0, chartComp
             if (minP > visMax || maxP < visMin) continue;
         }
 
-        const allPrices = new Set([...Object.keys(snap.bids), ...Object.keys(snap.asks)]);
+        // Use cached price array if available (avoids Set + spread allocation per frame)
+        const allPrices = snap._priceArr || Object.keys(snap.bids).concat(Object.keys(snap.asks));
 
         for (const priceStr of allPrices) {
             const price = parseFloat(priceStr);
@@ -652,20 +623,6 @@ function renderDomHeatmap2D(canvas, safePriceToY = null, midPrice = 0, chartComp
                 ctx.rect(cellX, cellY, cellW, cellH);
             }
             ctx.fill();
-
-            if (HeatmapSettings.wallglow && dominant >= wallThreshold) {
-                ctx.shadowColor = `rgba(${r},${g},${b},0.5)`;
-                ctx.shadowBlur = HeatmapSettings.wallglowBlur;
-                ctx.fillStyle = `rgba(${r},${g},${b},0.30)`;
-                ctx.beginPath();
-                if (cr > 0.1) {
-                    ctx.roundRect(cellX, cellY, cellW, cellH, cr);
-                } else {
-                    ctx.rect(cellX, cellY, cellW, cellH);
-                }
-                ctx.fill();
-                ctx.shadowBlur = 0;
-            }
         }
     }
 
@@ -772,9 +729,7 @@ function renderDomHeatmap2D(canvas, safePriceToY = null, midPrice = 0, chartComp
 
     if (HeatmapSettings.microprice) {
         const _mcRgb = _hexToRgb(HeatmapSettings.micropriceColor);
-        ctx.shadowColor = `rgba(${_mcRgb.r}, ${_mcRgb.g}, ${_mcRgb.b}, 0.35)`;
-        ctx.shadowBlur = 6;
-        ctx.strokeStyle = `rgba(${_mcRgb.r}, ${_mcRgb.g}, ${_mcRgb.b}, 0.90)`;
+        ctx.strokeStyle = `rgba(${_mcRgb.r}, ${_mcRgb.g}, ${_mcRgb.b}, 1)`;
         ctx.lineWidth = HeatmapSettings.micropriceWidth;
         ctx.beginPath();
         const microPts = [];
@@ -790,55 +745,6 @@ function renderDomHeatmap2D(canvas, safePriceToY = null, midPrice = 0, chartComp
             }
             ctx.lineTo(microPts[microPts.length - 1].x, microPts[microPts.length - 1].y);
             ctx.stroke();
-        }
-        ctx.shadowBlur = 0;
-    }
-
-    // ── LAYER 5: Aggressive Fills (O(1) P90 read) ──
-    const BUY_FILL_COLOR = `${_buyRgb.r}, ${_buyRgb.g}, ${_buyRgb.b}`;
-    const SELL_FILL_COLOR = `${_sellRgb.r}, ${_sellRgb.g}, ${_sellRgb.b}`;
-    const MIN_CIRCLE_R = 1.5, MAX_CIRCLE_R = HeatmapSettings.tradesSize;
-    if (HeatmapSettings.trades) {
-        const tradeVolRef = DOM2D_STATE._tradeVolP90 || 5;
-
-        for (let col = 0; col < numCols; col++) {
-            const snap = displaySnaps[col];
-            if (!snap.trades || !snap.trades.length) continue;
-            const x = heatmapLeft + col * COL_W + COL_W / 2;
-
-            const byPrice = {};
-            for (const t of snap.trades) {
-                const price = t.p;
-                if (!price || price < visMin || price > visMax) continue;
-                const key = Math.floor(price / bucketSize) * bucketSize;
-                if (!byPrice[key]) byPrice[key] = { buyVol: 0, sellVol: 0 };
-                if (t.s === 'b') byPrice[key].buyVol += (t.v || 1);
-                else if (t.s === 's') byPrice[key].sellVol += (t.v || 1);
-                else { byPrice[key].buyVol += (t.v || 1)*0.5; byPrice[key].sellVol += (t.v || 1)*0.5; }
-            }
-
-            for (const [bucketStr, agg] of Object.entries(byPrice)) {
-                const bucketPrice = parseFloat(bucketStr);
-                const y = _priceToY(bucketPrice + bucketSize / 2);
-                if (y === null || y < 0 || y > cssH) continue;
-
-                if (agg.buyVol > 0) {
-                    const normB = Math.min(Math.sqrt(agg.buyVol / tradeVolRef), 1.0);
-                    const rB = MIN_CIRCLE_R + normB * (MAX_CIRCLE_R - MIN_CIRCLE_R);
-                    ctx.beginPath(); ctx.arc(x, y - rB*0.3, rB, 0, Math.PI * 2);
-                    ctx.fillStyle = `rgba(${BUY_FILL_COLOR},${(0.5 + normB*0.4).toFixed(3)})`;
-                    ctx.fill();
-                    if(rB>3){ ctx.strokeStyle=`rgba(${BUY_FILL_COLOR},0.8)`; ctx.lineWidth=0.5; ctx.stroke(); }
-                }
-                if (agg.sellVol > 0) {
-                    const normS = Math.min(Math.sqrt(agg.sellVol / tradeVolRef), 1.0);
-                    const rS = MIN_CIRCLE_R + normS * (MAX_CIRCLE_R - MIN_CIRCLE_R);
-                    ctx.beginPath(); ctx.arc(x, y + rS*0.3, rS, 0, Math.PI * 2);
-                    ctx.fillStyle = `rgba(${SELL_FILL_COLOR},${(0.5 + normS*0.4).toFixed(3)})`;
-                    ctx.fill();
-                    if(rS>3){ ctx.strokeStyle=`rgba(${SELL_FILL_COLOR},0.8)`; ctx.lineWidth=0.5; ctx.stroke(); }
-                }
-            }
         }
     }
 
@@ -894,49 +800,6 @@ function renderDomHeatmap2D(canvas, safePriceToY = null, midPrice = 0, chartComp
         }
     }
 
-    // ── LAYER 7: Spread Dynamics ──
-    if (HeatmapSettings.spread) {
-        const SPREAD_STRIP_H = HeatmapSettings.spreadHeight;
-        const spreadStripTop = cssH - 28 - (HeatmapSettings.delta ? HeatmapSettings.deltaHeight : 0) - SPREAD_STRIP_H - 2;
-
-        let spreadMin = Infinity, spreadMax = 0;
-        for (let i = 0; i < numCols; i++) {
-            const sp = displaySnaps[i]._spread || 0;
-            if (sp > 0) { spreadMin = Math.min(spreadMin, sp); spreadMax = Math.max(spreadMax, sp); }
-        }
-        if (spreadMin === Infinity) spreadMin = 0;
-        const spreadRange = Math.max(spreadMax - spreadMin, 0.25);
-
-        ctx.fillStyle = 'rgba(4, 6, 14, 0.4)';
-        ctx.fillRect(heatmapLeft, spreadStripTop, numCols * COL_W, SPREAD_STRIP_H);
-
-        ctx.beginPath();
-        let pathSt = false;
-        for (let col = 0; col < numCols; col++) {
-            const sp = displaySnaps[col]._spread || 0;
-            if (sp <= 0) continue;
-            const px = heatmapLeft + col * COL_W + COL_W / 2;
-            const norm = (sp - spreadMin) / spreadRange;
-            const py = spreadStripTop + SPREAD_STRIP_H - 2 - norm * (SPREAD_STRIP_H - 4);
-            if (!pathSt) { ctx.moveTo(px, py); pathSt = true; }
-            else ctx.lineTo(px, py);
-        }
-
-        if (pathSt) {
-            const lastSpread = displaySnaps[numCols - 1]._spread || 0;
-            const lastNorm = (lastSpread - spreadMin) / spreadRange;
-            if (lastNorm > 0.7) ctx.strokeStyle = 'rgba(255, 60, 60, 0.7)';
-            else if (lastNorm > 0.4) ctx.strokeStyle = 'rgba(255, 200, 50, 0.7)';
-            else ctx.strokeStyle = 'rgba(200, 210, 230, 0.5)';
-            ctx.lineWidth = 1; ctx.stroke();
-            
-            ctx.font = '7px "JetBrains Mono", monospace';
-            ctx.fillStyle = 'rgba(160, 170, 190, 0.6)';
-            ctx.textAlign = 'left'; ctx.textBaseline = 'top';
-            ctx.fillText(`SPD ${lastSpread.toFixed(2)}`, heatmapLeft + 3, spreadStripTop + 1);
-        }
-    }
-    
     // Time labels
     ctx.font = '8px "JetBrains Mono", "SF Mono", monospace';
     ctx.fillStyle = 'rgba(120, 130, 155, 0.5)';
@@ -1106,11 +969,13 @@ function renderDomHeatmap2D(canvas, safePriceToY = null, midPrice = 0, chartComp
 let _dom2dRafPending = false;
 let _dom2dRafArgs = null;
 function renderDomHeatmap2DThrottled(canvas, priceToY, midPrice, chartContext) {
+    if (window._chartScrolling) return; // skip during scroll
     _dom2dRafArgs = [canvas, priceToY, midPrice, chartContext];
     if (_dom2dRafPending) return;
     _dom2dRafPending = true;
     requestAnimationFrame(() => {
         _dom2dRafPending = false;
+        if (window._chartScrolling) return; // double-check
         if (_dom2dRafArgs) { renderDomHeatmap2D(..._dom2dRafArgs); _dom2dRafArgs = null; }
     });
 }

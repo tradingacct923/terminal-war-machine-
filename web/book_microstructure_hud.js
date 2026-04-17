@@ -83,7 +83,7 @@ const BookMsHUD = (() => {
                 #bms-hud-header .bms-live-dot {
                     width: 6px; height: 6px; border-radius: 50%;
                     background: #1fd17a; margin-right: 5px;
-                    animation: bms-pulse 1.5s infinite;
+                    animation: bms-pulse 1.5s 80;
                 }
                 @keyframes bms-pulse {
                     0%,100% { opacity: 1; } 50% { opacity: 0.3; }
@@ -101,7 +101,7 @@ const BookMsHUD = (() => {
                 .bms-qa-center { position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: rgba(255,255,255,0.2); }
                 .bms-qa-fill {
                     position: absolute; top: 2px; bottom: 2px;
-                    border-radius: 2px; transition: all 0.3s ease;
+                    border-radius: 2px; transition: width 0.3s ease, background-color 0.3s ease;
                 }
                 .bms-qa-val { position: absolute; right: 4px; top: 0; line-height: 16px; font-size: 9px; font-weight: 700; }
 
@@ -208,7 +208,7 @@ const BookMsHUD = (() => {
                     </div>
                 </div>
                 <div class="bms-hft-warn" id="bms-hft-warn">
-                    ⚡ BBO HFT-ONLY — quotes will evaporate on sweep
+                    BBO HFT-ONLY -- quotes will evaporate on sweep
                 </div>
                 <hr class="bms-divider">
                 <table class="bms-levels">
@@ -245,6 +245,29 @@ const BookMsHUD = (() => {
         return _panel;
     }
 
+    // ── Cached DOM refs for update() ─────────────────────────────────────────
+    let _cachedEls = null;
+    function _getEls() {
+        if (_cachedEls) return _cachedEls;
+        _cachedEls = {
+            qaFill: document.getElementById('bms-qa-fill'),
+            qaVal: document.getElementById('bms-qa-val'),
+            bidPrice: document.getElementById('bms-bid-price'),
+            bidSize: document.getElementById('bms-bid-size'),
+            bidMmc: document.getElementById('bms-bid-mmc'),
+            bidVenues: document.getElementById('bms-bid-venues'),
+            bidQfill: document.getElementById('bms-bid-qfill'),
+            askPrice: document.getElementById('bms-ask-price'),
+            askSize: document.getElementById('bms-ask-size'),
+            askMmc: document.getElementById('bms-ask-mmc'),
+            askVenues: document.getElementById('bms-ask-venues'),
+            askQfill: document.getElementById('bms-ask-qfill'),
+            hftWarn: document.getElementById('bms-hft-warn'),
+            tbody: document.getElementById('bms-levels-body'),
+        };
+        return _cachedEls;
+    }
+
     // ── Update function ───────────────────────────────────────────────────────
     function update(data) {
         // Only render if panel was explicitly created via init() (pane mode).
@@ -259,52 +282,42 @@ const BookMsHUD = (() => {
         const hft = !!data.bbo_hft_only;
 
         // ── QA Imbalance bar ──
-        const fill = document.getElementById('bms-qa-fill');
-        const val  = document.getElementById('bms-qa-val');
-        if (fill && val) {
-            // qa ∈ [-1, +1]. Center at 50%. Positive = bid heavy (green), neg = ask heavy (red).
-            const pct = ((qa + 1) / 2) * 100;  // map to 0-100
+        const e = _getEls();
+        if (e.qaFill && e.qaVal) {
+            const pct = ((qa + 1) / 2) * 100;
             if (qa >= 0) {
-                // Bid-heavy: fill from center rightward, green
-                fill.style.left   = '50%';
-                fill.style.right  = `${100 - pct}%`;
-                fill.style.width  = `${pct - 50}%`;
-                fill.style.background = 'rgba(31,209,122,0.6)';
+                e.qaFill.style.left   = '50%';
+                e.qaFill.style.right  = `${100 - pct}%`;
+                e.qaFill.style.width  = `${pct - 50}%`;
+                e.qaFill.style.background = 'rgba(31,209,122,0.6)';
             } else {
-                // Ask-heavy: fill from center leftward, red
-                fill.style.left   = `${pct}%`;
-                fill.style.right  = '50%';
-                fill.style.width  = `${50 - pct}%`;
-                fill.style.background = 'rgba(255,64,48,0.6)';
+                e.qaFill.style.left   = `${pct}%`;
+                e.qaFill.style.right  = '50%';
+                e.qaFill.style.width  = `${50 - pct}%`;
+                e.qaFill.style.background = 'rgba(255,64,48,0.6)';
             }
-            val.textContent = (qa >= 0 ? '+' : '') + qa.toFixed(3);
-            val.style.color = qa >= 0 ? '#1fd17a' : '#ff4030';
+            e.qaVal.textContent = (qa >= 0 ? '+' : '') + qa.toFixed(3);
+            e.qaVal.style.color = qa >= 0 ? '#1fd17a' : '#ff4030';
         }
 
-        // ── BBO cards ──
-        const _set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
-        const _html = (id, v) => { const el = document.getElementById(id); if (el) el.innerHTML = v; };
+        // ── BBO cards (cached refs) ──
+        if (e.bidPrice) e.bidPrice.textContent = bbo_bid.price ? bbo_bid.price.toFixed(2) : '—';
+        if (e.bidSize) e.bidSize.textContent = bbo_bid.size ? bbo_bid.size.toLocaleString() : '—';
+        if (e.bidMmc) e.bidMmc.textContent = bbo_bid.mm_count || '—';
+        if (e.bidVenues) e.bidVenues.innerHTML = (bbo_bid.venues||[]).map(_venueTag).join(' ');
+        if (e.bidQfill) e.bidQfill.style.width = `${Math.round(bidQ * 100)}%`;
 
-        _set('bms-bid-price', bbo_bid.price ? bbo_bid.price.toFixed(2) : '—');
-        _set('bms-bid-size', bbo_bid.size ? bbo_bid.size.toLocaleString() : '—');
-        _set('bms-bid-mmc', bbo_bid.mm_count || '—');
-        _html('bms-bid-venues', (bbo_bid.venues||[]).map(_venueTag).join(' '));
-        const bqf = document.getElementById('bms-bid-qfill');
-        if (bqf) bqf.style.width = `${Math.round(bidQ * 100)}%`;
-
-        _set('bms-ask-price', bbo_ask.price ? bbo_ask.price.toFixed(2) : '—');
-        _set('bms-ask-size', bbo_ask.size ? bbo_ask.size.toLocaleString() : '—');
-        _set('bms-ask-mmc', bbo_ask.mm_count || '—');
-        _html('bms-ask-venues', (bbo_ask.venues||[]).map(_venueTag).join(' '));
-        const aqf = document.getElementById('bms-ask-qfill');
-        if (aqf) aqf.style.width = `${Math.round(askQ * 100)}%`;
+        if (e.askPrice) e.askPrice.textContent = bbo_ask.price ? bbo_ask.price.toFixed(2) : '—';
+        if (e.askSize) e.askSize.textContent = bbo_ask.size ? bbo_ask.size.toLocaleString() : '—';
+        if (e.askMmc) e.askMmc.textContent = bbo_ask.mm_count || '—';
+        if (e.askVenues) e.askVenues.innerHTML = (bbo_ask.venues||[]).map(_venueTag).join(' ');
+        if (e.askQfill) e.askQfill.style.width = `${Math.round(askQ * 100)}%`;
 
         // ── HFT warning ──
-        const warn = document.getElementById('bms-hft-warn');
-        if (warn) warn.classList.toggle('visible', hft);
+        if (e.hftWarn) e.hftWarn.classList.toggle('visible', hft);
 
         // ── Depth table ──
-        const tbody = document.getElementById('bms-levels-body');
+        const tbody = e.tbody;
         if (tbody) {
             const bidLevels = (data.bid_levels || []).slice(0, 4);
             const askLevels = (data.ask_levels || []).slice(0, 4);
@@ -348,3 +361,4 @@ const BookMsHUD = (() => {
 
     return { init, update, destroy };
 })();
+window.BookMsHUD = BookMsHUD;

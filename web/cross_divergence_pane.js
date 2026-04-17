@@ -23,7 +23,7 @@ const CrossDivergencePane = (() => {
             .xdiv-badge { text-align:center; padding:6px 0; }
             .xdiv-badge-label { font-size:14px; font-weight:700; letter-spacing:1.5px; padding:4px 14px; border-radius:4px; display:inline-block; }
             .xdiv-confirmed { background:rgba(31,209,122,.12); color:#1fd17a; border:1px solid rgba(31,209,122,.3); }
-            .xdiv-divergent { background:rgba(224,48,96,.12); color:#e03060; border:1px solid rgba(224,48,96,.3); animation:xdiv-pulse 1.5s infinite; }
+            .xdiv-divergent { background:rgba(224,48,96,.12); color:#e03060; border:1px solid rgba(224,48,96,.3); animation:xdiv-pulse 1.5s 40; }
             .xdiv-neutral { background:rgba(140,150,180,.06); color:rgba(140,150,180,.5); border:1px solid rgba(140,150,180,.1); }
             @keyframes xdiv-pulse { 0%,100% { border-color:rgba(224,48,96,.3); } 50% { border-color:rgba(224,48,96,.7); } }
 
@@ -51,7 +51,7 @@ const CrossDivergencePane = (() => {
             .xdiv-venue-col { flex:1; }
             .xdiv-venue-label { font-size:7px; color:rgba(140,150,180,.4); text-transform:uppercase; letter-spacing:.3px; margin-bottom:2px; text-align:center; }
             .xdiv-qa-imb-bar { position:relative; height:14px; background:rgba(255,255,255,.03); border-radius:2px; overflow:hidden; margin-bottom:2px; }
-            .xdiv-qa-imb-fill { position:absolute; top:1px; bottom:1px; border-radius:2px; transition:all .3s ease; }
+            .xdiv-qa-imb-fill { position:absolute; top:1px; bottom:1px; border-radius:2px; transition:width .3s ease, background-color .3s ease; }
             .xdiv-qa-imb-mid { position:absolute; left:50%; top:0; width:1px; height:100%; background:rgba(255,255,255,.12); }
             .xdiv-qa-imb-val { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); font-size:8px; font-weight:600; z-index:1; }
             .xdiv-venue-chips { font-size:7px; line-height:1.6; text-align:center; min-height:14px; }
@@ -124,20 +124,36 @@ const CrossDivergencePane = (() => {
         _container = null;
         _qqq = { qa: 0, bidQ: 0, askQ: 0, hft: false, ts: 0 };
         _spy = { qa: 0, bidQ: 0, askQ: 0, hft: false, ts: 0 };
+        // Clear cached DOM refs
+        for (const k in _barEls) delete _barEls[k];
+    }
+
+    // Cache DOM refs per prefix to avoid querySelector on every update
+    const _barEls = {};
+    function _getBarEls(prefix) {
+        if (_barEls[prefix]) return _barEls[prefix];
+        if (!_container) return null;
+        _barEls[prefix] = {
+            bid: _container.querySelector(`#xdiv-${prefix}-bid`),
+            ask: _container.querySelector(`#xdiv-${prefix}-ask`),
+            val: _container.querySelector(`#xdiv-${prefix}-val`),
+            dir: _container.querySelector(`#xdiv-${prefix}-dir`),
+            bq: _container.querySelector(`#xdiv-${prefix}-bq`),
+            aq: _container.querySelector(`#xdiv-${prefix}-aq`),
+            hft: _container.querySelector(`#xdiv-${prefix}-hft`),
+        };
+        return _barEls[prefix];
     }
 
     function _updateBar(prefix, state) {
         if (!_container) return;
         const qa = state.qa;
-        const pct = Math.min(Math.abs(qa) * 100, 50); // max 50% each side
+        const pct = Math.min(Math.abs(qa) * 100, 50);
 
-        const bidBar = _container.querySelector(`#xdiv-${prefix}-bid`);
-        const askBar = _container.querySelector(`#xdiv-${prefix}-ask`);
-        const valEl = _container.querySelector(`#xdiv-${prefix}-val`);
-        const dirEl = _container.querySelector(`#xdiv-${prefix}-dir`);
-        const bqEl = _container.querySelector(`#xdiv-${prefix}-bq`);
-        const aqEl = _container.querySelector(`#xdiv-${prefix}-aq`);
-        const hftEl = _container.querySelector(`#xdiv-${prefix}-hft`);
+        const els = _getBarEls(prefix);
+        if (!els) return;
+        const bidBar = els.bid, askBar = els.ask, valEl = els.val;
+        const dirEl = els.dir, bqEl = els.bq, aqEl = els.aq, hftEl = els.hft;
 
         if (bidBar && askBar) {
             if (qa > 0) {
@@ -237,3 +253,4 @@ const CrossDivergencePane = (() => {
 
     return { init, destroy, onBookMs };
 })();
+window.CrossDivergencePane = CrossDivergencePane;
