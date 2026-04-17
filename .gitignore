@@ -1,6 +1,10 @@
 # ── Secrets (NEVER push these) ────────────────────
 .env
+.env.*
+env
 config.json
+.schwab_tokens.json
+connectors/.schwab_tokens.json
 
 # ── Python ────────────────────────────────────────
 __pycache__/

@@ -6,6 +6,26 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
+import logging
+from logging.handlers import RotatingFileHandler
+_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(_LOG_DIR, exist_ok=True)
+_LOG_FMT = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+_root_logger = logging.getLogger()
+if not any(isinstance(h, RotatingFileHandler) for h in _root_logger.handlers):
+    _fh = RotatingFileHandler(
+        os.path.join(_LOG_DIR, "server.log"),
+        maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8",
+    )
+    _fh.setFormatter(_LOG_FMT)
+    _fh.setLevel(logging.INFO)
+    _ch = logging.StreamHandler(sys.stdout)
+    _ch.setFormatter(_LOG_FMT)
+    _ch.setLevel(logging.INFO)
+    _root_logger.addHandler(_fh)
+    _root_logger.addHandler(_ch)
+    _root_logger.setLevel(logging.INFO)
+
 from flask import Flask, jsonify, request, send_from_directory, Response, make_response
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
@@ -146,7 +166,10 @@ def _cached_fetch_all(ticker: str):
 
 app = Flask(__name__, static_folder="web", static_url_path="")
 CORS(app)  # Open CORS — user will configure domain later
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading",
+# gevent async mode: native WebSocket support, ~5ms latency, cooperative multitasking.
+# Replaces threading mode (37ms GIL latency + broken WS handshake under Werkzeug 3.x).
+# eventlet breaks SSL on Python 3.9 (RecursionError in ssl.py) — gevent is safe.
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent",
                     ping_timeout=30, ping_interval=10)
 
 # Build version = git short hash (falls back to file mtime)
@@ -840,22 +863,6 @@ def api_chain():
         if ratio <= 0:
             print(f"[api/chain] ⚠️ No live NQ/QQQ ratio — NQ$ mapping disabled")
 
-        # ── Get active iceberg levels from L2 detection ──
-        active_iceberg_levels = set()
-        try:
-            from background_engine.l2_worker import get_l2_state as _g2
-            l2_state = _g2()
-            for det_list in [l2_state.get("icebergs", []), l2_state.get("drifting_icebergs", [])]:
-                for det in (det_list or []):
-                    try:
-                        ice_price = float(det.get("price", 0))
-                        if ice_price > 0:
-                            active_iceberg_levels.add(round(ice_price, 2))
-                    except (ValueError, TypeError):
-                        pass
-        except Exception:
-            pass
-
         # ── Build per-strike aggregates for P/C and GEX ──
         strike_data = {}
         for opt in raw_chain:
@@ -900,12 +907,6 @@ def api_chain():
             if otype == "put":
                 gex = -gex
 
-            # Iceberg active at this NQ price?
-            ice_active = any(
-                abs(nq_price - ice_lvl) <= 5.0
-                for ice_lvl in active_iceberg_levels
-            )
-
             rows.append({
                 "strike":  strike,
                 "type":    otype,
@@ -923,7 +924,6 @@ def api_chain():
                 "nq_price": nq_price,
                 "pc_ratio": pc_ratio,
                 "gex":      gex,
-                "iceberg":  ice_active,
                 # ── Enriched fields (Phase 2) ──
                 "mark":        round(float(opt.get("mark") or 0), 4),
                 "high":        round(float(opt.get("high") or 0), 4),
@@ -953,7 +953,6 @@ def api_chain():
                 "nq_price": nq_mapped,
                 "gex": round(gex_val, 0),
                 "type": "call_wall" if gex_val > 0 else "put_wall",
-                "iceberg": any(abs(nq_mapped - il) <= 5.0 for il in active_iceberg_levels),
             })
 
         print(f"[api/chain] Schwab: {ticker} spot={spot:.2f} exp={exp_date} chains={len(raw_chain)}")
@@ -968,7 +967,6 @@ def api_chain():
             "ratio": round(ratio, 4),
             "futures_mid": futures_mid,
             "top_gex": top_gex,
-            "active_icebergs": list(active_iceberg_levels),
         })
     except Exception as e:
         import traceback
@@ -1395,8 +1393,6 @@ def api_data():
         # Heatmaps
         "gex_hm":    _build_gex_heatmap(data["gex"]["per_exp"]),
         "dex_hm":    _build_heatmap(data["dex"]),
-        "vex_hm":    _build_heatmap(data["vex"]),
-        "tex_hm":    _build_tex_heatmap(data["tex"]),
         "vannex_hm": _build_heatmap(data["vannex"]),
         "cex_hm":    _build_tex_heatmap(data["cex"]),
     }
@@ -2316,8 +2312,9 @@ def api_l2_candles():
             if bp:
                 candle_out["bp"] = bp
             # Include all orderflow detection data
-            for key in ("icebergs", "sweeps", "delta_div", "ignition",
-                        "spoofs", "drifting_iceberg", "wall_gone"):
+            for key in ("sweeps", "delta_div", "ignition",
+                        "spoofs", "wall_gone",
+                        "absorption", "depth_deltas"):
                 val = c.get(key)
                 if val:
                     candle_out[key] = val
@@ -2365,6 +2362,10 @@ def api_vprofile():
         row_count = int(request.args.get("row_count", 0))
         va_pct = float(request.args.get("va_pct", 0.70))
         va_pct = max(0.50, min(0.95, va_pct))  # clamp
+        session_type = request.args.get("session_type", "all")  # all|rth|eth
+        vol_filter = request.args.get("vol_filter", "total")    # total|buy|sell
+        min_level_vol = int(request.args.get("min_level_vol", 0))  # filter out levels < N total vol
+        step_param = request.args.get("step", "")  # 15m|30m|1h|2h|4h — step profile mode
         now = _t.time()
         et = pytz.timezone("US/Eastern")
         now_et = datetime.fromtimestamp(now, tz=et)
@@ -2450,12 +2451,25 @@ def api_vprofile():
         TICK_SIZES = {"NQ": 0.25, "GC": 0.10, "ES": 0.25}
         tick = TICK_SIZES.get(symbol, 0.25)
         profile = {}  # {price_str: {buy, sell}}
+        # Absorption tracking: per-level volume vs candle range
+        abs_tracker = {}  # {price_str: {vol, candle_ranges[], candle_count}}
         candles_used = 0
         for c in raw:
             t = int(c.get("t", 0))
             if t < from_ts or t > to_ts:
                 continue
-            bp = c.get("bp")
+            # RTH/ETH session filter
+            if session_type != 'all':
+                c_et = datetime.fromtimestamp(t, tz=et)
+                c_hour = c_et.hour * 60 + c_et.minute  # minutes since midnight
+                rth_start, rth_end = 9 * 60 + 30, 16 * 60  # 9:30-16:00
+                if session_type == 'rth' and not (rth_start <= c_hour < rth_end):
+                    continue
+                if session_type == 'eth' and (rth_start <= c_hour < rth_end):
+                    continue
+            # Use bp_large if min_level_vol requests large-trade-only profile
+            bp_key = "bp_large" if min_level_vol >= 10 and c.get("bp_large") else "bp"
+            bp = c.get(bp_key)
             if bp:
                 # Exact volume-at-price from live ticks
                 candles_used += 1
@@ -2466,6 +2480,14 @@ def api_vprofile():
                         profile[price_str] = {"buy": 0, "sell": 0}
                     profile[price_str]["buy"] += volumes[0]
                     profile[price_str]["sell"] += volumes[1]
+                    # Track absorption: volume at this price vs candle's price range
+                    c_range = max(c.get("h", 0) - c.get("l", 0), tick)
+                    pv = volumes[0] + volumes[1]
+                    if pv > 0:
+                        if price_str not in abs_tracker:
+                            abs_tracker[price_str] = {"vol_per_candle": [], "ranges": []}
+                        abs_tracker[price_str]["vol_per_candle"].append(pv)
+                        abs_tracker[price_str]["ranges"].append(c_range)
             else:
                 # Backfill candle — distribute volume across H-L range
                 h = c.get("h", 0)
@@ -2499,18 +2521,136 @@ def api_vprofile():
                 "levels_count": 0, "candles_used": 0, "levels": []
             })
 
-        # Build sorted levels
+        # Build sorted levels (respecting vol_filter for POC/VA computation)
         levels = []
         for price_str, vols in profile.items():
-            total = vols["buy"] + vols["sell"]
-            levels.append({
+            buy_v = vols["buy"]
+            sell_v = vols["sell"]
+            # vol_filter controls which volume dimension drives POC/VA
+            if vol_filter == 'buy':
+                total = buy_v
+            elif vol_filter == 'sell':
+                total = sell_v
+            else:
+                total = buy_v + sell_v
+            lv = {
                 "price": float(price_str),
-                "buy": vols["buy"],
-                "sell": vols["sell"],
+                "buy": buy_v,
+                "sell": sell_v,
                 "total": total,
-                "delta": vols["buy"] - vols["sell"],
-            })
+                "delta": buy_v - sell_v,
+            }
+            # Absorption ratio: volume / avg price displacement at this level
+            at = abs_tracker.get(price_str)
+            if at and len(at["vol_per_candle"]) >= 2:
+                total_vol_at = sum(at["vol_per_candle"])
+                avg_range = sum(at["ranges"]) / len(at["ranges"])
+                if avg_range > 0:
+                    n_candles = len(at["vol_per_candle"])
+                    time_factor = max(1, n_candles) ** 0.5
+                    lv["abs_ratio"] = round(total_vol_at / avg_range / time_factor, 1)
+                # Exhaustion: only compute for levels near current price
+                # Old levels naturally have declining volume because price left, not exhaustion
+                # Use last candle's close as "current price"
+                _last_close = raw[-1].get("c", 0) if raw else 0
+                _price_dist = abs(float(price_str) - _last_close) if _last_close > 0 else 999
+                if _price_dist <= 20:  # within 20 points of current price
+                    vols = at["vol_per_candle"]
+                    if len(vols) >= 4:
+                        # Only use RECENT candles (last 60% of data) to avoid stale comparison
+                        recent_start = max(0, len(vols) - int(len(vols) * 0.6))
+                        recent = vols[recent_start:]
+                        if len(recent) >= 4:
+                            half = len(recent) // 2
+                            first_half_avg = sum(recent[:half]) / half
+                            second_half_avg = sum(recent[half:]) / (len(recent) - half)
+                            if first_half_avg > 0:
+                                exh = round((second_half_avg - first_half_avg) / first_half_avg, 3)
+                                lv["exh"] = exh
+            levels.append(lv)
         levels.sort(key=lambda x: x["price"])
+
+        # Enrich with refill speed from live l2_worker data
+        try:
+            from background_engine.l2_worker import get_refill_stats
+            refill = get_refill_stats(symbol)
+            for lv in levels:
+                ps = f"{lv['price']:.2f}"
+                rs = refill.get(ps)
+                if rs and rs.get('count', 0) >= 2:
+                    lv['refill_class'] = rs['classification']
+        except Exception as e:
+            logging.getLogger(__name__).debug("refill enrich failed: %s", e)
+
+        # Compute level states: FRESH / DEF / CONSUMED / AIR
+        # Combines VP (historical volume) + L2 (live DOM depth) + refill tracking
+        try:
+            import traceback as _tb
+            from background_engine.l2_worker import L2_STATE, _L2_LOCK
+            with _L2_LOCK:
+                _dom = L2_STATE.get("dom", {}).get(symbol, {})
+                _raw_bids = _dom.get("bids", {})
+                _raw_asks = _dom.get("asks", {})
+            # Build numeric lookup: float price → depth (handles any string format)
+            _bid_depth = {}
+            for k, v in _raw_bids.items():
+                try: _bid_depth[round(float(k), 2)] = v
+                except: pass
+            _ask_depth = {}
+            for k, v in _raw_asks.items():
+                try: _ask_depth[round(float(k), 2)] = v
+                except: pass
+            # VP volume percentiles — the VP is the primary filter
+            _sorted_vols = sorted([lv["total"] for lv in levels if lv["total"] > 0])
+            _vp_p80 = _sorted_vols[int(len(_sorted_vols) * 0.80)] if _sorted_vols else 0
+            _vp_p50 = _sorted_vols[int(len(_sorted_vols) * 0.50)] if _sorted_vols else 0
+
+            # DOM depth median for FRESH threshold
+            _all_depths = []
+            for lv in levels:
+                _p = round(lv['price'], 2)
+                _d = (_bid_depth.get(_p, 0) or 0) + (_ask_depth.get(_p, 0) or 0)
+                if _d > 0:
+                    _all_depths.append(_d)
+            _depth_median = sorted(_all_depths)[len(_all_depths) // 2] if _all_depths else 3
+
+            for lv in levels:
+                _p = round(lv['price'], 2)
+                _depth = (_bid_depth.get(_p, 0) or 0) + (_ask_depth.get(_p, 0) or 0)
+
+                # VP volume is the PRIMARY gate
+                _vp_significant = lv["total"] >= _vp_p80   # top 20% VP volume
+                _vp_moderate = lv["total"] >= _vp_p50      # top 50% VP volume
+                _has_depth = _depth >= _depth_median        # above median DOM depth
+
+                if _vp_significant and _has_depth:
+                    # High VP + high depth = actively defended level
+                    lv["state"] = "DEF"
+                    lv["depth"] = int(_depth)
+                elif _vp_significant and not _has_depth:
+                    # High VP + no depth = was defended, ammo consumed
+                    lv["state"] = "CONSUMED"
+                elif not _vp_moderate and _has_depth:
+                    # Low VP + high depth = fresh untested wall
+                    lv["state"] = "FRESH"
+                    lv["depth"] = int(_depth)
+                else:
+                    # Everything else = not significant
+                    lv["state"] = "AIR"
+        except Exception as _e:
+            print(f"[VP STATE] Error computing states: {_e}")
+            import traceback; traceback.print_exc()
+
+        # Trade-size filter: remove levels below minimum volume threshold
+        if min_level_vol > 0:
+            levels = [lv for lv in levels if lv["total"] >= min_level_vol]
+            if not levels:
+                return jsonify({
+                    "symbol": symbol, "mode": mode, "from_ts": from_ts, "to_ts": to_ts,
+                    "poc": 0, "vah": 0, "val": 0, "total_vol": 0,
+                    "levels_count": 0, "candles_used": candles_used, "levels": []
+                })
+
         total_vol = sum(lv["total"] for lv in levels)
 
         # POC: price with highest volume
@@ -2531,6 +2671,74 @@ def api_vprofile():
         vah = va_prices[-1] if va_prices else poc
         val = va_prices[0] if va_prices else poc
 
+        # ── KDE + Prominence HVN/LVN Detection ──
+        # Non-parametric density estimation — zero tuned parameters.
+        # KDE finds the smooth volume density; prominence scoring on KDE
+        # peaks/troughs identifies structurally significant levels.
+        kde_bw = None
+        if len(levels) >= 5:
+            try:
+                import numpy as np
+                from scipy.stats import gaussian_kde
+                from scipy.signal import find_peaks
+
+                prices_arr = np.array([lv["price"] for lv in levels])
+                vols_arr = np.array([float(lv["total"]) for lv in levels])
+
+                # Weighted KDE: each price point weighted by its volume
+                # Scott's rule for bandwidth — optimal for unknown distributions
+                kde = gaussian_kde(prices_arr, weights=vols_arr, bw_method='scott')
+                kde_bw = float(kde.factor)
+
+                # Evaluate density at each price level
+                density = kde(prices_arr)
+                max_density = density.max()
+                if max_density > 0:
+                    norm_density = density / max_density  # normalize to [0,1]
+                else:
+                    norm_density = np.zeros_like(density)
+
+                # Write KDE density to each level
+                for i, lv in enumerate(levels):
+                    lv["kde"] = round(float(norm_density[i]), 4)
+
+                # HVN: peaks in KDE density with prominence scoring
+                hvn_peaks, hvn_props = find_peaks(density, distance=2, plateau_size=0)
+                if len(hvn_peaks) > 0 and "prominences" not in hvn_props:
+                    from scipy.signal import peak_prominences
+                    proms, _, _ = peak_prominences(density, hvn_peaks)
+                    hvn_props["prominences"] = proms
+
+                if len(hvn_peaks) > 0 and len(hvn_props.get("prominences", [])) > 0:
+                    hvn_proms = hvn_props["prominences"]
+                    med_prom = float(np.median(hvn_proms))
+                    max_prom = float(hvn_proms.max()) if hvn_proms.max() > 0 else 1.0
+                    for j, idx in enumerate(hvn_peaks):
+                        prom = float(hvn_proms[j])
+                        if prom >= med_prom:
+                            levels[idx]["hvn"] = round(prom / max_prom, 4)
+
+                # LVN: troughs (peaks in negated density)
+                lvn_peaks, lvn_props = find_peaks(-density, distance=2, plateau_size=0)
+                if len(lvn_peaks) > 0 and "prominences" not in lvn_props:
+                    from scipy.signal import peak_prominences
+                    proms, _, _ = peak_prominences(-density, lvn_peaks)
+                    lvn_props["prominences"] = proms
+
+                if len(lvn_peaks) > 0 and len(lvn_props.get("prominences", [])) > 0:
+                    lvn_proms = lvn_props["prominences"]
+                    med_prom = float(np.median(lvn_proms))
+                    max_prom = float(lvn_proms.max()) if lvn_proms.max() > 0 else 1.0
+                    for j, idx in enumerate(lvn_peaks):
+                        prom = float(lvn_proms[j])
+                        if prom >= med_prom:
+                            levels[idx]["lvn"] = round(prom / max_prom, 4)
+
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                # KDE failed — levels continue without kde/hvn/lvn fields
+
         # Bucket into row_count bins if requested
         if row_count > 0 and len(levels) > row_count:
             min_p = levels[0]["price"]
@@ -2542,43 +2750,102 @@ def api_vprofile():
                     lo = min_p + i * bucket_size
                     hi = lo + bucket_size
                     b = {"price": round(lo + bucket_size / 2, 2), "buy": 0, "sell": 0, "total": 0, "delta": 0}
+                    b_kde = 0.0
+                    b_hvn = None
+                    b_lvn = None
                     for lv in levels:
                         if lv["price"] >= lo and (lv["price"] < hi or i == row_count - 1):
                             b["buy"] += lv["buy"]
                             b["sell"] += lv["sell"]
                             b["total"] += lv["total"]
                             b["delta"] += lv["delta"]
+                            # Propagate KDE: take max density and highest conviction
+                            if "kde" in lv:
+                                b_kde = max(b_kde, lv["kde"])
+                            if "hvn" in lv and (b_hvn is None or lv["hvn"] > b_hvn):
+                                b_hvn = lv["hvn"]
+                            if "lvn" in lv and (b_lvn is None or lv["lvn"] > b_lvn):
+                                b_lvn = lv["lvn"]
                     if b["total"] > 0:
+                        if b_kde > 0:
+                            b["kde"] = b_kde
+                        if b_hvn is not None:
+                            b["hvn"] = b_hvn
+                        if b_lvn is not None:
+                            b["lvn"] = b_lvn
                         buckets.append(b)
                 levels = buckets
 
-        # ── Initial Balance (IB) — first 30 min of session ──
-        ib_high = None
-        ib_low = None
-        if mode in ("session", "prior_day"):
-            # Session open for IB: use the actual session start, not fallback from_ts
-            if mode == "session":
-                if now_et.hour >= 18:
-                    ib_session_start = int(now_et.replace(hour=18, minute=0, second=0, microsecond=0).timestamp())
-                else:
-                    from datetime import timedelta
-                    ib_session_start = int((now_et - timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0).timestamp())
-            else:
-                ib_session_start = from_ts
-            ib_end = ib_session_start + 30 * 60
-            ib_count = 0
-            for c in raw:
-                ct = int(c.get("t", 0))
-                if ct < ib_session_start or ct > ib_end:
-                    continue
-                ib_count += 1
-                ch = c.get("h", 0)
-                cl_ib = c.get("l", 0)
-                if ch > 0 and cl_ib > 0:
-                    if ib_high is None or ch > ib_high:
-                        ib_high = ch
-                    if ib_low is None or cl_ib < ib_low:
-                        ib_low = cl_ib
+        # ── Step Profiles: break time range into sub-profiles ──
+        step_profiles = None
+        if step_param:
+            step_map = {"15m": 900, "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400}
+            step_sec = step_map.get(step_param, 0)
+            if step_sec > 0:
+                step_profiles = []
+                cursor = from_ts
+                while cursor < to_ts:
+                    chunk_end = min(cursor + step_sec, to_ts)
+                    # Build mini-profile for this chunk
+                    sp = {}
+                    for c in raw:
+                        ct = int(c.get("t", 0))
+                        if ct < cursor or ct >= chunk_end:
+                            continue
+                        bp = c.get("bp")
+                        if bp:
+                            for ps, vols in bp.items():
+                                if not isinstance(vols, (list, tuple)) or len(vols) < 2:
+                                    continue
+                                if ps not in sp:
+                                    sp[ps] = {"buy": 0, "sell": 0}
+                                sp[ps]["buy"] += vols[0]
+                                sp[ps]["sell"] += vols[1]
+                        else:
+                            h, l, v = c.get("h", 0), c.get("l", 0), c.get("v", 0)
+                            if v <= 0 or h <= 0 or l <= 0 or h <= l:
+                                continue
+                            n_t = max(int(round((h - l) / tick)), 1)
+                            vpt = v / (n_t + 1)
+                            is_bull = c.get("c", 0) >= c.get("o", 0)
+                            br = 0.6 if is_bull else 0.4
+                            p = l
+                            while p <= h + tick * 0.01:
+                                ps = f"{p:.2f}"
+                                if ps not in sp:
+                                    sp[ps] = {"buy": 0, "sell": 0}
+                                sp[ps]["buy"] += vpt * br
+                                sp[ps]["sell"] += vpt * (1 - br)
+                                p = round(p + tick, 10)
+                    if sp:
+                        s_levels = [{"price": float(k), "total": v["buy"] + v["sell"],
+                                     "buy": v["buy"], "sell": v["sell"],
+                                     "delta": v["buy"] - v["sell"]}
+                                    for k, v in sp.items()]
+                        s_levels.sort(key=lambda x: x["price"])
+                        s_total = sum(lv["total"] for lv in s_levels)
+                        s_poc_lv = max(s_levels, key=lambda x: x["total"])
+                        s_poc = s_poc_lv["price"]
+                        # Quick VA
+                        s_by_vol = sorted(s_levels, key=lambda x: x["total"], reverse=True)
+                        s_va_vol = 0
+                        s_va_p = []
+                        for lv in s_by_vol:
+                            s_va_vol += lv["total"]
+                            s_va_p.append(lv["price"])
+                            if s_va_vol >= s_total * va_pct:
+                                break
+                        s_va_p.sort()
+                        step_profiles.append({
+                            "from_ts": cursor,
+                            "to_ts": chunk_end,
+                            "poc": s_poc,
+                            "vah": s_va_p[-1] if s_va_p else s_poc,
+                            "val": s_va_p[0] if s_va_p else s_poc,
+                            "total_vol": s_total,
+                            "levels": s_levels,
+                        })
+                    cursor = chunk_end
 
         result = {
             "symbol": symbol,
@@ -2586,6 +2853,7 @@ def api_vprofile():
             "from_ts": from_ts,
             "to_ts": to_ts,
             "poc": poc,
+            "kde_bw": kde_bw,
             "vah": vah,
             "val": val,
             "total_vol": total_vol,
@@ -2593,26 +2861,202 @@ def api_vprofile():
             "candles_used": candles_used,
             "levels": levels,
         }
-        if ib_high is not None and ib_low is not None:
-            ib_range = ib_high - ib_low
-            result["ib_high"] = ib_high
-            result["ib_low"] = ib_low
-            result["ib_range"] = ib_range
-            # IB extensions: 0.5x, 1x, 1.5x, 2x above and below
-            result["ib_ext"] = {
-                "upper_0_5": ib_high + ib_range * 0.5,
-                "upper_1_0": ib_high + ib_range * 1.0,
-                "upper_1_5": ib_high + ib_range * 1.5,
-                "upper_2_0": ib_high + ib_range * 2.0,
-                "lower_0_5": ib_low - ib_range * 0.5,
-                "lower_1_0": ib_low - ib_range * 1.0,
-                "lower_1_5": ib_low - ib_range * 1.5,
-                "lower_2_0": ib_low - ib_range * 2.0,
-            }
+        if step_profiles is not None:
+            result["step_profiles"] = step_profiles
         return jsonify(result)
     except Exception as e:
         import traceback
         traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/vprofile/naked-pocs")
+def api_naked_pocs():
+    """Naked POCs — prior session POCs that price hasn't revisited.
+    ?symbol=NQ&days=5 (default 5 sessions back)
+    Returns [{price, session_date, age_days, tested}]
+    """
+    try:
+        from background_engine.l2_worker import get_candles
+        import time as _t, pytz
+        from datetime import datetime, timedelta
+
+        symbol = request.args.get("symbol", "NQ")
+        days = int(request.args.get("days", 5))
+        days = max(1, min(days, 10))
+
+        et = pytz.timezone("US/Eastern")
+        now = _t.time()
+        now_et = datetime.fromtimestamp(now, tz=et)
+        raw = get_candles(symbol, "1m")
+        if not raw:
+            return jsonify({"naked_pocs": []})
+
+        TICK_SIZES = {"NQ": 0.25, "GC": 0.10, "ES": 0.25}
+        tick = TICK_SIZES.get(symbol, 0.25)
+
+        # Find current session start
+        if now_et.hour >= 18:
+            cur_session_start = now_et.replace(hour=18, minute=0, second=0, microsecond=0)
+        else:
+            cur_session_start = (now_et - timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)
+
+        naked_pocs = []
+        for d in range(1, days + 1):
+            sess_end = cur_session_start - timedelta(days=d - 1)
+            sess_start = sess_end - timedelta(days=1)
+            s_from = int(sess_start.timestamp())
+            s_to = int(sess_end.timestamp())
+
+            # Build volume-at-price for this session
+            profile = {}
+            for c in raw:
+                t = int(c.get("t", 0))
+                if t < s_from or t > s_to:
+                    continue
+                bp = c.get("bp")
+                if bp:
+                    for ps, vols in bp.items():
+                        if not isinstance(vols, (list, tuple)) or len(vols) < 2:
+                            continue
+                        if ps not in profile:
+                            profile[ps] = 0
+                        profile[ps] += vols[0] + vols[1]
+                else:
+                    h, l, v = c.get("h", 0), c.get("l", 0), c.get("v", 0)
+                    if v <= 0 or h <= 0 or l <= 0 or h <= l:
+                        continue
+                    n_ticks = max(int(round((h - l) / tick)), 1)
+                    vpt = v / (n_ticks + 1)
+                    p = l
+                    while p <= h + tick * 0.01:
+                        ps = f"{p:.2f}"
+                        profile[ps] = profile.get(ps, 0) + vpt
+                        p = round(p + tick, 10)
+
+            if not profile:
+                continue
+
+            # POC = max volume price
+            poc_str = max(profile, key=profile.get)
+            poc_price = float(poc_str)
+
+            # Check if price revisited this POC since session ended.
+            # Sprint 4: tolerance of ±1.5 tick covers half-tick bar closes and
+            # wicks that came within 0.375pt of POC but didn't cross exactly.
+            tested = False
+            closest_ticks = None
+            hit_tol = tick * 1.5
+            for c in raw:
+                t = int(c.get("t", 0))
+                if t <= s_to:
+                    continue
+                h, l = c.get("h", 0), c.get("l", 0)
+                if h <= 0 or l <= 0:
+                    continue
+                if (h + hit_tol) >= poc_price >= (l - hit_tol):
+                    tested = True
+                    break
+                # Track closest approach for post-hoc diagnostics
+                gap = min(abs(h - poc_price), abs(l - poc_price))
+                gap_ticks = gap / tick
+                if closest_ticks is None or gap_ticks < closest_ticks:
+                    closest_ticks = gap_ticks
+
+            if not tested:
+                sess_label = sess_start.strftime("%m/%d")
+                # Sprint 4: 0.1-day precision so freshly formed POCs show 1.1/1.2 etc.
+                age = round((now_et - sess_start).total_seconds() / 86400.0, 1)
+                naked_pocs.append({
+                    "price": poc_price,
+                    "session_date": sess_label,
+                    "age_days": age,
+                    "tested": False,
+                    "closest_approach_ticks": round(closest_ticks, 1) if closest_ticks is not None else None,
+                })
+
+        return jsonify({"naked_pocs": naked_pocs})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/vprofile/dev-poc")
+def api_dev_poc():
+    """Developing POC — live POC migration path for current session.
+    ?symbol=NQ&interval=5 (interval in minutes, default 5)
+    Returns {poc_path: [{time, poc}], current_poc}
+    """
+    try:
+        from background_engine.l2_worker import get_candles
+        import time as _t, pytz
+        from datetime import datetime, timedelta
+
+        symbol = request.args.get("symbol", "NQ")
+        interval = int(request.args.get("interval", 5))
+        interval = max(1, min(interval, 60))
+        interval_sec = interval * 60
+
+        et = pytz.timezone("US/Eastern")
+        now = _t.time()
+        now_et = datetime.fromtimestamp(now, tz=et)
+        raw = get_candles(symbol, "1m")
+        if not raw:
+            return jsonify({"poc_path": [], "current_poc": None})
+
+        TICK_SIZES = {"NQ": 0.25, "GC": 0.10, "ES": 0.25}
+        tick = TICK_SIZES.get(symbol, 0.25)
+
+        # Session start
+        if now_et.hour >= 18:
+            session_start = now_et.replace(hour=18, minute=0, second=0, microsecond=0)
+        else:
+            session_start = (now_et - timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)
+        s_from = int(session_start.timestamp())
+
+        # Filter to session candles, sorted by time
+        session_candles = sorted(
+            [c for c in raw if int(c.get("t", 0)) >= s_from],
+            key=lambda c: c.get("t", 0)
+        )
+        if not session_candles:
+            return jsonify({"poc_path": [], "current_poc": None})
+
+        # Walk candles chronologically, compute running POC at each interval
+        profile = {}  # running volume-at-price
+        poc_path = []
+        next_checkpoint = s_from + interval_sec
+
+        for c in session_candles:
+            t = int(c.get("t", 0))
+            bp = c.get("bp")
+            if bp:
+                for ps, vols in bp.items():
+                    if not isinstance(vols, (list, tuple)) or len(vols) < 2:
+                        continue
+                    profile[ps] = profile.get(ps, 0) + vols[0] + vols[1]
+            else:
+                h, l, v = c.get("h", 0), c.get("l", 0), c.get("v", 0)
+                if v <= 0 or h <= 0 or l <= 0 or h <= l:
+                    continue
+                n_ticks = max(int(round((h - l) / tick)), 1)
+                vpt = v / (n_ticks + 1)
+                p = l
+                while p <= h + tick * 0.01:
+                    ps = f"{p:.2f}"
+                    profile[ps] = profile.get(ps, 0) + vpt
+                    p = round(p + tick, 10)
+
+            # Emit POC at each interval checkpoint
+            while t >= next_checkpoint and profile:
+                poc_str = max(profile, key=profile.get)
+                poc_path.append({"time": next_checkpoint, "poc": float(poc_str)})
+                next_checkpoint += interval_sec
+
+        # Current POC
+        current_poc = float(max(profile, key=profile.get)) if profile else None
+
+        return jsonify({"poc_path": poc_path, "current_poc": current_poc})
+    except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
@@ -2643,15 +3087,15 @@ def api_l2_status():
 # ── Alpha Engine Dashboard API ────────────────────────────────────────────────
 @app.route("/api/alpha")
 def api_alpha():
-    """Phase 7 Alpha Engine — real-time stats from iceberg_outcomes.jsonl."""
+    """Phase 7 Alpha Engine — real-time stats from edge_outcomes.jsonl."""
     import json as _json, time as _t
     try:
         from background_engine.l2_worker import (
-            _KALMAN_CV, _VOLUME_CLOCKS, _CURRENT_REGIME, _ICE_PENDING
+            _KALMAN_CV, _VOLUME_CLOCKS, _CURRENT_REGIME
         )
 
         log_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "logs", "iceberg_outcomes.jsonl"
+            os.path.dirname(os.path.abspath(__file__)), "logs", "edge_outcomes.jsonl"
         )
 
         signals = []
@@ -2703,7 +3147,7 @@ def api_alpha():
         nq_cv = round(_KALMAN_CV['NQ'].state, 4) if 'NQ' in _KALMAN_CV else 0
         nq_cv_n = _KALMAN_CV['NQ']._n if 'NQ' in _KALMAN_CV else 0
         current_dsl = round(max(3.0, nq_cv * 100), 2)
-        pending_count = len(_ICE_PENDING.get('NQ', []))
+        pending_count = 0
 
         vpin_val = 0
         vpin_regime = 'N/A'
@@ -2857,22 +3301,17 @@ def _ensure_workers_started():
             print(f"[startup] WARNING: workers failed to start: {_e}", flush=True)
 
 # ── Socket.IO event handlers ──
-@socketio.on('connect')
-def handle_connect():
-    print(f"[Socket.IO] Client connected: {request.sid}")
-    # Push candle history immediately on connect (NQ 1m by default).
-    # This ensures bubble profiles (bp) are populated on the first page load
-    # without waiting for a topology reconnect / gap-fill trigger.
+def _push_candle_history(sid, symbol='NQ', tf='1m', max_candles=200):
+    """Push candle history to a specific client. Returns True if data was sent."""
     try:
         from background_engine.l2_worker import get_candles, _CURRENT_CANDLE
-        candles_raw = get_candles('NQ', '1m')
-        # Append current in-flight candle (has live bp but isn't frozen yet)
-        cur = _CURRENT_CANDLE.get('NQ', {}).get('1m')
+        candles_raw = get_candles(symbol, tf)
+        cur = _CURRENT_CANDLE.get(symbol, {}).get(tf)
         all_candles = list(candles_raw)
         if cur and (not all_candles or cur['t'] != all_candles[-1]['t']):
             all_candles.append(cur)
         send_candles = []
-        for c in all_candles[-200:]:
+        for c in all_candles[-max_candles:]:
             out = {
                 "time":   int(c.get("t", 0)),
                 "open":   c["o"], "high": c["h"],
@@ -2882,22 +3321,79 @@ def handle_connect():
             bp = c.get("bp")
             if bp:
                 out["bp"] = {k: v for k, v in bp.items() if v[0] > 0 or v[1] > 0}
-            for key in ("icebergs", "sweeps", "delta_div", "ignition",
-                        "spoofs", "drifting_iceberg", "wall_gone"):
+            for key in ("sweeps", "delta_div", "ignition",
+                        "spoofs", "wall_gone",
+                        "absorption", "depth_deltas"):
                 val = c.get(key)
                 if val:
                     out[key] = val
             send_candles.append(out)
         if send_candles:
-            emit('candle_history', {'symbol': 'NQ', 'tf': '1m', 'candles': send_candles})
+            socketio.emit('candle_history', {'symbol': symbol, 'tf': tf, 'candles': send_candles},
+                          to=sid, namespace='/')
             bp_count = sum(1 for c in send_candles if c.get('bp'))
-            print(f"[Socket.IO] Pushed {len(send_candles)} candles ({bp_count} with bp) to {request.sid}")
+            print(f"[Socket.IO] Pushed {len(send_candles)} {symbol}/{tf} candles ({bp_count} with bp) to {sid}")
+            return True
     except Exception as e:
-        print(f"[Socket.IO] candle_history push on connect failed: {e}")
+        print(f"[Socket.IO] candle_history push failed: {e}")
+    return False
+
+# Track active tf per client to cancel stale deferred pushes
+_client_active_tf = {}  # {sid: tf}
+
+def _deferred_candle_push(sid, symbol='NQ', tf='1m'):
+    """Retry candle push until backfill is done and meaningful data is available."""
+    import time as _time
+    for attempt in range(15):
+        _time.sleep(2)
+        # Abort if client switched to a different tf
+        if _client_active_tf.get(sid) != tf:
+            print(f"[Socket.IO] Deferred push for {sid} aborted — client switched from {tf} to {_client_active_tf.get(sid)}")
+            return
+        try:
+            from background_engine.l2_worker import get_candles
+            candles = get_candles(symbol, tf)
+            if len(candles) >= 50:
+                _push_candle_history(sid, symbol, tf)
+                return
+        except Exception:
+            pass
+    # Last resort: push whatever we have (if still on same tf)
+    if _client_active_tf.get(sid) == tf:
+        _push_candle_history(sid, symbol, tf)
+
+@socketio.on('connect')
+def handle_connect():
+    sid = request.sid
+    print(f"[Socket.IO] Client connected: {sid}")
+    # Push candle history on connect — subscribe handler also pushes on tf switch
+    # but the initial connect needs this for first load
+    _client_active_tf[sid] = '1m'
+    # Ensure _ACTIVE_TFS contains this client's default tf
+    try:
+        import background_engine.l2_worker as _l2w
+        _l2w._ACTIVE_TFS = set(_client_active_tf.values()) or {"1m"}
+    except Exception:
+        pass
+    if not _push_candle_history(sid):
+        import threading
+        t = threading.Thread(target=_deferred_candle_push, args=(sid,), daemon=True)
+        t.start()
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    print(f"[Socket.IO] Client disconnected: {request.sid}")
+    sid = request.sid
+    print(f"[Socket.IO] Client disconnected: {sid}")
+    # Drop this client's tf and rebuild _ACTIVE_TFS set
+    _client_active_tf.pop(sid, None)
+    try:
+        import background_engine.l2_worker as _l2w
+        live = set(_client_active_tf.values()) or {"1m"}
+        _l2w._ACTIVE_TFS = live
+        # Keep legacy singleton roughly in sync (arbitrary pick)
+        _l2w._ACTIVE_TF = next(iter(live))
+    except Exception:
+        pass
 
 @socketio.on('subscribe')
 def handle_subscribe(data):
@@ -2906,52 +3402,35 @@ def handle_subscribe(data):
     """
     symbol = data.get('symbol', 'NQ').upper()
     tf = data.get('tf', '1m')
-    print(f"[Socket.IO] Client {request.sid} subscribed to {symbol}/{tf}")
+    sid = request.sid
+    print(f"[Socket.IO] Client {sid} subscribed to {symbol}/{tf}")
     emit('subscribed', {'symbol': symbol, 'tf': tf})
+    # Track per-client tf (kills stale deferred pushes)
+    _client_active_tf[sid] = tf
+    # Update active tf set — union of all clients' TFs (multi-client safe)
+    try:
+        import background_engine.l2_worker as _l2w
+        live = set(_client_active_tf.values()) or {"1m"}
+        _l2w._ACTIVE_TFS = live
+        _l2w._ACTIVE_TF = tf  # legacy field — last-subscriber wins (harmless now)
+    except Exception:
+        pass
     # Reset V2 engines so stale state from previous symbol doesn't bleed
     try:
         from background_engine.l2_worker import _reset_v2_engines
         _reset_v2_engines(symbol)
     except Exception:
         pass  # l2_worker not yet loaded on cold start
-    # Push full candle history for the requested symbol/tf
-    try:
-        from background_engine.l2_worker import get_candles, _CURRENT_CANDLE, CANDLE_TIMEFRAMES
-        if tf not in CANDLE_TIMEFRAMES:
-            return
-        candles_raw = get_candles(symbol, tf)
-        cur = _CURRENT_CANDLE.get(symbol, {}).get(tf)
-        all_candles = list(candles_raw)
-        if cur and (not all_candles or cur['t'] != all_candles[-1]['t']):
-            all_candles.append(cur)
-        send_candles = []
-        for c in all_candles[-300:]:
-            out = {
-                "time":   int(c.get("t", 0)),
-                "open":   c["o"], "high": c["h"],
-                "low":    c["l"], "close": c["c"],
-                "volume": c.get("v", 0),
-            }
-            bp = c.get("bp")
-            if bp:
-                out["bp"] = {k: v for k, v in bp.items() if v[0] > 0 or v[1] > 0}
-            for key in ("icebergs", "sweeps", "delta_div", "ignition",
-                        "spoofs", "drifting_iceberg", "wall_gone"):
-                val = c.get(key)
-                if val:
-                    out[key] = val
-            send_candles.append(out)
-        if send_candles:
-            emit('candle_history', {'symbol': symbol, 'tf': tf, 'candles': send_candles})
-            bp_count = sum(1 for c in send_candles if c.get('bp'))
-            print(f"[Socket.IO] subscribe: pushed {len(send_candles)} {symbol}/{tf} candles "
-                  f"({bp_count} with bp) to {request.sid}")
-    except Exception as e:
-        print(f"[Socket.IO] subscribe candle_history push failed: {e}")
+    # Push candle history — retry if worker hasn't loaded yet
+    if not _push_candle_history(sid, symbol, tf, max_candles=300):
+        print(f"[Socket.IO] No candles for {symbol}/{tf} yet, scheduling deferred push for {sid}...")
+        import threading
+        t = threading.Thread(target=_deferred_candle_push, args=(sid, symbol, tf), daemon=True)
+        t.start()
 
 if __name__ == "__main__":
     print("Starting Altaris Dev with Socket.IO...")
     print("Open http://localhost:5000 in your browser")
 
     port = int(os.environ.get("PORT", 5000))
-    socketio.run(app, host="0.0.0.0", port=port, debug=False, allow_unsafe_werkzeug=True)
+    socketio.run(app, host="0.0.0.0", port=port, debug=False)

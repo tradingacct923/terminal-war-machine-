@@ -116,7 +116,7 @@ def _get_token():
             return t
     except Exception:
         pass
-    return os.getenv("TRADIER_TOKEN", "BkkUX4cdeBXLkAejHAm8mKeOGTzt")
+    return os.getenv("TRADIER_TOKEN", "")
 
 def _tradier_get(path, params=None):
     import urllib.request, urllib.parse
