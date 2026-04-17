@@ -13,8 +13,11 @@ results via get_iv_calibration() for other engines to consume.
 """
 
 import time
+import logging
 import threading
 from datetime import datetime
+
+log = logging.getLogger(__name__)
 
 
 class IVCalibrator:
@@ -56,7 +59,7 @@ class IVCalibrator:
         self._running = True
         self._thread = threading.Thread(target=self._poll_loop, daemon=True, name='iv-calibrator')
         self._thread.start()
-        print(f"[IV-CAL] Started — polling {self._ticker} every {self._poll_interval}s")
+        log.info(f"[IV-CAL] Started — polling {self._ticker} every {self._poll_interval}s")
 
     def stop(self):
         """Stop the polling thread."""
@@ -97,7 +100,7 @@ class IVCalibrator:
             except Exception as e:
                 fail_count += 1
                 backoff = min(self._poll_interval * (2 ** min(fail_count, 4)), 3600)
-                print(f"[IV-CAL] ⚠️ Poll failed ({fail_count}x): {e} — backing off {backoff}s")
+                log.info(f"[IV-CAL] ⚠️ Poll failed ({fail_count}x): {e} — backing off {backoff}s")
                 time.sleep(backoff)
 
     def _poll_tradier(self):
@@ -221,6 +224,6 @@ class IVCalibrator:
                 'strike_count': len(strike_data),
             }
 
-        print(f"[IV-CAL] {self._ticker} ATM={atm_strike} mid_iv={atm_mid_iv:.4f} "
+        log.info(f"[IV-CAL] {self._ticker} ATM={atm_strike} mid_iv={atm_mid_iv:.4f} "
               f"spread={iv_spread:.4f} ({spread_label}) smv={atm_smv:.4f} "
               f"skew25d={skew_25d:+.4f} | {len(strike_data)} strikes")

@@ -79,5 +79,80 @@ class TestHealthInvariants(unittest.TestCase):
                 os.environ["ALPHA_ENABLED"] = prev
 
 
+class TestGlobalDeclarations(unittest.TestCase):
+    """
+    Catch the class of bug where a module-level singleton is assigned inside a
+    function without `global`, silently creating a local instead of updating the
+    module global.
+
+    This is the bug that caused IVCalibrator + MMTracker data to be dropped from
+    every zone_update event — IVCalibrator itself ran fine, but the publish path
+    saw module-level _iv_calibrator as None forever.
+    """
+
+    # (file, function_name, required_globals): every module-level var that must
+    # be assignable inside the named function.
+    CASES = [
+        (
+            "background_engine/schwab_bridge.py",
+            "_run_bridge",
+            {"_iv_calibrator", "_mm_tracker", "_flow_classifier", "_edge_detector",
+             "_dte0_squeeze", "_greek_surface", "_vol_surface", "_streamer"},
+        ),
+    ]
+
+    def _parse_function(self, file_path, func_name):
+        import ast
+        import os
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, file_path)) as f:
+            tree = ast.parse(f.read())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == func_name:
+                return node
+        return None
+
+    def test_globals_declared_where_assigned(self):
+        import ast
+        for file_path, func_name, required in self.CASES:
+            fn = self._parse_function(file_path, func_name)
+            self.assertIsNotNone(fn, f"{file_path}::{func_name} not found")
+
+            assigned = set()
+            globaled = set()
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Assign):
+                    for t in node.targets:
+                        if isinstance(t, ast.Name):
+                            assigned.add(t.id)
+                elif isinstance(node, ast.Global):
+                    globaled.update(node.names)
+
+            missing = (assigned & required) - globaled
+            self.assertFalse(
+                missing,
+                f"{file_path}::{func_name} assigns {missing} without `global` "
+                f"— this silently creates locals and drops the data from consumers. "
+                f"Add `global {', '.join(sorted(missing))}` before the assignment."
+            )
+
+
+class TestZoneUpdateContract(unittest.TestCase):
+    """Assert zone_update emit has the IV merge block in place."""
+
+    def test_zone_update_merges_iv_calibration(self):
+        import os
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "background_engine/schwab_bridge.py")) as f:
+            src = f.read()
+        # Presence check on the inject block. If someone rips this out, test fails.
+        for key in ("orats_mid_iv", "orats_smv_vol", "skew_25d", "mm_uncertainty"):
+            self.assertIn(
+                f"zone_data['{key}']", src,
+                f"zone_update emit no longer sets {key!r} — "
+                f"audit P1 surfaced this field; do not drop it silently"
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

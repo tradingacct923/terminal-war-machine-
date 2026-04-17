@@ -12,44 +12,44 @@
   <link rel="preconnect" href="https://unpkg.com" crossorigin />
   <!-- Fonts: non-render-blocking with swap -->
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600;700&family=Share+Tech+Mono&display=swap" />
-  <link rel="stylesheet" href="style.css?v=1777900000" />
-  <link rel="stylesheet" href="layout_engine.css?v=1777900000" />
+  <link rel="stylesheet" href="style.css?v=1778000000" />
+  <link rel="stylesheet" href="layout_engine.css?v=1778000000" />
   <!-- CDN libraries: defer to avoid blocking page render -->
   <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <script defer src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
-  <!-- Plotly: lazy-loaded on demand (3.5MB) — loaded by app.js?v=1777900000 when GEX/DEX panes are mounted -->
+  <!-- Plotly: lazy-loaded on demand (3.5MB) — loaded by app.js?v=1778000000 when GEX/DEX panes are mounted -->
   <script defer src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.4/socket.io.min.js"></script>
   <!-- Local scripts: all deferred for non-blocking load -->
-  <script defer src="webgl_overlay.js?v=1777900000"></script>
-  <script defer src="core/event_bus.js?v=1777900000"></script>
-  <script defer src="volume_bubbles.js?v=1777900000"></script>
-  <script defer src="v2_sigma_engine.js?v=1777900000"></script>
-  <script defer src="volume_profile_overlay.js?v=1777900000"></script>
-  <script defer src="vp_intel_pane.js?v=1777900000"></script>
-  <script defer src="v2_integration.js?v=1777900000"></script>
-  <script defer src="sigma_engine.js?v=1777900000"></script>
-  <script defer src="kinetic_text.js?v=1777900000"></script>
-  <script defer src="kinetic_hud.js?v=1777900000"></script>
-  <script defer src="book_microstructure_hud.js?v=1777900000"></script>
-  <script defer src="equity_tape_pane.js?v=1777900000"></script>
-  <script defer src="cross_divergence_pane.js?v=1777900000"></script>
-  <script defer src="options_flow_pane.js?v=1777900000"></script>
-  <script defer src="vol_surface_pane.js?v=1777900000"></script>
-  <script defer src="dealer_flow_pane.js?v=1777900000"></script>
-  <script defer src="depth_ladder.js?v=1777900000"></script>
-  <script defer src="pressure_field.js?v=1777900000"></script>
-  <script defer src="features/thermal_flare.js?v=1777900000"></script>
-  <script defer src="features/wall_lines.js?v=1777900000"></script>
-  <script defer src="features/options_chain.js?v=1777900000"></script>
-  <script defer src="features/chart_core.js?v=1777900000"></script>
-  <script defer src="features/drawing_tools.js?v=1777900000"></script>
-  <script defer src="features/data_fetch.js?v=1777900000"></script>
-  <script defer src="features/dashboard_charts.js?v=1777900000"></script>
-  <script defer src="features/alpha_dashboard.js?v=1777900000"></script>
-  <script defer src="layout_manager.js?v=1777900000"></script>
-  <script defer src="layout_integration.js?v=1777900000"></script>
-  <script defer src="toast.js?v=1777900000"></script>
-  <script defer src="app.js?v=1777900000"></script>
+  <script defer src="webgl_overlay.js?v=1778000000"></script>
+  <script defer src="core/event_bus.js?v=1778000000"></script>
+  <script defer src="volume_bubbles.js?v=1778000000"></script>
+  <script defer src="v2_sigma_engine.js?v=1778000000"></script>
+  <script defer src="volume_profile_overlay.js?v=1778000000"></script>
+  <script defer src="vp_intel_pane.js?v=1778000000"></script>
+  <script defer src="v2_integration.js?v=1778000000"></script>
+  <script defer src="sigma_engine.js?v=1778000000"></script>
+  <script defer src="kinetic_text.js?v=1778000000"></script>
+  <script defer src="kinetic_hud.js?v=1778000000"></script>
+  <script defer src="book_microstructure_hud.js?v=1778000000"></script>
+  <script defer src="equity_tape_pane.js?v=1778000000"></script>
+  <script defer src="cross_divergence_pane.js?v=1778000000"></script>
+  <script defer src="options_flow_pane.js?v=1778000000"></script>
+  <script defer src="vol_surface_pane.js?v=1778000000"></script>
+  <script defer src="dealer_flow_pane.js?v=1778000000"></script>
+  <script defer src="depth_ladder.js?v=1778000000"></script>
+  <script defer src="pressure_field.js?v=1778000000"></script>
+  <script defer src="features/thermal_flare.js?v=1778000000"></script>
+  <script defer src="features/wall_lines.js?v=1778000000"></script>
+  <script defer src="features/options_chain.js?v=1778000000"></script>
+  <script defer src="features/chart_core.js?v=1778000000"></script>
+  <script defer src="features/drawing_tools.js?v=1778000000"></script>
+  <script defer src="features/data_fetch.js?v=1778000000"></script>
+  <script defer src="features/dashboard_charts.js?v=1778000000"></script>
+  <script defer src="features/alpha_dashboard.js?v=1778000000"></script>
+  <script defer src="layout_manager.js?v=1778000000"></script>
+  <script defer src="layout_integration.js?v=1778000000"></script>
+  <script defer src="toast.js?v=1778000000"></script>
+  <script defer src="app.js?v=1778000000"></script>
   <!-- Apply saved theme before first paint -->
   <script>document.documentElement.setAttribute('data-theme', localStorage.getItem('dashTheme') || 'void');</script>
   <!-- Suppress LWC internal "Value is null" throws (CDN cross-origin, no stack access) -->
@@ -264,7 +264,6 @@
         <div class="t-metric" title="ORATS calibrated ATM mid IV"><span class="t-metric-label" style="color:#ffd700">O.Mid</span><span class="t-metric-val" id="t-orats-mid" style="font-size:8px">—</span></div>
         <div class="t-metric" title="ORATS smoothed mid-vol (skew-corrected)"><span class="t-metric-label" style="color:#ffd700">O.SMV</span><span class="t-metric-val" id="t-orats-smv" style="font-size:8px">—</span></div>
         <div class="t-metric" title="Market-Maker bid-ask uncertainty band (0-3)"><span class="t-metric-label" style="color:#ff6b6b">MM.σ</span><span class="t-metric-val" id="t-mm-unc" style="font-size:8px">—</span></div>
-        <div class="t-metric" title="Mean pairwise signal correlation (ρ̄)"><span class="t-metric-label" style="color:#b4a7ff">ρ̄</span><span class="t-metric-val" id="t-rho-bar" style="font-size:8px">—</span></div>
         <div class="t-metric" title="Copula-specific correlation estimate"><span class="t-metric-label" style="color:#b4a7ff">ρC</span><span class="t-metric-val" id="t-copula-rho" style="font-size:8px">—</span></div>
       </div>
       <!-- Greeks -->
@@ -485,12 +484,12 @@
 
     <!-- ════════════════════════════════════════════════════════════════════
          PANE GRID — Dynamic Layout Engine
-         Panes are created by layout_integration.js, content mounted by app.js?v=1777900000
+         Panes are created by layout_integration.js, content mounted by app.js?v=1778000000
          ════════════════════════════════════════════════════════════════════ -->
     <div id="pane-grid" data-layout="single"></div>
     <div id="drag-overlay"></div>
 
-    <!-- ── Options Chain Panel (hidden, mounted into oclvl pane by app.js?v=1777900000) ── -->
+    <!-- ── Options Chain Panel (hidden, mounted into oclvl pane by app.js?v=1778000000) ── -->
     <div class="t-options" id="t-options" style="display:none">
       <div class="oc-header">
         <span class="oc-title">OPTIONS CHAIN</span>

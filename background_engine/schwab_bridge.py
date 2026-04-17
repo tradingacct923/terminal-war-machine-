@@ -53,13 +53,13 @@ def start_schwab_bridge():
     """Start the Schwab streamer bridge in a background thread."""
     global _bridge_running
     if _bridge_running:
-        print("[SCHWAB-BRIDGE] Already running")
+        log.info("[SCHWAB-BRIDGE] Already running")
         return
 
     _bridge_running = True
     t = threading.Thread(target=_run_bridge, daemon=True)
     t.start()
-    print("[SCHWAB-BRIDGE] Background thread spawned")
+    log.info("[SCHWAB-BRIDGE] Background thread spawned")
 
 
 def _run_bridge():
@@ -86,35 +86,35 @@ def _run_bridge():
             _edge_detector._get_vpin = lambda sym: _VPIN_ENGINES.get(sym)
             _edge_detector._get_hawkes = lambda sym: _V2_HAWKES.get(sym)
             _edge_detector._get_kalman = lambda sym: _V2_KALMAN.get(sym)
-            print("[SCHWAB-BRIDGE] AdverseSelection + NQ engines → EdgeDetector wired")
+            log.info("[SCHWAB-BRIDGE] AdverseSelection + NQ engines → EdgeDetector wired")
         except ImportError:
-            print("[SCHWAB-BRIDGE] ⚠️ NQ engine wiring not available")
-        print("[SCHWAB-BRIDGE] EdgeDetector attached")
+            log.info("[SCHWAB-BRIDGE] ⚠️ NQ engine wiring not available")
+        log.info("[SCHWAB-BRIDGE] EdgeDetector attached")
 
         # Initialize MMTracker — market maker withdrawal detection
         global _mm_tracker
         from connectors.mm_tracker import MMTracker
         _mm_tracker = MMTracker(edge_detector=_edge_detector)
         _edge_detector._mm_tracker_ref = _mm_tracker
-        print("[SCHWAB-BRIDGE] MMTracker attached → EdgeDetector")
+        log.info("[SCHWAB-BRIDGE] MMTracker attached → EdgeDetector")
 
         # Initialize 0DTE Squeeze Detector — options dealer delta hedge tracking
         global _dte0_squeeze, _greek_surface
         try:
             from connectors.dte0_squeeze import DTE0SqueezeDetector
             _dte0_squeeze = DTE0SqueezeDetector(edge_detector=_edge_detector)
-            print("[SCHWAB-BRIDGE] DTE0 Squeeze Detector attached → EdgeDetector")
+            log.info("[SCHWAB-BRIDGE] DTE0 Squeeze Detector attached → EdgeDetector")
         except ImportError as e:
-            print(f"[SCHWAB-BRIDGE] ⚠️ DTE0 Squeeze Detector not available: {e}")
+            log.info(f"[SCHWAB-BRIDGE] ⚠️ DTE0 Squeeze Detector not available: {e}")
 
         # Initialize Greek Surface Engine — full sensitivity surface
         try:
             from connectors.greek_surface import GreekSurface
             _greek_surface = GreekSurface()
             _edge_detector._greek_surface = _greek_surface
-            print("[SCHWAB-BRIDGE] GreekSurface engine attached → EdgeDetector")
+            log.info("[SCHWAB-BRIDGE] GreekSurface engine attached → EdgeDetector")
         except ImportError as e:
-            print(f"[SCHWAB-BRIDGE] ⚠️ GreekSurface not available: {e}")
+            log.info(f"[SCHWAB-BRIDGE] ⚠️ GreekSurface not available: {e}")
 
         # Initialize Vol Surface Monitor — live volatility surface state machine
         global _vol_surface
@@ -122,10 +122,10 @@ def _run_bridge():
             from connectors.vol_surface import VolSurface
             _vol_surface = VolSurface()
             _edge_detector._vol_surface = _vol_surface
-            print("[SCHWAB-BRIDGE] VolSurface monitor attached → EdgeDetector")
+            log.info("[SCHWAB-BRIDGE] VolSurface monitor attached → EdgeDetector")
         except ImportError as e:
             _vol_surface = None
-            print(f"[SCHWAB-BRIDGE] ⚠️ VolSurface not available: {e}")
+            log.info(f"[SCHWAB-BRIDGE] ⚠️ VolSurface not available: {e}")
 
         # Initialize IV Calibrator — Tradier ORATS IV surface polling
         global _iv_calibrator
@@ -133,10 +133,10 @@ def _run_bridge():
             from connectors.iv_calibrator import IVCalibrator
             _iv_calibrator = IVCalibrator(ticker='QQQ', poll_interval=300)
             _iv_calibrator.start()
-            print("[SCHWAB-BRIDGE] IVCalibrator started (Tradier ORATS, 5-min poll)")
+            log.info("[SCHWAB-BRIDGE] IVCalibrator started (Tradier ORATS, 5-min poll)")
         except ImportError as e:
             _iv_calibrator = None
-            print(f"[SCHWAB-BRIDGE] ⚠️ IVCalibrator not available: {e}")
+            log.info(f"[SCHWAB-BRIDGE] ⚠️ IVCalibrator not available: {e}")
 
         # Wire NQ detection forwarding: l2_worker → EdgeDetector (works without Schwab)
         try:
@@ -148,27 +148,27 @@ def _run_bridge():
             set_cross_asset_provider(_edge_detector.get_cross_asset_context)
             set_trade_score_callback(_edge_detector.score_trade)
             set_nq_signal_callback(_edge_detector.check_nq_signals)
-            print("[SCHWAB-BRIDGE] NQ detection ↔ EdgeDetector bidirectional wired + NQ signals")
+            log.info("[SCHWAB-BRIDGE] NQ detection ↔ EdgeDetector bidirectional wired + NQ signals")
         except ImportError:
-            print("[SCHWAB-BRIDGE] ⚠️ l2_worker not available for NQ forwarding")
+            log.info("[SCHWAB-BRIDGE] ⚠️ l2_worker not available for NQ forwarding")
 
     except Exception as e:
         import traceback
-        print(f"[SCHWAB-BRIDGE] ❌ EdgeDetector init failed: {e}")
-        print(traceback.format_exc())
+        log.info(f"[SCHWAB-BRIDGE] ❌ EdgeDetector init failed: {e}")
+        log.info(traceback.format_exc())
 
     # ── Schwab auth + streamer (optional — NQ signals work without it) ──
     try:
-        print("[SCHWAB-BRIDGE] Initializing Schwab auth...")
+        log.info("[SCHWAB-BRIDGE] Initializing Schwab auth...")
         from connectors.schwab_auth import SchwabAuth
         from connectors.schwab_streamer import SchwabStreamer
 
         auth = SchwabAuth()
         if not auth.is_authenticated():
-            print("[SCHWAB-BRIDGE] ⚠️ Schwab not authenticated — NQ-only mode (TopStepX signals active)")
+            log.info("[SCHWAB-BRIDGE] ⚠️ Schwab not authenticated — NQ-only mode (TopStepX signals active)")
             return
 
-        print("[SCHWAB-BRIDGE] Authenticated, starting streamer...")
+        log.info("[SCHWAB-BRIDGE] Authenticated, starting streamer...")
         _streamer = SchwabStreamer(auth)
 
         # Register callbacks
@@ -190,7 +190,7 @@ def _run_bridge():
         # Re-attach Schwab book callbacks
         _streamer.on('NASDAQ_BOOK', _edge_detector._on_book)
         _streamer.on('SCREENER_OPTION', _edge_detector._on_screener)
-        print("[SCHWAB-BRIDGE] FlowClassifier + Schwab streams → EdgeDetector attached")
+        log.info("[SCHWAB-BRIDGE] FlowClassifier + Schwab streams → EdgeDetector attached")
 
         # Start the WebSocket connection
         _streamer.start()
@@ -206,20 +206,20 @@ def _run_bridge():
 
         # Subscribe to QQQ equity L2 book (NASDAQ_BOOK)
         _streamer.subscribe_nasdaq_book(['QQQ'])
-        print("[SCHWAB-BRIDGE] Subscribed to NASDAQ_BOOK for QQQ")
+        log.info("[SCHWAB-BRIDGE] Subscribed to NASDAQ_BOOK for QQQ")
 
         # Subscribe to SPY equity L2 book (NYSE_BOOK) — cross-market divergence
         _streamer.subscribe_nyse_book(['SPY'])
-        print("[SCHWAB-BRIDGE] Subscribed to NYSE_BOOK for SPY")
+        log.info("[SCHWAB-BRIDGE] Subscribed to NYSE_BOOK for SPY")
 
         # Subscribe to options screener (volume-based unusual activity)
         try:
             _streamer.subscribe_screener_option('VOLUME', '0')
-            print("[SCHWAB-BRIDGE] Subscribed to SCREENER_OPTION")
+            log.info("[SCHWAB-BRIDGE] Subscribed to SCREENER_OPTION")
         except Exception as e:
-            print(f"[SCHWAB-BRIDGE] SCREENER_OPTION subscription failed: {e}")
+            log.info(f"[SCHWAB-BRIDGE] SCREENER_OPTION subscription failed: {e}")
 
-        print("[SCHWAB-BRIDGE] All subscriptions active")
+        log.info("[SCHWAB-BRIDGE] All subscriptions active")
 
         # Keep thread alive and log stats periodically
         while _bridge_running:
@@ -233,8 +233,8 @@ def _run_bridge():
 
     except Exception as e:
         import traceback
-        print(f"[SCHWAB-BRIDGE] ❌ Bridge failed: {e}")
-        print(traceback.format_exc())
+        log.info(f"[SCHWAB-BRIDGE] ❌ Bridge failed: {e}")
+        log.info(traceback.format_exc())
 
 
 def _subscribe_qqq_options():
@@ -256,15 +256,15 @@ def _subscribe_qqq_options():
             # Try live cached QQQ from equity stream
             if _latest_qqq > 0:
                 qqq_spot = _latest_qqq
-                print(f"[SCHWAB-BRIDGE] QQQ REST unavailable, using live stream QQQ={qqq_spot:.2f}")
+                log.info(f"[SCHWAB-BRIDGE] QQQ REST unavailable, using live stream QQQ={qqq_spot:.2f}")
             else:
-                print(f"[SCHWAB-BRIDGE] ❌ No live QQQ spot available — aborting options subscription")
+                log.info(f"[SCHWAB-BRIDGE] ❌ No live QQQ spot available — aborting options subscription")
                 return
 
         # Get nearest 2 expirations (0DTE + next)
         raw_dates = _schwab_expirations("QQQ")
         if not raw_dates:
-            print("[SCHWAB-BRIDGE] ⚠️ No QQQ expirations — skipping options subscription")
+            log.info("[SCHWAB-BRIDGE] ⚠️ No QQQ expirations — skipping options subscription")
             return
 
         exp_dates = raw_dates[:3]  # 0DTE + next two for term structure
@@ -281,23 +281,23 @@ def _subscribe_qqq_options():
                     if sym and abs(strike - atm) <= 60:  # ±$60 around ATM (~120 strikes per expiry)
                         symbols.append(sym)
             except Exception as e:
-                print(f"[SCHWAB-BRIDGE] ⚠️ Chain fetch failed for {exp_date}: {e}")
+                log.info(f"[SCHWAB-BRIDGE] ⚠️ Chain fetch failed for {exp_date}: {e}")
 
         if not symbols:
-            print(f"[SCHWAB-BRIDGE] ⚠️ No QQQ options near ATM={atm}")
+            log.info(f"[SCHWAB-BRIDGE] ⚠️ No QQQ options near ATM={atm}")
             return
 
         _ndx_option_symbols = symbols[:200]  # Cap at 200 (wider chain coverage)
         _streamer.subscribe_options(_ndx_option_symbols)
         # Also subscribe to OPTIONS_BOOK (Level 2 depth) for flow classification
         _streamer.subscribe_options_book(_ndx_option_symbols[:20])  # Cap L2 at 20 to keep bandwidth reasonable
-        print(f"[SCHWAB-BRIDGE] 📊 Subscribed to {len(_ndx_option_symbols)} QQQ options "
+        log.info(f"[SCHWAB-BRIDGE] 📊 Subscribed to {len(_ndx_option_symbols)} QQQ options "
               f"(ATM≈{atm}, exps={exp_dates}) + OPTIONS_BOOK L2 for top 20")
 
     except Exception as e:
         import traceback
-        print(f"[SCHWAB-BRIDGE] ⚠️ QQQ options subscription failed: {e}")
-        print(traceback.format_exc())
+        log.info(f"[SCHWAB-BRIDGE] ⚠️ QQQ options subscription failed: {e}")
+        log.info(traceback.format_exc())
 
 
 # ── NQ/QQQ/NDX price mapping ──────────────────────────────────────────────────
@@ -705,7 +705,7 @@ def _maybe_emit_zones():
         # NQ price — TopStepX L2 is PRIMARY (fastest, 24/5), Schwab is secondary
         nq_live = _get_nq_mid()
         if nq_live <= 0:
-            print("[SCHWAB-BRIDGE] ⚠️ No NQ from TopStepX or Schwab — skipping zone emit")
+            log.info("[SCHWAB-BRIDGE] ⚠️ No NQ from TopStepX or Schwab — skipping zone emit")
             return
 
         # Update Schwab's NQ cache so ratio stays current even if Schwab stream drops
@@ -724,7 +724,7 @@ def _maybe_emit_zones():
             ndx_spot = nq_live / _nq_qqq_ratio
             ratio_source = "DERIVED_QQQ"
         else:
-            print("[SCHWAB-BRIDGE] ⚠️ No QQQ/NDX and no cached ratio — skipping zone emit")
+            log.info("[SCHWAB-BRIDGE] ⚠️ No QQQ/NDX and no cached ratio — skipping zone emit")
             return
 
         # NQ/QQQ ratio — MUST be computed from live feeds
@@ -734,7 +734,7 @@ def _maybe_emit_zones():
             ratio = _nq_qqq_ratio  # cached from last live computation
             ratio_source = f"CACHED_RATIO({_nq_qqq_ratio:.4f})"
         else:
-            print("[SCHWAB-BRIDGE] ⚠️ No live NQ feed — cannot compute ratio, skipping zone emit")
+            log.info("[SCHWAB-BRIDGE] ⚠️ No live NQ feed — cannot compute ratio, skipping zone emit")
             return
 
         def _r(v):
@@ -977,7 +977,7 @@ def _maybe_emit_zones():
                 if greek_data:
                     zone_data.update(greek_data)
             except Exception as e:
-                print(f"[SCHWAB-BRIDGE] ⚠️ GreekSurface compute error: {e}")
+                log.info(f"[SCHWAB-BRIDGE] ⚠️ GreekSurface compute error: {e}")
 
         # ── Merge Tradier ORATS IV calibration data ───────────────────────
         if _iv_calibrator:
@@ -1019,7 +1019,7 @@ def _maybe_emit_zones():
                         zone_data['vol_alert'] = alert_type
                         zone_data['vol_alert_severity'] = severity
             except Exception as e:
-                print(f"[SCHWAB-BRIDGE] ⚠️ VolSurface error: {e}")
+                log.info(f"[SCHWAB-BRIDGE] ⚠️ VolSurface error: {e}")
 
         # ── Pull adverse selection score + copula joint confidence ───────
         try:
@@ -1138,11 +1138,11 @@ def _maybe_emit_zones():
                     iv_rv_spread=mean_iv - _nq_realized_vol if _nq_realized_vol > 0 else 0.0,
                 )
         except Exception as e:
-            print(f"[SCHWAB-BRIDGE] ⚠️ Regime sync error: {e}")
+            log.info(f"[SCHWAB-BRIDGE] ⚠️ Regime sync error: {e}")
 
     except Exception as e:
         import traceback
-        print(f"[SCHWAB-BRIDGE] ⚠️ Zone emit error: {e}")
+        log.info(f"[SCHWAB-BRIDGE] ⚠️ Zone emit error: {e}")
         traceback.print_exc()
 
 
@@ -1256,12 +1256,12 @@ def _on_nasdaq_book(data):
     # One-shot log to confirm MM MPID data
     if not _book_logged and bids:
         _book_logged = True
-        print(f"[SCHWAB-BRIDGE] NASDAQ_BOOK sample ({symbol}):")
+        log.info(f"[SCHWAB-BRIDGE] NASDAQ_BOOK sample ({symbol}):")
         for side_label, levels in [('BID', bids[:3]), ('ASK', asks[:3])]:
             for lvl in levels:
                 mms = lvl.get('market_makers', [])
                 ids = [m.get('id', '?') for m in mms[:8]]
-                print(f"  {side_label} {lvl.get('price')}: size={lvl.get('size')} mm_count={lvl.get('mm_count')} MMs={ids}")
+                log.info(f"  {side_label} {lvl.get('price')}: size={lvl.get('size')} mm_count={lvl.get('mm_count')} MMs={ids}")
 
     # ── Book Microstructure Analysis ──────────────────────────────────────────
     # Compute quality metrics per level and aggregate into BBO-level signals.
@@ -1356,12 +1356,12 @@ def _on_nyse_book(data):
 
     if not _nyse_book_logged and bids:
         _nyse_book_logged = True
-        print(f"[SCHWAB-BRIDGE] NYSE_BOOK sample ({symbol}):")
+        log.info(f"[SCHWAB-BRIDGE] NYSE_BOOK sample ({symbol}):")
         for side_label, levels in [('BID', bids[:3]), ('ASK', asks[:3])]:
             for lvl in levels:
                 mms = lvl.get('market_makers', [])
                 ids = [m.get('id', '?') for m in mms[:8]]
-                print(f"  {side_label} {lvl.get('price')}: size={lvl.get('size')} "
+                log.info(f"  {side_label} {lvl.get('price')}: size={lvl.get('size')} "
                       f"mm_count={lvl.get('mm_count')} MMs={ids}")
 
     now_ms = time.time()
@@ -1448,9 +1448,9 @@ def _on_screener_option(data):
 
     # Log first raw response for field debugging
     if not _screener_logged:
-        print(f"[SCHWAB-BRIDGE] SCREENER_OPTION data: items={len(data.get('items', []))}")
+        log.info(f"[SCHWAB-BRIDGE] SCREENER_OPTION data: items={len(data.get('items', []))}")
         items_sample = data.get('items', [])[:2]
-        print(f"[SCHWAB-BRIDGE] SCREENER_OPTION sample items: {str(items_sample)[:500]}")
+        log.info(f"[SCHWAB-BRIDGE] SCREENER_OPTION sample items: {str(items_sample)[:500]}")
         _screener_logged = True
 
     items = data.get('items', [])
@@ -1497,10 +1497,10 @@ def _log_stats():
     src = "TSX" if nq_topstep > 0 and nq_topstep != nq_schwab else "SCH"
     nq_show = nq_topstep if nq_topstep > 0 else nq_schwab
     if _streamer and _streamer.is_connected:
-        print(f"[SCHWAB-BRIDGE] 📊 {_tick_count} ticks | NQ={nq_show:.2f}({src}) | "
+        log.info(f"[SCHWAB-BRIDGE] 📊 {_tick_count} ticks | NQ={nq_show:.2f}({src}) | "
               f"ratio={_nq_qqq_ratio:.2f} | strikes={opts_count} | opt_age={opt_age}s")
     else:
-        print(f"[SCHWAB-BRIDGE] ⚠️  {_tick_count} ticks | NQ={nq_show:.2f}({src}) | connected=False (reconnecting...)")
+        log.info(f"[SCHWAB-BRIDGE] ⚠️  {_tick_count} ticks | NQ={nq_show:.2f}({src}) | connected=False (reconnecting...)")
     _tick_count = 0
 
 
@@ -1510,5 +1510,5 @@ def stop_schwab_bridge():
     _bridge_running = False
     if _streamer:
         _streamer.stop()
-    print("[SCHWAB-BRIDGE] Stopped")
+    log.info("[SCHWAB-BRIDGE] Stopped")
 

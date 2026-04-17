@@ -326,7 +326,6 @@ function _setupDataEvents() {
             oratsMid: document.getElementById('t-orats-mid'),
             oratsSmv: document.getElementById('t-orats-smv'),
             mmUnc: document.getElementById('t-mm-unc'),
-            rhoBar: document.getElementById('t-rho-bar'),
             copulaRho: document.getElementById('t-copula-rho'),
         };
         return _zoneEls;
@@ -415,10 +414,11 @@ function _setupDataEvents() {
         }
 
         // Vol alert: NONE/SHOCK/STRESS/SKEW_SHIFT etc.
-        if (z.volAlert && data.vol_alert !== undefined) {
+        // Always show NONE explicitly (not em-dash) so user knows pipeline is live.
+        if (z.volAlert) {
             const a = String(data.vol_alert || 'NONE');
-            z.volAlert.textContent = a === 'NONE' ? '—' : a;
-            z.volAlert.style.color = a === 'NONE' ? '#888' :
+            z.volAlert.textContent = a;
+            z.volAlert.style.color = a === 'NONE' ? '#666' :
                 (a.includes('SHOCK') || a.includes('STRESS')) ? '#ff3060' : '#ff9500';
         }
 
@@ -470,13 +470,6 @@ function _setupDataEvents() {
             const v = Number(data.mm_uncertainty) || 0;
             z.mmUnc.textContent = v.toFixed(2);
             z.mmUnc.style.color = v > 2 ? '#ff3060' : v > 1 ? '#ff9500' : '#888';
-        }
-
-        // Mean pairwise signal correlation (0-1)
-        if (z.rhoBar && data.rho_bar !== undefined) {
-            const v = Number(data.rho_bar) || 0;
-            z.rhoBar.textContent = v.toFixed(2);
-            z.rhoBar.style.color = v > 0.7 ? '#ff3060' : v > 0.4 ? '#ff9500' : '#38bdf8';
         }
 
         // Copula-specific correlation estimate
