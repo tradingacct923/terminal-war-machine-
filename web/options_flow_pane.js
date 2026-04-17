@@ -134,3 +134,4 @@ const OptionsFlowPane = (() => {
 
     return { init, destroy, onOptionMark };
 })();
+window.OptionsFlowPane = OptionsFlowPane;

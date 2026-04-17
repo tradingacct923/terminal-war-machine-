@@ -5,7 +5,7 @@ Architecture:
   1. EmpiricalDist: Non-parametric percentile ranks (EWMA + reservoir)
   2. EdgeDetector: Regime-conditional thresholds, per-underlying screener
   3. GEX-weighted signals: amplify/discount based on proximity to gamma walls
-  4. NQ futures detection forwarding: iceberg/sweep from l2_worker → edge votes
+  4. NQ futures detection forwarding: sweep from l2_worker → edge votes
   5. Outcome feedback loop: tracks PnL at 10s/30s/60s, reports win rate
   6. Joint probability confidence: not naive averaging
 
@@ -13,7 +13,7 @@ Cross-asset data consumed:
   Stream 1: QQQ L2 (NASDAQ_BOOK) — book microstructure
   Stream 2: Options Screener     — unusual volume spikes
   Stream 3: Live GEX zones       — gamma walls, flip point
-  Stream 4: NQ futures detections — iceberg/sweep from l2_worker
+  Stream 4: NQ futures detections — sweep from l2_worker
 """
 
 import time
@@ -21,6 +21,7 @@ import math
 import threading
 import re
 from collections import deque, defaultdict
+from connectors.state_fusion import GaussianCopulaFusion
 
 
 # ═══════════════════════════════════════════════════════════
@@ -135,7 +136,7 @@ class EdgeDetector:
 
     v4 upgrades over v3:
       1. GEX-weighted signals — proximity to gamma walls amplifies/discounts
-      2. NQ futures detection forwarding — iceberg/sweep from l2_worker
+      2. NQ futures detection forwarding — sweep from l2_worker
       3. Per-underlying screener distributions
       4. Joint probability confidence
       5. Signal outcome feedback loop
@@ -157,6 +158,11 @@ class EdgeDetector:
         'DELTA_HEDGE_LONG': 'FLOW',     'DELTA_HEDGE_SHORT': 'FLOW',
         'FLOW_DIVERGENCE_LONG': 'FLOW', 'FLOW_ALIGNMENT_SHORT': 'FLOW',
         'CONFLUENCE_NUCLEAR_LONG': 'OPTIONS', 'CONFLUENCE_NUCLEAR_SHORT': 'OPTIONS',
+        # NQ-native signals (TopStepX L2 only — no Schwab needed)
+        'VPIN_SPIKE_LONG': 'TOXICITY',  'VPIN_SPIKE_SHORT': 'TOXICITY',
+        'HAWKES_EXHAUST_LONG': 'HAWKES','HAWKES_EXHAUST_SHORT': 'HAWKES',
+        'KYLE_DIVERGE_LONG': 'ADVERSE', 'KYLE_DIVERGE_SHORT': 'ADVERSE',
+        'OFI_EXTREME_LONG': 'NQ_FLOW',  'OFI_EXTREME_SHORT': 'NQ_FLOW',
     }
 
     def __init__(self, streamer, flow_classifier=None, socketio=None):
@@ -215,7 +221,7 @@ class EdgeDetector:
         self._zones_updated_at = 0
 
         # ─── NQ Futures Detection Buffer ─────────────────
-        self._nq_detections = deque(maxlen=100)  # recent NQ iceberg/sweep events
+        self._nq_detections = deque(maxlen=100)  # recent NQ sweep events
         self._nq_detection_stats = EmpiricalDist(half_life=30, reservoir_size=200)
         self._nq_lead_lag_stats = EmpiricalDist(half_life=20, reservoir_size=100)
 
@@ -248,6 +254,25 @@ class EdgeDetector:
         self._hawkes_dist = EmpiricalDist(half_life=100, reservoir_size=300)
         self._hawkes_rate_dist = EmpiricalDist(half_life=50, reservoir_size=200)  # inter-event rate tracker
         self._hawkes_event_count = 0
+
+        # ─── Adverse Selection Engine (from l2_worker) ─────
+        self._adverse_selection_fn = None  # callable: get_adverse_selection(symbol) → engine or None
+
+        # ─── Copula Signal Fusion (replaces naive independence) ──
+        self._copula = GaussianCopulaFusion(ema_halflife=200, min_obs=30)
+
+        # ─── NQ-native signal engine getters (set by schwab_bridge wiring) ──
+        self._get_vpin = None          # callable(symbol) → VPINEngine or None
+        self._get_hawkes = None        # callable(symbol) → HawkesBranchingRatio or None
+        self._get_kalman = None        # callable(symbol) → AdaptiveKalmanOFI or None
+        self._nq_signal_dists = {      # Empirical distributions for NQ signal percentiles
+            'vpin': EmpiricalDist(half_life=100, reservoir_size=300),
+            'hawkes_rho': EmpiricalDist(half_life=50, reservoir_size=200),
+            'kyle_div': EmpiricalDist(half_life=50, reservoir_size=200),
+            'ofi': EmpiricalDist(half_life=50, reservoir_size=300),
+        }
+        self._last_nq_check = 0
+        self._nq_check_interval = 2.0  # check every 2s
 
         # ─── Greek Surface State (from zone_update) ───────
         self._prev_iv_skew = None     # For IV skew change detection
@@ -301,8 +326,10 @@ class EdgeDetector:
         if self._streamer:
             self._streamer.on('NASDAQ_BOOK', self._on_book)
             self._streamer.on('SCREENER_OPTION', self._on_screener)
-            self._running = True
             print("[EDGE] ✅ Edge detector v4 — regime+GEX+NQ+MM cross-asset engine active")
+        else:
+            print("[EDGE] ✅ Edge detector v4 — NQ-only mode (TopStepX native signals)")
+        self._running = True
 
     def stop(self):
         self._running = False
@@ -310,7 +337,7 @@ class EdgeDetector:
     def get_cross_asset_context(self, symbol='NQ'):
         """Provide cross-asset context back to l2_worker.
 
-        Called by l2_worker during iceberg detection to enrich NQ detections
+        Called by l2_worker during detection to enrich NQ detections
         with QQQ-side intelligence (GEX zones, stop clusters, MM withdrawals).
 
         Returns dict with context or None if no data available.
@@ -323,7 +350,6 @@ class EdgeDetector:
         gex_zone = 'NO_DATA'
         mid = self._last_prices.get(qqq_sym, 0)
         if mid > 0 and self._live_zones:
-            # Determine direction from iceberg side (will be applied by l2_worker)
             # Return neutral context — l2_worker applies direction-specific logic
             gex_factor_long, gex_zone_long = self._gex_context(qqq_sym, True)
             gex_factor_short, gex_zone_short = self._gex_context(qqq_sym, False)
@@ -440,9 +466,9 @@ class EdgeDetector:
     # ═══════════════════════════════════════════════════════
 
     def on_nq_detection(self, detection_type, detection_data, symbol='NQ'):
-        """Called by l2_worker when NQ iceberg/sweep/spoof fires.
+        """Called by l2_worker when NQ sweep/spoof fires.
 
-        detection_type: 'iceberg' | 'drifting_iceberg' | 'sweep' | 'ignition' | 'spoof' | 'wall_gone'
+        detection_type: 'sweep' | 'ignition' | 'spoof' | 'wall_gone'
         detection_data: dict from l2_worker (side, volume, cv, etc.)
         """
         if not self._running:
@@ -451,13 +477,7 @@ class EdgeDetector:
         now = time.time()
         side = detection_data.get('side', '')
         # Normalize direction
-        if detection_type in ('iceberg', 'drifting_iceberg'):
-            # side is the AGGRESSOR — who is hitting the iceberg.
-            # side='s' (sell aggressor hitting bid) → BID iceberg → buyer wall → BULLISH
-            # side='b' (buy aggressor lifting ask) → ASK iceberg → seller wall → BEARISH
-            # Trade WITH the iceberg (against the aggressor)
-            is_long = side not in ('b', 'BID', 'bid', 'buy')  # FIXED: was inverted
-        elif detection_type == 'sweep':
+        if detection_type == 'sweep':
             # Sweep BUY = aggressive buyer = bullish
             is_long = side in ('b', 'BUY', 'buy')
         elif detection_type == 'wall_gone':
@@ -475,7 +495,7 @@ class EdgeDetector:
             })
 
         # ── Emit tape_alert to frontend for EQ Book glow ──
-        if self._sio and detection_type in ('iceberg', 'drifting_iceberg', 'sweep', 'wall_gone'):
+        if self._sio and detection_type in ('sweep', 'wall_gone'):
             vol = detection_data.get('total_vol', detection_data.get('volume', 0))
             price = detection_data.get('price', detection_data.get('mid', 0))
             if not price or price <= 0:
@@ -515,7 +535,7 @@ class EdgeDetector:
 
         # ── Emit tape_alert for verified NQ detection (force_glow) ──
         # These are pre-verified institutional events — the Python engine already
-        # mathematically proved this was an iceberg/sweep. Always push to tape.
+        # mathematically proved the detection. Always push to tape.
         if self._sio:
             price = detection_data.get('price', detection_data.get('at_price', 0))
             if not price or price <= 0:
@@ -540,6 +560,154 @@ class EdgeDetector:
                 })
             except Exception:
                 pass  # never let emit errors break the detection engine
+
+    # ═══════════════════════════════════════════════════════
+    #  NQ-NATIVE SIGNALS (TopStepX L2 only — no Schwab needed)
+    # ═══════════════════════════════════════════════════════
+
+    def check_nq_signals(self, symbol='NQ'):
+        """Called periodically by l2_worker to check NQ engine states and emit signals.
+
+        Reads VPIN, Hawkes, Kyle lambda, Kalman OFI from l2_worker engines.
+        Fires edge_signal when thresholds are exceeded.
+        """
+        now = time.time()
+        if now - self._last_nq_check < self._nq_check_interval:
+            return
+        self._last_nq_check = now
+
+        if not self._running:
+            return
+
+        # Update NQ mid price from l2_worker state for outcome tracking
+        try:
+            from background_engine.l2_worker import L2_STATE, _L2_LOCK
+            with _L2_LOCK:
+                nq_mid = L2_STATE["mid_prices"].get(symbol, 0)
+            if nq_mid > 0:
+                self._last_prices[symbol] = nq_mid
+                self._resolve_outcomes(symbol)
+        except Exception:
+            pass
+
+        # ── 1. VPIN SPIKE: toxic flow detected ──
+        if self._get_vpin:
+            try:
+                vpin = self._get_vpin(symbol)
+                if vpin and vpin._buckets_completed >= 5:
+                    val = vpin.vpin
+                    self._nq_signal_dists['vpin'].update(val)
+                    if self._nq_signal_dists['vpin'].warm:
+                        vpin_pctl = self._nq_signal_dists['vpin'].percentile_of(val)
+                        # VPIN > P85 = informed flow, direction from DOM imbalance
+                        if vpin_pctl >= 85:
+                            direction = self._infer_nq_direction(symbol)
+                            if direction:
+                                confidence = self._joint_confidence([vpin_pctl])
+                                components = {
+                                    'vpin': round(val, 4),
+                                    'vpin_pctl': round(vpin_pctl, 1),
+                                    'vpin_regime': vpin.get_regime_modifier(),
+                                    'regime': self._get_regime(),
+                                }
+                                self._emit_signal(f'VPIN_SPIKE_{direction}', confidence, components, symbol)
+            except Exception:
+                pass
+
+        # ── 2. HAWKES EXHAUSTION: clustering collapse ──
+        if self._get_hawkes:
+            try:
+                hawkes = self._get_hawkes(symbol)
+                if hawkes:
+                    h_state = hawkes.get_state()
+                    rho = h_state.get('rho')
+                    if rho is not None:
+                        self._nq_signal_dists['hawkes_rho'].update(rho)
+                        if hawkes.is_exhaustion():
+                            # Exhaustion = momentum collapse, trade reversal
+                            side_dom = h_state.get('side_dominance', 0)
+                            # If buy-side was dominant (side_dom > 0), exhaustion = SHORT
+                            direction = 'SHORT' if side_dom > 0 else 'LONG'
+                            rho_pctl = self._nq_signal_dists['hawkes_rho'].percentile_of(rho) if self._nq_signal_dists['hawkes_rho'].warm else 75
+                            confidence = self._joint_confidence([rho_pctl])
+                            components = {
+                                'hawkes_rho': round(rho, 4),
+                                'hawkes_rho_pctl': round(rho_pctl, 1),
+                                'hawkes_phase': h_state.get('phase', ''),
+                                'side_dominance': round(side_dom, 4),
+                                'regime': self._get_regime(),
+                            }
+                            self._emit_signal(f'HAWKES_EXHAUST_{direction}', confidence, components, symbol)
+            except Exception:
+                pass
+
+        # ── 3. KYLE DIVERGENCE: informed flow entering ──
+        if self._adverse_selection_fn:
+            try:
+                as_eng = self._adverse_selection_fn(symbol)
+                if as_eng and as_eng.warm:
+                    st = as_eng.get_state()
+                    div = st['kyle_divergence']
+                    self._nq_signal_dists['kyle_div'].update(abs(div))
+                    if self._nq_signal_dists['kyle_div'].warm:
+                        div_pctl = self._nq_signal_dists['kyle_div'].percentile_of(abs(div))
+                        # Kyle divergence > P90 = fast lambda pulling away from slow
+                        if div_pctl >= 90:
+                            # Direction from lambda sign: positive lambda = buying pressure
+                            direction = 'LONG' if st['kyle_lambda_fast'] > 0 else 'SHORT'
+                            confidence = self._joint_confidence([div_pctl])
+                            components = {
+                                'kyle_lambda_fast': round(st['kyle_lambda_fast'], 6),
+                                'kyle_lambda_slow': round(st['kyle_lambda_slow'], 6),
+                                'kyle_divergence': round(div, 6),
+                                'kyle_div_pctl': round(div_pctl, 1),
+                                'as_score': st['adverse_selection_score'],
+                                'as_regime': st['as_regime'],
+                                'regime': self._get_regime(),
+                            }
+                            self._emit_signal(f'KYLE_DIVERGE_{direction}', confidence, components, symbol)
+            except Exception:
+                pass
+
+        # ── 4. OFI EXTREME: Kalman-filtered order flow at tail ──
+        if self._get_kalman:
+            try:
+                kalman = self._get_kalman(symbol)
+                if kalman and kalman.ready:
+                    theta = kalman.theta  # filtered OFI state
+                    snr = kalman._last_snr
+                    self._nq_signal_dists['ofi'].update(abs(theta))
+                    if self._nq_signal_dists['ofi'].warm:
+                        ofi_pctl = self._nq_signal_dists['ofi'].percentile_of(abs(theta))
+                        # OFI > P90 with SNR > 1.5 = high-confidence directional flow
+                        if ofi_pctl >= 90 and snr >= 1.5:
+                            direction = 'LONG' if theta > 0 else 'SHORT'
+                            confidence = self._joint_confidence([ofi_pctl])
+                            components = {
+                                'ofi_theta': round(theta, 6),
+                                'ofi_pctl': round(ofi_pctl, 1),
+                                'ofi_snr': round(snr, 3),
+                                'regime': self._get_regime(),
+                            }
+                            self._emit_signal(f'OFI_EXTREME_{direction}', confidence, components, symbol)
+            except Exception:
+                pass
+
+    def _infer_nq_direction(self, symbol='NQ'):
+        """Infer direction from recent NQ detections + DOM imbalance."""
+        # Check NQ consensus first
+        nq_dir, _, nq_count = self._get_nq_consensus(lookback_sec=15)
+        if nq_dir and nq_count >= 2:
+            return nq_dir
+        # Fall back to Kalman OFI sign
+        if self._get_kalman:
+            try:
+                k = self._get_kalman(symbol)
+                if k and k.ready:
+                    return 'LONG' if k.theta > 0 else 'SHORT'
+            except Exception:
+                pass
+        return None
 
     def _get_nq_consensus(self, lookback_sec=30):
         """Get NQ detection consensus from recent detections.
@@ -1078,7 +1246,6 @@ class EdgeDetector:
             self._flow_stats[symbol] = {
                 'size_score': EmpiricalDist(half_life=40),
                 'venue_score': EmpiricalDist(half_life=40),
-                'iceberg_score': EmpiricalDist(half_life=40),
                 'sweep_score': EmpiricalDist(half_life=40),
                 'pressure_score': EmpiricalDist(half_life=40),
             }
@@ -1093,7 +1260,7 @@ class EdgeDetector:
             return
 
         flow_stats = self._get_flow_stats(symbol)
-        for key in ['size_score', 'venue_score', 'iceberg_score', 'sweep_score', 'pressure_score']:
+        for key in ['size_score', 'venue_score', 'sweep_score', 'pressure_score']:
             flow_stats[key].update(report.get(key, 50))
 
         if not flow_stats['size_score'].warm:
@@ -1101,33 +1268,14 @@ class EdgeDetector:
 
         high_pctl, low_pctl, _, _ = self._get_regime_thresholds()
         size_score = report['size_score']
-        iceberg_score = report['iceberg_score']
         sweep_score = report['sweep_score']
         pressure = report['pressure_score']
 
         size_pctl = flow_stats['size_score'].percentile_of(size_score)
-        iceberg_pctl = flow_stats['iceberg_score'].percentile_of(iceberg_score)
         sweep_pctl = flow_stats['sweep_score'].percentile_of(sweep_score)
 
-        # Divergence
-        if size_pctl <= (100 - high_pctl + 15) and iceberg_pctl >= (high_pctl - 15) and pressure < 45:
-            raw_confidence = self._joint_confidence([100.0 - size_pctl, iceberg_pctl])
-            gex_factor, gex_zone = self._gex_context(symbol, True)
-            confidence = min(99.9, raw_confidence * gex_factor)
-
-            self._emit_signal('FLOW_DIVERGENCE_LONG', confidence, {
-                'size_score_pctl': round(size_pctl, 1),
-                'iceberg_score_pctl': round(iceberg_pctl, 1),
-                'sweep_score_pctl': round(sweep_pctl, 1),
-                'pressure': round(pressure, 1),
-                'raw_size_score': round(size_score, 1),
-                'raw_iceberg_score': round(iceberg_score, 1),
-                'regime': self._get_regime(),
-                'gex_zone': gex_zone,
-            }, symbol)
-
-        # Alignment
-        elif size_pctl >= (high_pctl - 15) and sweep_pctl >= (high_pctl - 15) and iceberg_pctl <= 40 and pressure < 45:
+        # Alignment: size + sweep both high, pressure bearish
+        if size_pctl >= (high_pctl - 15) and sweep_pctl >= (high_pctl - 15) and pressure < 45:
             raw_confidence = self._joint_confidence([size_pctl, sweep_pctl])
             gex_factor, gex_zone = self._gex_context(symbol, False)
             confidence = min(99.9, raw_confidence * gex_factor)
@@ -1135,7 +1283,6 @@ class EdgeDetector:
             self._emit_signal('FLOW_ALIGNMENT_SHORT', confidence, {
                 'size_score_pctl': round(size_pctl, 1),
                 'sweep_score_pctl': round(sweep_pctl, 1),
-                'iceberg_score_pctl': round(iceberg_pctl, 1),
                 'pressure': round(pressure, 1),
                 'raw_size_score': round(size_score, 1),
                 'raw_sweep_score': round(sweep_score, 1),
@@ -1147,20 +1294,14 @@ class EdgeDetector:
     #  JOINT PROBABILITY CONFIDENCE
     # ═══════════════════════════════════════════════════════
 
-    @staticmethod
-    def _joint_confidence(pctl_list):
-        """Joint confidence from independent percentile observations.
-        Two P95 events = P99.75, not (P95+P95)/2 = P95."""
-        if not pctl_list:
-            return 50.0
-        tail_probs = []
-        for p in pctl_list:
-            p = max(50.1, min(99.99, p))
-            tail_probs.append(1.0 - p / 100.0)
-        joint_tail = 1.0
-        for tp in tail_probs:
-            joint_tail *= tp
-        return round(min(99.99, max(50.0, (1.0 - joint_tail) * 100.0)), 1)
+    def _joint_confidence(self, pctl_list):
+        """Joint confidence via Gaussian copula with correlation adjustment.
+
+        Uses Meng's effective dimensionality to avoid overstating confidence
+        when signals are correlated (they always are in microstructure data).
+        Falls back to conservative estimate if copula not yet warm.
+        """
+        return self._copula.joint_confidence(pctl_list)
 
     # ═══════════════════════════════════════════════════════
     #  SIGNAL OUTCOME FEEDBACK
@@ -1197,6 +1338,18 @@ class EdgeDetector:
             'vix_price': round(self._vix_price, 2),
             'vix_pct': round(self._vix_pct_change, 2),
         })
+        # Adverse selection snapshot at signal time
+        if self._adverse_selection_fn:
+            try:
+                _as = self._adverse_selection_fn('NQ')
+                if _as and _as.warm:
+                    st = _as.get_state()
+                    p = self._pending_outcomes[-1]
+                    p['as_score'] = st['adverse_selection_score']
+                    p['as_regime'] = st['as_regime']
+                    p['kyle_lambda'] = st['kyle_lambda_fast']
+            except Exception:
+                pass
 
     def _resolve_outcomes(self, symbol):
         mid = self._last_prices.get(symbol, 0)
@@ -1325,6 +1478,11 @@ class EdgeDetector:
         if accuracy:
             signal['track_record'] = accuracy
 
+        # Feed copula with named percentile signals for correlation estimation
+        for comp_key, comp_val in components.items():
+            if comp_key.endswith('_pctl') and isinstance(comp_val, (int, float)):
+                self._copula.update(comp_key, comp_val)
+
         # Phase 1 enrichment: cross-asset score, Hawkes, MVD, DEX
         cross_score = self.get_cross_asset_score()
         hawkes_pctl = self.get_hawkes_pctl()
@@ -1360,6 +1518,27 @@ class EdgeDetector:
         if nbbo_dir:
             components['nbbo_venue_consensus'] = nbbo_dir
             components['nbbo_venue_count'] = nbbo_count
+
+        # ── Adverse Selection gating + enrichment ──
+        as_state = None
+        if self._adverse_selection_fn:
+            try:
+                _as_eng = self._adverse_selection_fn('NQ')
+                if _as_eng and _as_eng.warm:
+                    as_state = _as_eng.get_state()
+                    components['as_score'] = as_state['adverse_selection_score']
+                    components['as_regime'] = as_state['as_regime']
+                    components['kyle_lambda'] = as_state['kyle_lambda_fast']
+                    components['kyle_divergence'] = as_state['kyle_divergence']
+                    components['gh_info_ratio'] = as_state['gh_info_ratio']
+                    # Gate: suppress sub-P70 signals during TOXIC flow
+                    if as_state['as_regime'] == 'TOXIC' and confidence < 70:
+                        return
+                    # Gate: suppress sub-P60 signals during ELEVATED flow
+                    if as_state['as_regime'] == 'ELEVATED' and confidence < 60:
+                        return
+            except Exception:
+                pass
 
         # ── Cross-asset divergence (SPY/VIX) ──
         components['cross_divergence'] = self.get_cross_divergence_score()
@@ -1669,19 +1848,19 @@ class EdgeDetector:
         direction = None
         
         # Scenario A: Massive Buy Aggression (Z > 2.58 = 99% confidence), but price sits still.
-        # This means an Iceberg Seller is absorbing everything. Seller dominates. Bearish.
+        # Seller absorbs everything. Bearish.
         if z_score >= 2.58:
             is_long = False
             direction = 'SHORT'
-            
+
         # Scenario B: Massive Sell Aggression (Z < -2.58 = 99% confidence), but price sits still.
-        # This means an Iceberg Buyer is absorbing everything. Buyer dominates. Bullish.
+        # Buyer absorbs everything. Bullish.
         elif z_score <= -2.58:
             is_long = True
             direction = 'LONG'
 
         if direction:
-            # We found a dominant absorption iceberg mathematically
+            # Dominant absorption detected mathematically
             self._last_dominance_signal = now
 
             # Base confidence 55 + density bonus
@@ -1980,12 +2159,7 @@ class EdgeDetector:
             # ── Stage 1: NQ structural signal ──
             nq_dir, nq_pctl, nq_count = self._get_nq_consensus(lookback_sec=30)
 
-            # Also check for exhausting icebergs specifically
-            nq_exhausting = any(
-                d.get('data', {}).get('decay') == 'exhausting'
-                for d in self._nq_detections
-                if d['timestamp'] > now - 30
-            )
+            nq_exhausting = False
 
             # ── Stage 2: MM withdrawal ──
             mm_dir, mm_count = self._get_mm_consensus(lookback_sec=30)
@@ -2164,7 +2338,7 @@ class EdgeDetector:
         # Raw ratio — no percentile guess, no weighting
         cp_ratio = round(call_vol / max(put_vol, 1), 2) if (call_vol + put_vol) > 0 else None
 
-        # 4. NQ Iceberg/Sweep raw counts (pure event counts, no consensus blending)
+        # 4. NQ Sweep raw counts (pure event counts, no consensus blending)
         recent_det = [d for d in self._nq_detections if now - d['timestamp'] < 60]
         ice_long = sum(1 for d in recent_det if d['is_long'])
         ice_short = sum(1 for d in recent_det if not d['is_long'])
@@ -2388,7 +2562,7 @@ class EdgeDetector:
             if (call_vol + put_vol) > 0:
                 qqq_skew = (call_vol - put_vol) / (call_vol + put_vol)
 
-        # NQ iceberg consensus
+        # NQ detection consensus
         nq_dir, nq_pctl, nq_count = self._get_nq_consensus()
         nq_signal = 0.0
         if nq_dir == 'LONG':

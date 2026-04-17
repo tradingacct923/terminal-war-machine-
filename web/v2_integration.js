@@ -10,11 +10,10 @@
  *   6. RegressionAcceleration   (replaces 2-sample accel)
  *   7. CumlDeltaRenderer        (the missing sidebar)
  *   8. ExhaustionDetector       (flow-price divergence)
- *   9. IcebergVisualizer        (surfaces backend iceberg detections)
- *  10. SweepRenderer            (lightning bolt multi-level sweeps)
- *  11. HawkesStateManager       (fixes per-frame reset bug)
+ *   9. SweepRenderer            (lightning bolt multi-level sweeps)
+ *  10. HawkesStateManager       (fixes per-frame reset bug)
  *
- * Load order: volume_bubbles.js → v2_sigma_engine.js → v2_iceberg_sweep.js → v2_integration.js
+ * Load order: volume_bubbles.js → v2_sigma_engine.js → v2_integration.js
  */
 (function() {
 'use strict';
@@ -28,6 +27,19 @@
 // d.symbol is passed by the chart host; falls back to first bar's 's' field
 // or stays as the last known value.
 let _v2ActiveSymbol = null;
+// Chart absorption-bubble feature toggles (exposed on window for live tuning)
+let _showAbsTag  = true;   // FORTRESS/SOLID/HELD text tag next to bubble
+let _showRefillPip = true; // refill-class colored dot on bubble edge
+let _showAbsZoneBand = true; // horizontal band across chart for multi-level clusters
+// Live-tunable from console: window.V2ChartAbs.tag = false; etc.
+window.V2ChartAbs = {
+    get tag() { return _showAbsTag; },
+    set tag(v) { _showAbsTag = !!v; },
+    get refillPip() { return _showRefillPip; },
+    set refillPip(v) { _showRefillPip = !!v; },
+    get zoneBand() { return _showAbsZoneBand; },
+    set zoneBand(v) { _showAbsZoneBand = !!v; },
+};
 
 // ── Backend absorption data bridge ──
 // The dom_snapshot WebSocket emits data.abs = {priceStr: {s, w, sh, c, ...}}
@@ -112,173 +124,63 @@ const TapeEWMA = {
 };
 window._tapeEWMA = TapeEWMA; // expose for console inspection
 
-// Wire TapeEWMA to dom_snapshot: feed every incoming trade into the EWMA.
-// Also cache spread/BBO from the new backend fields (best_bid, best_ask, spread).
-// Uses a deferred approach so this works regardless of load order.
-(function _wireTapeEWMAListener() {
-    let _handler = null;
-    function attach() {
-        const sio = window._sio;
-        if (!sio) { setTimeout(attach, 400); return; }
-        if (_handler) sio.off('dom_snapshot', _handler);
-        _handler = (data) => {
-            if (data && data.trades && data.trades.length) {
-                TapeEWMA.ingest(data.trades);
+// ── Toolbar badges: t-hawkes-rho, t-hawkes-dir, t-spread ─────────────────
+// Hawkes branching ratio and side-dominance come from candle_enriched.hawkes
+// (emitted 5Hz by l2_worker.HawkesBranchingRatio). Spread is derived
+// client-side from l2_update top-of-book (best_bid / best_ask) so it doesn't
+// depend on a backend-side spread field that never shipped.
+if (typeof AltarisEvents !== 'undefined') {
+    const _els = {
+        rho:    document.getElementById('t-hawkes-rho'),
+        dir:    document.getElementById('t-hawkes-dir'),
+        spread: document.getElementById('t-spread'),
+    };
+
+    AltarisEvents.on('data:candles:enriched', (d) => {
+        const h = d && d.hawkes;
+        if (!h) return;
+
+        if (_els.rho) {
+            if (h.rho == null) {
+                _els.rho.textContent = '—';
+                _els.rho.style.color = '#888';
+            } else {
+                _els.rho.textContent = h.rho.toFixed(2);
+                const c = h.phase === 'supercritical' ? '#ff3060'
+                        : h.phase === 'subcritical'   ? '#4cd964'
+                        : '#ff9500';
+                _els.rho.style.color = c;
             }
+        }
 
-            // ── FIX 1: Wire _v2AbsBuffer ──
-            // dom_snapshot.abs = {priceStr: {s, w, sh, c}} — per-price absorption scores.
-            // The comment in the original code said "HOW TO WIRE: add window._v2AbsBuffer = data.abs"
-            // but it was never done. Without this, AbsorptionAggregator.ingest() never
-            // gets backend scores and falls back to local BP-only scoring.
-            if (data && data.abs) {
-                window._v2AbsBuffer = data.abs;
+        if (_els.dir) {
+            const sd = h.side_dominance;
+            if (sd == null) {
+                _els.dir.textContent = '—';
+                _els.dir.style.color = '#888';
+            } else {
+                // side_dominance ∈ [-1, +1]. Threshold at ±0.15 for visible tilt.
+                const pct = (sd * 100).toFixed(0);
+                if (sd > 0.15)       { _els.dir.textContent = `▲ ${pct}`; _els.dir.style.color = '#2ee88a'; }
+                else if (sd < -0.15) { _els.dir.textContent = `▼ ${pct}`; _els.dir.style.color = '#ff3060'; }
+                else                 { _els.dir.textContent = `◆ ${pct}`; _els.dir.style.color = '#888';    }
             }
-            // ── BUG 5 FIX: Wire depth_vel ──
-            if (data && data.depth_vel) {
-                window._domDepthVel = data.depth_vel;
-            }
+        }
+    });
 
-            // ── FIX 2: Wire domSnapshotAbsTiers ──
-            // dom_snapshot.abs_tiers = {priceStr: {tier, label, score}} — WALL/ABS/CRACK tiers.
-            // Previously only written by v2_dom_heatmap.js (line 405), meaning it was only
-            // populated when a heatmap pane was mounted. Bubble classify path checked this
-            // global but got {} when no heatmap was active — fell back to local tier scoring.
-            if (data && data.abs_tiers) {
-                window.domSnapshotAbsTiers = data.abs_tiers;
-            }
-
-            // ── Model engine outputs: Queue Dynamics, Trade Toxicity, Level Survival ──
-            if (data && data.queue_dynamics)  window._queueDynamics  = data.queue_dynamics;
-            if (data && data.trade_toxicity)  window._tradeToxicity  = data.trade_toxicity;
-            if (data && data.level_survival)  window._levelSurvival  = data.level_survival;
-
-            // Cache BBO + spread for market-maker risk display.
-            // Backend now emits best_bid, best_ask, spread on every snapshot.
-            if (data && data.sym) {
-                if (!window._v2BBO) window._v2BBO = {};
-                window._v2BBO[data.sym] = {
-                    bid:    data.best_bid  || 0,
-                    ask:    data.best_ask  || 0,
-                    spread: data.spread    || 0,
-                    ts:     data.ts        || 0,
-                };
-            }
-        };
-        sio.on('dom_snapshot', _handler);
-    }
-    attach();
-})();
-
-// Wire the socket listener once (after Socket.IO connects).
-// Uses a deferred approach so this works regardless of load order.
-(function _wireV2SignalsListener() {
-    function attach() {
-        if (!window._sio) return;
-        window._sio.off('v2_signals'); // remove stale listener on re-attach
-        window._sio.on('v2_signals', (data) => {
-            if (!data || !data.sym) return;
-            // Store per-symbol so multi-symbol setups don't cross-contaminate
-            window._v2Signals = data;
-
-            // Update ρ(Γ) display in top toolbar if element exists
-            const rhoEl = document.getElementById('t-hawkes-rho');
-            if (rhoEl && data.hawkes) {
-                const rho = data.hawkes.rho;
-                if (rho === null || rho === undefined || !isFinite(rho)) {
-                    rhoEl.textContent = '—';
-                    rhoEl.style.color = '';
-                } else {
-                    rhoEl.textContent = rho.toFixed(3);
-                    rhoEl.style.color = rho >= 1.0 ? '#ff3060'
-                        : rho >= 0.8 ? '#ffb428' : '#2ee88a';
-                    // Pulse animation on supercritical
-                    if (rho >= 1.0) {
-                        rhoEl.style.animation = 'none';
-                        void rhoEl.offsetWidth; // force reflow
-                        rhoEl.style.animation = 'rho-pulse 0.6s ease-out';
-                    } else {
-                        rhoEl.style.animation = '';
-                    }
-                }
-
-                // ── FIX 4: Directional Hawkes badge (↑B / ↓S) ──
-                // side_dominance = (rho_buy - rho_sell) / (rho_buy + rho_sell)
-                //   +1.0 = pure buy self-excitation (ask sweeps incoming)
-                //   -1.0 = pure sell self-excitation (bid dump incoming)
-                //   near 0 = balanced / unclear
-                const dirEl = document.getElementById('t-hawkes-dir');
-                if (dirEl) {
-                    const dom = data.hawkes.side_dominance;
-                    if (dom === null || dom === undefined || !isFinite(dom) || rho === null || !isFinite(rho)) {
-                        dirEl.textContent = '';
-                    } else if (Math.abs(dom) < 0.15) {
-                        // Balanced — no directional signal
-                        dirEl.textContent = '≈';
-                        dirEl.style.color = 'rgba(140,160,200,0.5)';
-                    } else if (dom > 0) {
-                        // Buy-dominant
-                        dirEl.textContent = '↑B';
-                        // Scale intensity by dominance strength × ρ (only meaningful when active)
-                        const intensity = Math.min(dom * rho, 1.0);
-                        dirEl.style.color = `rgba(46,232,138,${0.5 + intensity * 0.5})`;
-                    } else {
-                        // Sell-dominant
-                        dirEl.textContent = '↓S';
-                        const intensity = Math.min(Math.abs(dom) * rho, 1.0);
-                        dirEl.style.color = `rgba(255,48,96,${0.5 + intensity * 0.5})`;
-                    }
-                }
-            }
-
-            // ── FIX 3: tape_floor override — always use backend value ──
-            // PROBLEM: The old guard `TapeEWMA._n < 30` was supposed to only override
-            // during warmup. But after 766 trades with ewmaMean=1 (tiny tick prints),
-            // the EWMA is calibrated to the wrong value — the client sees fractional/
-            // small prints while the backend VolumeClock sees the full unthrottled stream.
-            //
-            // The backend VolumeClock.bucket_size is ALWAYS more accurate than TapeEWMA:
-            //   - VolumeClock: full 100% of prints at full resolution, continuously
-            //   - TapeEWMA: ~500ms batches of compact_trades (sampled, batched)
-            //
-            // So: always apply when backend sends tape_floor > 0.
-            // Only gate: if our local EWMA has already surpassed the backend value,
-            // trust the local one (means we've seen a regime shift the backend hasn't sent yet).
-            if (data.tape_floor && data.tape_floor > 0) {
-                const backendFloor = data.tape_floor;
-                const localFloor   = TapeEWMA.floor();
-                // Apply if: backend > 1 (actually calibrated) AND backend > local
-                // (so we only override upward, never suppress a real regime shift)
-                if (backendFloor > 1 && backendFloor > localFloor) {
-                    const logFloor = Math.log(backendFloor + 1);
-                    TapeEWMA._mu  = logFloor;
-                    TapeEWMA._var = 0.25;
-                    TapeEWMA._n   = Math.max(TapeEWMA._n, 30); // ensure past warmup
-                }
-            }
-
-            // ── spread HUD (market-maker risk signal) ──
-            const spreadEl = document.getElementById('t-spread');
-            if (spreadEl && data.kalman) {
-                // theta > 0 = buy-side OFI dominant, < 0 = sell-side
-                // SNR indicates regime confidence
-                const snr = data.kalman.snr || 0;
-                spreadEl.textContent = isFinite(snr) ? snr.toFixed(2) + 'σ' : '—';
-                spreadEl.style.color = snr >= 2.0 ? '#ff3060' : snr >= 1.0 ? '#ffb428' : '#2ee88a';
-            }
-        });  // end sio.on('v2_signals')
-        console.log('[V2.2] v2_signals listener attached');
-    }  // end attach()
-    // Try immediately, then retry until Socket.IO connects
-    if (window._sio) { attach(); }
-    else {
-        let attempts = 0;
-        const interval = setInterval(() => {
-            if (window._sio) { attach(); clearInterval(interval); }
-            else if (++attempts > 20) clearInterval(interval); // stop after 10s
-        }, 500);
-    }
-})();
+    // Spread: l2_update.dom.NQ.spread is pre-computed by l2_worker.
+    AltarisEvents.on('data:l2:update', (data) => {
+        if (!_els.spread) return;
+        const nq = data && data.dom && data.dom.NQ;
+        if (!nq || typeof nq.spread !== 'number') return;
+        const spread = nq.spread;
+        _els.spread.textContent = spread.toFixed(2);
+        // NQ tick = 0.25. Tight = 1 tick, wide = >2 ticks.
+        _els.spread.style.color = spread <= 0.25 ? '#4cd964'
+                                : spread <= 0.50 ? '#ff9500'
+                                : '#ff3060';
+    });
+}
 
 // ── Inline _rgba safety ──
 // _rgba() is defined in volume_bubbles.js. If load order breaks, we need
@@ -288,13 +190,37 @@ if (typeof _rgba !== 'function') {
     window._rgba = (rgb, alpha) => `rgba(${rgb[0]}, ${rgb[1]}, ${rgb[2]}, ${alpha})`;
 }
 
+// ── Scroll-aware rendering: skip heavy computation during active scroll ──
+// Detect scroll by comparing visible range between frames.
+// If range changed since last frame → user is scrolling → skip.
+let _v2ScrollActive = false;
+let _v2ScrollTimer = 0;
+let _v2LastFrom = -1;
+let _v2LastTo = -1;
+
+// Also listen to event bus (backup detection)
+if (typeof AltarisEvents !== 'undefined') {
+    AltarisEvents.on('chart:scroll', () => {
+        _v2ScrollActive = true;
+        clearTimeout(_v2ScrollTimer);
+        _v2ScrollTimer = setTimeout(() => { _v2ScrollActive = false; }, 150);
+    });
+}
+
+// ── Draw timing profiler: logs to console every 60 frames ──
+let _drawTimings = { total: 0, phaseA: 0, phaseB: 0, render: 0, count: 0, cacheHits: 0 };
+
 VolumeBubbleRenderer.prototype.draw = function(target, priceConverter) {
+    const _t0 = performance.now();
     const d = this._data;
     if (!d || !d.bars || d.bars.length === 0) return;
 
     const { from, to } = d.visibleRange;
     const barSpacing = d.barSpacing || 6;
     const useDots = false;
+
+    // Bubbles must render during scroll to stay glued to candles.
+    // LWC calls draw() with fresh bar.x coordinates on every scroll frame.
 
     // ── Symbol change detection ──
     // Detect instrument switches and reset all stateful modules.
@@ -338,6 +264,8 @@ VolumeBubbleRenderer.prototype.draw = function(target, priceConverter) {
     // ── Per-pane overlay config lookup ──
     // Container ref is set on the renderer by ChartCore during init
     const _paneOverlay = this._containerRef ? (this._containerRef._overlayConfig || null) : null;
+    // When VP Intel pane is mounted, skip all bars/badges/arrows/text on chart — Intel has them
+    const _vpIntelActive = typeof VolumeProfileOverlay !== 'undefined' && VolumeProfileOverlay.isIntelActive && VolumeProfileOverlay.isIntelActive();
 
     try { target.useMediaCoordinateSpace(({ context: ctx, mediaSize }) => {
 
@@ -591,151 +519,137 @@ VolumeBubbleRenderer.prototype.draw = function(target, priceConverter) {
         // Signature includes TapeEWMA.floor() so cache invalidates when tape
         // regime shifts (e.g. open → slow tape). floor() is O(1) EWMA read.
         // NOTE: _latestBar declared above at Phase 2 — do NOT re-declare here.
-        const _frameSig = `${from}:${to}:${_latestBar?.originalData?.ts||0}:${window._v2Signals?.ts||0}:${Object.keys(window._v2AbsBuffer||{}).length}:${_dynFloor}`;
+        // Two-level cache: data signature (classification) + viewport signature (x/y coords)
+        const _dataSig = `${from}:${to}:${_latestBar?.originalData?.ts||0}:${window._v2Signals?.ts||0}:${Object.keys(window._v2AbsBuffer||{}).length}:${_dynFloor}`;
+        const _firstBarX = d.bars[from]?.x || 0;
 
-        let glowBubbles, buyBubbles, sellBubbles, absorbBubbles, labelBubbles, _priceBarX;
+        const _tPhaseA0 = performance.now();
+        let glowBubbles, buyBubbles, sellBubbles, absorbBubbles, labelBubbles, _priceBarX, _priceAgg;
 
-        if (_frameSig === this._v3sig && this._v3cache) {
-            // ── Cache hit: reuse last frame's bubble arrays ──
-            ({ glowBubbles, buyBubbles, sellBubbles, absorbBubbles, labelBubbles, _priceBarX } = this._v3cache);
+        if (_dataSig === this._v3sig && this._v3cache) {
+            // ── Data cache hit: same bars, same data — just remap x/y coords ──
+            _drawTimings.cacheHits++;
+            ({ glowBubbles, buyBubbles, sellBubbles, absorbBubbles, labelBubbles, _priceBarX, _priceAgg } = this._v3cache);
+            // Remap pixel coordinates from fresh bar positions + priceConverter
+            if (this._v3firstBarX !== _firstBarX) {
+                this._v3firstBarX = _firstBarX;
+                // Build barIdx → bar.x lookup from current frame
+                const _barXMap = {};
+                for (let i = from; i < to; i++) {
+                    if (d.bars[i]) _barXMap[i] = d.bars[i].x;
+                }
+                const _allBubbles = [...glowBubbles, ...buyBubbles, ...sellBubbles, ...absorbBubbles];
+                for (const b of _allBubbles) {
+                    if (b._barIdx !== undefined && _barXMap[b._barIdx] !== undefined) {
+                        b.x = _barXMap[b._barIdx];
+                    }
+                    b.y = priceConverter(b.price) || b.y;
+                }
+            }
         } else {
             // ── Cache miss: full consolidation + classification ──
-            this._v3sig = _frameSig;
+            this._v3sig = _dataSig;
+            this._v3firstBarX = _firstBarX;
             glowBubbles = []; buyBubbles = []; sellBubbles = []; absorbBubbles = []; labelBubbles = []; _priceBarX = {};
 
-            // ── PRE-PASS: Aggregate volumes per price across ALL visible bars ──
-            // A 50-lot print at 18340 across 3 bars = ONE institutional decision.
-            // Aggregate first, classify once. Eliminates the 60× stacking bug.
-            const _priceAgg = {};
+            // ── PER-BAR PASS: Each bar gets its own bubbles at its own x position ──
+            // Bubbles are glued to the candle they belong to.
+            // Also build _priceAgg for absorption zone detection (cross-bar).
+            _priceAgg = {};
+            const _bkAbsTiersGlobal = window._v2AbsBuffer && window.domSnapshotAbsTiers;
             for (let i = from; i < to; i++) {
                 const bar = d.bars[i];
                 if (!bar?.originalData?.bp) continue;
                 const bp = bar.originalData.bp;
+                const barX = bar.x;
+
+                // Clamp bubbles to within bar's OHLC range + margin
+                // Prevents DOM book levels from rendering bubbles far from actual price action
+                const _barHigh = bar.originalData.h || bar.originalData.high || Infinity;
+                const _barLow = bar.originalData.l || bar.originalData.low || -Infinity;
+                const _barRange = _barHigh - _barLow;
+                const _barMargin = Math.max(_barRange * 0.5, 2.0); // 50% of bar range or 2 pts min
+
                 for (const priceStr in bp) {
                     const entry = bp[priceStr];
                     const bv = entry[0] || 0, sv = entry[1] || 0;
                     const tv = bv + sv;
                     if (tv < 1) continue;
-                    // Adaptive floor gate: reject prints below P70 of current tape
                     if (tv < _dynFloor) continue;
 
+                    // Skip price levels far from the candle's actual range
+                    const _p = parseFloat(priceStr);
+                    if (_p > _barHigh + _barMargin || _p < _barLow - _barMargin) continue;
+
+                    // Cross-bar agg for absorption zones (Layer 0)
                     if (!_priceAgg[priceStr]) {
-                        _priceAgg[priceStr] = { buyVol: 0, sellVol: 0, maxSigma: 0, barX: bar.x, lastBarIdx: i, newestBarIdx: i, firstBarIdx: i, barCount: 0, barVols: [] };
+                        _priceAgg[priceStr] = { buyVol: 0, sellVol: 0, maxSigma: 0, barX, lastBarIdx: i, newestBarIdx: i, firstBarIdx: i, barCount: 0, barVols: [] };
                     }
                     const agg = _priceAgg[priceStr];
                     agg.buyVol += bv;
                     agg.sellVol += sv;
                     agg.barCount++;
-                    // Per-bar volume for dV/dt computation
                     agg.barVols.push({ idx: i, vol: tv, buy: bv, sell: sv });
-                    // Track most recent bar at this price (for temporal decay)
                     if (i > agg.newestBarIdx) agg.newestBarIdx = i;
                     if (i < agg.firstBarIdx) agg.firstBarIdx = i;
-                    // Track bar with highest single-bar sigma for X positioning.
-                    // Also write to _priceBarX for O(1) lookup by Layer 8.5.
+                    _priceBarX[priceStr] = barX;
+
+                    // Feed ExhaustionDetector
                     const _bSig = AdaptiveKalmanThreshold.sigmaDistance(tv);
-                    if (_bSig > agg.maxSigma) {
-                        agg.maxSigma = _bSig;
-                        agg.barX = bar.x;
-                        agg.lastBarIdx = i;
-                    }
-                    // _priceBarX always holds the LATEST (rightmost) bar.x seen
-                    // so Layer 8.5 gets the most recent position for the level.
-                    _priceBarX[priceStr] = bar.x;
-                    // Feed ExhaustionDetector per-bar (needs bar-level granularity)
+                    if (_bSig > agg.maxSigma) { agg.maxSigma = _bSig; agg.barX = barX; agg.lastBarIdx = i; }
                     const _bClose = bar.originalData.c || bar.originalData.close || 0;
                     ExhaustionDetector.update(priceStr, i, _bSig, bv, sv, _bClose);
+
+                    // ── Per-bar bubble classification ──
+                    const sigmaDistance = AdaptiveKalmanThreshold.sigmaDistance(tv);
+                    const domResult = AdaptiveDominance.test(bv, sv);
+                    const isBuy = bv >= sv;
+                    const isInstitutional = tv >= instThreshold;
+
+                    let absClass;
+                    if (_bkAbsTiersGlobal && _bkAbsTiersGlobal[priceStr]) {
+                        const bkT = _bkAbsTiersGlobal[priceStr];
+                        const glowMap = [0, 0.3, 0.6, 1.0];
+                        absClass = { tier: bkT.tier, label: bkT.label, glowIntensity: glowMap[Math.min(bkT.tier, 3)] ?? 0, score: bkT.score };
+                    } else {
+                        absClass = AbsorptionAggregator.classify(priceStr, to - 1);
+                    }
+                    const isAbsorb = absClass.tier >= 2;
+                    const isConfirmedWall = absClass.tier >= 2;
+
+                    // Per-bar gate: use TapeEWMA floor (adapts to current tape speed)
+                    // absorbMinVol (1.0σ global) is too high for quiet bars
+                    // _dynFloor auto-adapts: 2-3 lots off-hours, 60+ lots at RTH open
+                    if (tv < _dynFloor * 2) continue;
+
+                    const price = parseFloat(priceStr);
+                    if (isNaN(price)) continue;
+                    const y = priceConverter(price);
+                    if (y === null || y === undefined || isNaN(y)) continue;
+
+                    // Opacity: per-bar needs higher base since individual bar σ is lower
+                    const recencyWeight = TemporalDecay.weight(i, from, to);
+                    let opacity = 0.25 + Math.min(sigmaDistance * 0.15, 0.5);
+                    const conviction = AdaptiveDominance.convictionStrength(bv, sv);
+                    opacity += conviction * 0.1;
+                    if (absClass.tier >= 2) opacity += 0.15;
+                    opacity = Math.min(opacity * Math.max(recencyWeight, 0.4), 0.92);
+
+                    // Radius: per-bar σ-scaled with higher floor
+                    const sigmaRatio = Math.min(Math.max(sigmaDistance, 0) / 3, 1);
+                    const radius = 5 + sigmaRatio * (BUBBLE_CONFIG.MAX_RADIUS - 5);
+
+                    const _bpEntry = entry;
+                    const bookSize = (_bpEntry && _bpEntry[4] != null) ? _bpEntry[4] : 0;
+                    const bubble = { x: barX, y, price, radius, totalVol: tv, buyVol: bv, sellVol: sv, opacity, isAbsorb, isInstitutional, absClass, priceStr, dvdt: 0, bookSize, _barIdx: i };
+
+                    if (isInstitutional) glowBubbles.push(bubble);
+                    // Purple absorption bubbles removed — entropy-based, not real L2 absorption.
+                    // All bubbles route to buy/sell by dominant side.
+                    if (isBuy) buyBubbles.push(bubble);
+                    else sellBubbles.push(bubble);
+                    if (radius >= 7) labelBubbles.push(bubble);
                 }
-            }
-
-            // ── CLASSIFY PASS: one bubble per price level ──
-            const _bkAbsTiersGlobal = window._v2AbsBuffer && window.domSnapshotAbsTiers;
-            for (const priceStr in _priceAgg) {
-                const agg = _priceAgg[priceStr];
-                const { buyVol, sellVol, barX } = agg;
-                const totalVol = buyVol + sellVol;
-
-                const price = parseFloat(priceStr);
-                if (isNaN(price)) continue;
-                const y = priceConverter(price);
-                if (y === null || y === undefined || isNaN(y)) continue;
-
-                // σ on consolidated volume (represents full institutional conviction at level)
-                const sigmaDistance = AdaptiveKalmanThreshold.sigmaDistance(totalVol);
-
-                // Dominance: Wilson CI on consolidated buy/sell ratio
-                const domResult = AdaptiveDominance.test(buyVol, sellVol);
-                const isBuy = buyVol >= sellVol;
-                const isInstitutional = totalVol >= instThreshold;
-                const isInHawkesCluster = hawkesClusters.has(priceStr);
-
-                // Absorption: backend tier preferred, local fallback
-                let absClass;
-                if (_bkAbsTiersGlobal && _bkAbsTiersGlobal[priceStr]) {
-                    const bkT = _bkAbsTiersGlobal[priceStr];
-                    const glowMap = [0, 0.3, 0.6, 1.0];
-                    absClass = { tier: bkT.tier, label: bkT.label, glowIntensity: glowMap[Math.min(bkT.tier, 3)] ?? 0, score: bkT.score };
-                } else {
-                    absClass = AbsorptionAggregator.classify(priceStr, to - 1);
-                }
-                const isAbsorb = absClass.tier >= 2;
-                const isConfirmedWall = absClass.tier >= 2;
-
-                // ── V3: Kalman-derived gates (no hardcoded σ numbers) ──
-                // wallThreshold = e^(μ+2.0σ)-1 from AdaptiveKalmanThreshold._thresholds()
-                // directionalThreshold = e^(μ+2.5σ)-1
-                // Both adapt to the current tape regime automatically.
-                if (isConfirmedWall) {
-                    if (totalVol < wallThreshold) continue;
-                } else {
-                    if (totalVol < directionalThreshold) continue;
-                    if (!domResult.isDirectional) continue;
-                }
-
-                // ── Opacity from σ + conviction + recency ──
-                // Use newestBarIdx (most recent bar at this price) for decay,
-                // not lastBarIdx (highest sigma bar) — recency is about TIME not SIZE
-                const recencyWeight = TemporalDecay.weight(agg.newestBarIdx, from, to);
-                let opacity = BUBBLE_CONFIG.GRADIENT_BASE_OPACITY
-                    + Math.pow(Math.max(sigmaDistance, 0), 2) * BUBBLE_CONFIG.GRADIENT_EXPONENT_SCALE;
-                const conviction = AdaptiveDominance.convictionStrength(buyVol, sellVol);
-                opacity += conviction * BUBBLE_CONFIG.DOMINANCE_OPACITY_SCALE;
-                if (isInHawkesCluster) {
-                    const cl = hawkesClusters.get(priceStr);
-                    opacity += cl.clusterStrength * BUBBLE_CONFIG.CLUSTER_OPACITY_BOOST * 2;
-                }
-                if (absClass.tier >= 2) opacity += 0.15;
-                opacity = Math.min(opacity * recencyWeight, BUBBLE_CONFIG.GRADIENT_MAX_OPACITY);
-
-                // Radius: σ-scaled
-                const sigmaRatio = Math.min(Math.pow(Math.max(sigmaDistance, 0) / 4, 1.5), 1);
-                const radius = BUBBLE_CONFIG.MIN_RADIUS + sigmaRatio * (BUBBLE_CONFIG.MAX_RADIUS - BUBBLE_CONFIG.MIN_RADIUS);
-
-                // ── dV/dt: volume rate acceleration at this price level ──
-                // Compare second-half bar volumes vs first-half.
-                // ratio > 2.0 = volume doubling = active loading RIGHT NOW
-                let dvdt = 0;
-                const bv_ = agg.barVols;
-                if (bv_.length >= 3) {
-                    const half = Math.floor(bv_.length / 2);
-                    let sumFirst = 0, sumSecond = 0;
-                    for (let k = 0; k < half; k++) sumFirst += bv_[k].vol;
-                    for (let k = half; k < bv_.length; k++) sumSecond += bv_[k].vol;
-                    const avgFirst = sumFirst / half;
-                    const avgSecond = sumSecond / (bv_.length - half);
-                    dvdt = avgFirst > 0 ? avgSecond / avgFirst : (avgSecond > 0 ? 3 : 0);
-                }
-
-                const _bpBar = d.bars[agg.lastBarIdx];
-                const _bpEntry = _bpBar?.originalData?.bp?.[priceStr];
-                const bookSize = (_bpEntry && _bpEntry[4] != null) ? _bpEntry[4] : 0;
-                const bubble = { x: barX, y, radius, totalVol, buyVol, sellVol, opacity, isAbsorb, isInstitutional, absClass, priceStr, dvdt, bookSize };
-
-                if (isInstitutional) glowBubbles.push(bubble);
-                if (isAbsorb) absorbBubbles.push(bubble);
-                else if (isBuy) buyBubbles.push(bubble);
-                else sellBubbles.push(bubble);
-                if (radius >= 7) labelBubbles.push(bubble);
             }
 
             // ── Top-N cap: keep only highest-conviction bubbles ──
@@ -746,9 +660,9 @@ VolumeBubbleRenderer.prototype.draw = function(target, priceConverter) {
                 arr.sort((a, b) => b.totalVol - a.totalVol);
                 return arr.slice(0, n);
             };
-            buyBubbles    = _cap(buyBubbles, 15);
-            sellBubbles   = _cap(sellBubbles, 15);
-            absorbBubbles = _cap(absorbBubbles, 12);
+            buyBubbles    = _cap(buyBubbles, 40);
+            sellBubbles   = _cap(sellBubbles, 40);
+            absorbBubbles = _cap(absorbBubbles, 20);
             // Keep glow/label only for bubbles that made the cut
             const _kept = new Set([...buyBubbles, ...sellBubbles, ...absorbBubbles]);
             glowBubbles  = glowBubbles.filter(b => _kept.has(b));
@@ -756,90 +670,12 @@ VolumeBubbleRenderer.prototype.draw = function(target, priceConverter) {
 
             // Store in cache for next frame — include _priceBarX so Layer 8.5
             // can O(1) resolve the rightmost bar X for any price level.
-            this._v3cache = { glowBubbles, buyBubbles, sellBubbles, absorbBubbles, labelBubbles, _priceBarX };
+            this._v3cache = { glowBubbles, buyBubbles, sellBubbles, absorbBubbles, labelBubbles, _priceBarX, _priceAgg };
+            this._v3sig_prev = _dataSig;
         }
 
 
-        // ══════════════════════════════════════════════════════════════
-        // LAYER 0: ABSORPTION ZONES (behind everything)
-        // Contiguous price bands where AbsorptionAggregator detects
-        // 2+ adjacent ticks with absorption scores. Rendered as
-        // translucent horizontal bands spanning chart width.
-        // ══════════════════════════════════════════════════════════════
-
-        if (typeof AbsorptionZoneDetector !== 'undefined') {
-            const absZones = AbsorptionZoneDetector.detect(to - 1, _priceAgg || {});
-
-            for (const zone of absZones) {
-                const yLo = priceConverter(zone.lo);
-                const yHi = priceConverter(zone.hi);
-                if (yLo === null || yHi === null || isNaN(yLo) || isNaN(yHi)) continue;
-
-                // yLo > yHi because higher price = lower Y in canvas coords
-                const yTop = Math.min(yLo, yHi);
-                const yBot = Math.max(yLo, yHi);
-                const bandH = Math.max(yBot - yTop, 4); // min 4px visibility
-
-                // Alpha from zone score: logarithmic compression
-                // totalScore 2-5 → dim, 10-20 → moderate, 40+ → strong
-                const alphaRaw = Math.log(zone.totalScore + 1) / Math.log(50);
-                const alpha = Math.min(Math.max(alphaRaw * 0.25, 0.03), 0.18);
-
-                // Color: bid absorption (defending support) = cyan-green
-                //        ask absorption (defending resistance) = red-magenta
-                if (zone.side === 'bid') {
-                    ctx.fillStyle = `rgba(0, 180, 140, ${alpha})`;
-                } else {
-                    ctx.fillStyle = `rgba(180, 40, 80, ${alpha})`;
-                }
-
-                ctx.fillRect(0, yTop - 2, mediaSize.width, bandH + 4);
-
-                // Zone border lines (top and bottom of zone)
-                const borderAlpha = Math.min(alpha * 2.5, 0.35);
-                ctx.strokeStyle = zone.side === 'bid'
-                    ? `rgba(0, 220, 160, ${borderAlpha})`
-                    : `rgba(220, 50, 90, ${borderAlpha})`;
-                ctx.lineWidth = 1;
-                ctx.setLineDash([4, 3]);
-                ctx.beginPath();
-                ctx.moveTo(0, yTop - 2);
-                ctx.lineTo(mediaSize.width, yTop - 2);
-                ctx.moveTo(0, yTop + bandH + 2);
-                ctx.lineTo(mediaSize.width, yTop + bandH + 2);
-                ctx.stroke();
-                ctx.setLineDash([]);
-
-                // Label at right edge
-                if (zone.tier >= 1) {
-                    const labelX = mediaSize.width - BUBBLE_CONFIG.CUML_DELTA_BAR_MAX_WIDTH
-                        - BUBBLE_CONFIG.CUML_DELTA_RIGHT_MARGIN - 60;
-                    const labelY = yTop + bandH / 2;
-                    const labelText = `${zone.ticks}T ${zone.label}`;
-
-                    ctx.font = zone.tier >= 2
-                        ? 'bold 8px "JetBrains Mono", monospace'
-                        : '7px "JetBrains Mono", monospace';
-                    ctx.textAlign = 'right';
-                    ctx.textBaseline = 'middle';
-
-                    // Background pill
-                    const tm = ctx.measureText(labelText);
-                    ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
-                    ctx.beginPath();
-                    ctx.roundRect(labelX - tm.width - 6, labelY - 7, tm.width + 10, 14, 3);
-                    ctx.fill();
-
-                    // Text
-                    const textColor = zone.side === 'bid'
-                        ? `rgba(0, 220, 160, ${Math.min(alpha * 6, 0.9)})`
-                        : `rgba(220, 80, 120, ${Math.min(alpha * 6, 0.9)})`;
-                    ctx.fillStyle = textColor;
-                    ctx.fillText(labelText, labelX, labelY);
-                    ctx.textAlign = 'center'; // reset
-                }
-            }
-        }
+        // LAYER 0: ABSORPTION ZONES — REMOVED (weak abs_ratio signal, visual noise)
 
 
         // ══════════════════════════════════════════════════════════════
@@ -849,663 +685,464 @@ VolumeBubbleRenderer.prototype.draw = function(target, priceConverter) {
         // Skip bubble rendering if toggled off for this pane
         const _drawBubbles = !_paneOverlay || _paneOverlay.bubbles;
 
-        // Layer 0.25: Book imbalance gradient
-        // Subtle vertical gradient showing gravity field — where bids outweigh asks.
-        // >0.5 = bid-heavy (support below) = subtle green tint
-        // <0.5 = ask-heavy (ceiling above) = subtle red tint
-        {
-            const halfBar = barSpacing * 0.45;
-            const _tickSzImb = { NQ: 0.25, ES: 0.25, GC: 0.10 }[currentSymbol] || 0.25;
-            const _refPriceImb = d.bars[from] && d.bars[from].originalData
-                ? (d.bars[from].originalData.c || d.bars[from].originalData.close || 0) : 0;
-            let tickPxImb = 8;
-            if (_refPriceImb > 0) {
-                const y1 = priceConverter(_refPriceImb);
-                const y2 = priceConverter(_refPriceImb + _tickSzImb);
-                if (y1 != null && y2 != null && !isNaN(y1) && !isNaN(y2)) {
-                    tickPxImb = Math.max(Math.abs(y2 - y1), 2);
-                }
-            }
+        // LAYER 0.25: BOOK IMBALANCE GRADIENT — REMOVED (DOM shifts every tick, visual noise)
 
-            for (let i = from; i < to; i++) {
-                const bar = d.bars[i];
-                if (!bar || !bar.originalData || !bar.originalData.book_imbalance) continue;
-                const imbData = bar.originalData.book_imbalance;
+        // LAYER 0.5: MICRO-OFI HEATMAP — REMOVED (per-price coloring, visual noise)
 
-                for (const priceStr in imbData) {
-                    const ratio = imbData[priceStr];
-                    const deviation = ratio - 0.5;
-                    if (Math.abs(deviation) < 0.08) continue;
+        const _tPhaseA1 = performance.now();
+        _drawTimings.phaseA += (_tPhaseA1 - _tPhaseA0);
 
-                    const price = parseFloat(priceStr);
-                    if (isNaN(price)) continue;
-                    const y = priceConverter(price);
-                    if (y == null || isNaN(y)) continue;
+        // ══════════════════════════════════════════════════════════════
+        // LAYER 1: VOLUME BUBBLES — clean green/red circles at >2σ
+        // Shows where significant trade volume happened on each candle.
+        // Green = buy dominant, red = sell dominant. Size = σ distance.
+        // ══════════════════════════════════════════════════════════════
 
-                    const alpha = Math.min(Math.abs(deviation) * 0.3, 0.12);
-
-                    if (deviation > 0) {
-                        ctx.fillStyle = `rgba(40, 180, 100, ${alpha})`;
-                    } else {
-                        ctx.fillStyle = `rgba(180, 40, 60, ${alpha})`;
-                    }
-
-                    ctx.fillRect(bar.x - halfBar, y - tickPxImb / 2, halfBar * 2, tickPxImb);
-                }
-            }
-        }
-
-        // Layer 0.5: Micro-OFI heatmap
-        // Background gradient behind bubbles showing dealer positioning.
-        // Green = passive bids loading (bullish underpinning)
-        // Red   = passive asks stacking (bearish ceiling)
-        {
-            const halfBar = barSpacing * 0.45;
-            const _tickSz = { NQ: 0.25, ES: 0.25, GC: 0.10 }[currentSymbol] || 0.25;
-            const _refPrice = d.bars[from] && d.bars[from].originalData
-                ? (d.bars[from].originalData.c || d.bars[from].originalData.close || 0) : 0;
-            let tickPx = 8;
-            if (_refPrice > 0) {
-                const y1 = priceConverter(_refPrice);
-                const y2 = priceConverter(_refPrice + _tickSz);
-                if (y1 != null && y2 != null && !isNaN(y1) && !isNaN(y2)) {
-                    tickPx = Math.max(Math.abs(y2 - y1), 2);
-                }
-            }
-
-            for (let i = from; i < to; i++) {
-                const bar = d.bars[i];
-                if (!bar || !bar.originalData || !bar.originalData.micro_ofi) continue;
-                const ofiData = bar.originalData.micro_ofi;
-
-                for (const priceStr in ofiData) {
-                    const ofiVal = ofiData[priceStr];
-                    const norm = Math.abs(ofiVal);
-                    if (norm < 0.1) continue;
-
-                    const price = parseFloat(priceStr);
-                    if (isNaN(price)) continue;
-                    const y = priceConverter(price);
-                    if (y == null || isNaN(y)) continue;
-
-                    const alpha = Math.min(norm * 0.2, 0.3);
-
-                    if (ofiVal > 0) {
-                        ctx.fillStyle = `rgba(0, 200, 80, ${alpha})`;
-                    } else {
-                        ctx.fillStyle = `rgba(200, 40, 40, ${alpha})`;
-                    }
-
-                    ctx.fillRect(bar.x - halfBar, y - tickPx / 2, halfBar * 2, tickPx);
-                }
-            }
-        }
-
-        // Layer 1: Institutional glow rings
-        if (_drawBubbles) for (const b of glowBubbles) {
-            const glowR = b.radius + BUBBLE_CONFIG.GLOW_EXTRA_RADIUS;
-            let glowColor = b.isAbsorb ? BUBBLE_CONFIG.GLOW_COLOR_ABSORB
-                : b.buyVol >= b.sellVol ? BUBBLE_CONFIG.GLOW_COLOR_BUY
-                : BUBBLE_CONFIG.GLOW_COLOR_SELL;
-            const grad = ctx.createRadialGradient(b.x, b.y, b.radius, b.x, b.y, glowR);
-            grad.addColorStop(0, glowColor);
-            grad.addColorStop(1, 'rgba(0,0,0,0)');
-            ctx.fillStyle = grad;
-            ctx.beginPath();
-            ctx.arc(b.x, b.y, glowR, 0, Math.PI * 2);
-            ctx.fill();
-        }
-
-        // Layer 2: Buy bubbles
-        if (_drawBubbles) for (const b of buyBubbles) {
-            ctx.fillStyle = _rgba(BUBBLE_CONFIG.BUY_COLOR, b.opacity);
-            ctx.beginPath();
-            ctx.arc(b.x, b.y, b.radius, 0, Math.PI * 2);
-            ctx.fill();
-        }
-
-        // Layer 3: Sell bubbles
-        if (_drawBubbles) for (const b of sellBubbles) {
-            ctx.fillStyle = _rgba(BUBBLE_CONFIG.SELL_COLOR, b.opacity);
-            ctx.beginPath();
-            ctx.arc(b.x, b.y, b.radius, 0, Math.PI * 2);
-            ctx.fill();
-        }
-
-        // Layer 4: Absorption bubbles with tier-based glow
-        if (_drawBubbles) for (const b of absorbBubbles) {
-            // V2: Absorption glow scales with aggregator tier
-            if (b.absClass.tier >= 2) {
-                const glowR = b.radius + 4 + b.absClass.glowIntensity * 6;
-                // shadowBlur removed — forces GPU layer composite per stroke (300+ ops/frame)
-                // Glow effect preserved via higher opacity on the fill itself.
-                ctx.fillStyle = _rgba(BUBBLE_CONFIG.ABSORPTION_COLOR, Math.min(b.opacity * (1.2 + b.absClass.glowIntensity * 0.4), 0.95));
+        if (_drawBubbles && buyBubbles.length + sellBubbles.length > 0) {
+            ctx.save();
+            // Buy bubbles (green)
+            for (const b of buyBubbles) {
+                if (b.y === null || b.y === undefined || isNaN(b.y)) continue;
+                if (b.y < -10 || b.y > mediaSize.height + 10) continue;
+                ctx.fillStyle = `rgba(0, 230, 118, ${b.opacity * 0.7})`;
                 ctx.beginPath();
                 ctx.arc(b.x, b.y, b.radius, 0, Math.PI * 2);
                 ctx.fill();
-            } else {
-                ctx.fillStyle = _rgba(BUBBLE_CONFIG.ABSORPTION_COLOR, b.opacity);
+                // Border
+                ctx.strokeStyle = `rgba(0, 200, 83, ${Math.min(b.opacity + 0.1, 0.9)})`;
+                ctx.lineWidth = 1;
+                ctx.stroke();
+            }
+            // Sell bubbles (red)
+            for (const b of sellBubbles) {
+                if (b.y === null || b.y === undefined || isNaN(b.y)) continue;
+                if (b.y < -10 || b.y > mediaSize.height + 10) continue;
+                ctx.fillStyle = `rgba(255, 23, 68, ${b.opacity * 0.7})`;
                 ctx.beginPath();
                 ctx.arc(b.x, b.y, b.radius, 0, Math.PI * 2);
                 ctx.fill();
-            }
-
-            // Dual-color split ring
-            if (b.radius >= 5) {
-                ctx.lineWidth = 2;
-                ctx.strokeStyle = _rgba(BUBBLE_CONFIG.BUY_COLOR, 0.8);
-                ctx.beginPath();
-                ctx.arc(b.x, b.y, b.radius + 1, Math.PI, 0);
-                ctx.stroke();
-                ctx.strokeStyle = _rgba(BUBBLE_CONFIG.SELL_COLOR, 0.8);
-                ctx.beginPath();
-                ctx.arc(b.x, b.y, b.radius + 1, 0, Math.PI);
+                ctx.strokeStyle = `rgba(213, 0, 0, ${Math.min(b.opacity + 0.1, 0.9)})`;
+                ctx.lineWidth = 1;
                 ctx.stroke();
             }
-        }
-
-        // Layer 5: Institutional border rings
-        if (_drawBubbles) for (const b of glowBubbles) {
-            let ringColor = b.isAbsorb ? _rgba(BUBBLE_CONFIG.ABSORPTION_COLOR, 0.9)
-                : b.buyVol >= b.sellVol ? _rgba(BUBBLE_CONFIG.BUY_COLOR, 0.9)
-                : _rgba(BUBBLE_CONFIG.SELL_COLOR, 0.9);
-            ctx.strokeStyle = ringColor;
-            ctx.lineWidth = 2;
-            ctx.beginPath();
-            ctx.arc(b.x, b.y, b.radius + 2, 0, Math.PI * 2);
-            ctx.stroke();
-        }
-
-        // Layer 5.5: Book depth rings (Upgrade A)
-        // Ring thickness shows how much resting size was at the trade price.
-        // Thick ring = traded into a wall (absorption). Thin/no ring = thin air (sweep).
-        const MAX_BOOK_SIZE = { NQ: 500, ES: 2000, GC: 50 }[currentSymbol] || 500;
-        const allBubbles = [...buyBubbles, ...sellBubbles, ...absorbBubbles];
-        if (_drawBubbles) for (const b of allBubbles) {
-            if (!b.bookSize || b.bookSize < 5) continue;
-            const bookNorm = Math.min(b.bookSize / MAX_BOOK_SIZE, 1.0);
-            const ringWidth = 1 + bookNorm * 7;
-            const ringAlpha = 0.15 + bookNorm * 0.45;
-            ctx.lineWidth = ringWidth;
-            ctx.strokeStyle = `rgba(200, 210, 230, ${ringAlpha})`;
-            ctx.beginPath();
-            ctx.arc(b.x, b.y, b.radius + 3, 0, Math.PI * 2);
-            ctx.stroke();
-        }
-
-        // Layer 5.75: Depth delta arrows (Upgrade B)
-        // Up arrow (green) = passive bids loaded during candle (accumulation)
-        // Down arrow (red) = passive orders pulled during candle (trap/exhaustion)
-        if (_drawBubbles) for (let i = from; i < to; i++) {
-            const bar = d.bars[i];
-            if (!bar || !bar.originalData) continue;
-            const depthDeltas = bar.originalData.depth_deltas;
-            const bpData = bar.originalData.bp;
-            if (!depthDeltas || !bpData) continue;
-
-            for (const priceStr in depthDeltas) {
-                if (!bpData[priceStr]) continue;
-                const delta = depthDeltas[priceStr];
-                const absDelta = Math.abs(delta);
-                const arrowSize = Math.min(absDelta / 100, 1) * 12;
-                if (arrowSize < 3) continue;
-
-                const price = parseFloat(priceStr);
-                if (isNaN(price)) continue;
-                const y = priceConverter(price);
-                if (y == null || isNaN(y)) continue;
-
-                const bv = bpData[priceStr][0] || 0, sv = bpData[priceStr][1] || 0;
-                const tv = bv + sv;
-                if (tv < BUBBLE_CONFIG.MIN_BUBBLE_VOL) continue;
-                const sd = AdaptiveKalmanThreshold.sigmaDistance(tv);
-                const sr = Math.min(Math.pow(Math.max(sd, 0) / 4, 1.5), 1);
-                const bRadius = BUBBLE_CONFIG.MIN_RADIUS
-                    + sr * (BUBBLE_CONFIG.MAX_RADIUS - BUBBLE_CONFIG.MIN_RADIUS);
-
-                const arrowX = bar.x + bRadius + 6;
-                const arrowY = y;
-
-                ctx.save();
-                ctx.translate(arrowX, arrowY);
-
-                if (delta > 0) {
-                    ctx.fillStyle = 'rgba(0, 220, 100, 0.85)';
-                    ctx.beginPath();
-                    ctx.moveTo(0, -arrowSize);
-                    ctx.lineTo(arrowSize * 0.6, arrowSize * 0.3);
-                    ctx.lineTo(-arrowSize * 0.6, arrowSize * 0.3);
-                    ctx.closePath();
-                } else {
-                    ctx.fillStyle = 'rgba(255, 60, 60, 0.85)';
-                    ctx.beginPath();
-                    ctx.moveTo(0, arrowSize);
-                    ctx.lineTo(arrowSize * 0.6, -arrowSize * 0.3);
-                    ctx.lineTo(-arrowSize * 0.6, -arrowSize * 0.3);
-                    ctx.closePath();
-                }
-
+            // Glow for institutional (>3σ)
+            for (const b of glowBubbles) {
+                if (b.y === null || b.y === undefined || isNaN(b.y)) continue;
+                const isBuy = b.buyVol >= b.sellVol;
+                ctx.fillStyle = isBuy
+                    ? `rgba(0, 230, 118, ${b.opacity * 0.12})`
+                    : `rgba(255, 23, 68, ${b.opacity * 0.12})`;
+                ctx.beginPath();
+                ctx.arc(b.x, b.y, b.radius + 3, 0, Math.PI * 2);
                 ctx.fill();
-                ctx.restore();
             }
+            ctx.restore();
         }
 
-        // Layer 5.85: Depth velocity indicators
-        // Fast loading (negative rate) = green dashed ring
-        // Fast draining (positive rate) = red dashed ring
-        if (_drawBubbles) for (let i = from; i < to; i++) {
-            const bar = d.bars[i];
-            if (!bar || !bar.originalData) continue;
-            const velData = bar.originalData.depth_vel;
-            const bpData = bar.originalData.bp;
-            if (!velData || !bpData) continue;
-
-            for (const priceStr in velData) {
-                if (!bpData[priceStr]) continue;
-                const rate = velData[priceStr];
-                const absRate = Math.abs(rate);
-                if (absRate < 10) continue;
-
-                const price = parseFloat(priceStr);
-                if (isNaN(price)) continue;
-                const y = priceConverter(price);
-                if (y == null || isNaN(y)) continue;
-
-                const velNorm = Math.min(absRate / 100, 1.0);
-                const velAlpha = 0.15 + velNorm * 0.5;
-                const velRadius = 6 + velNorm * 8;
-
-                ctx.save();
-                ctx.setLineDash([2, 3]);
-                ctx.lineWidth = 1.5;
-
-                if (rate > 0) {
-                    ctx.strokeStyle = `rgba(255, 80, 80, ${velAlpha})`;
-                } else {
-                    ctx.strokeStyle = `rgba(80, 255, 120, ${velAlpha})`;
-                }
-
-                ctx.beginPath();
-                ctx.arc(bar.x, y, velRadius, 0, Math.PI * 2);
-                ctx.stroke();
-                ctx.setLineDash([]);
-                ctx.restore();
-            }
-        }
-
-        // Layer 6: Text labels
-        if (_drawBubbles && labelBubbles.length > 0) {
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            for (const b of labelBubbles) {
-                const label = b.totalVol >= 1000
-                    ? (b.totalVol / 1000).toFixed(1) + 'k' : String(b.totalVol);
-                ctx.font = b.isInstitutional ? BUBBLE_CONFIG.FONT : BUBBLE_CONFIG.FONT_SMALL;
-                ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
-                ctx.fillText(label, b.x + 1, b.y + 1);
-                ctx.fillStyle = BUBBLE_CONFIG.TEXT_COLOR;
-                ctx.fillText(label, b.x, b.y);
-
-                // V2: Absorption tier label (replaces simple "ABS")
-                if (b.isAbsorb && b.radius >= 10 && b.absClass.label) {
-                    ctx.font = '7px "JetBrains Mono", monospace';
-                    ctx.fillStyle = _rgba(BUBBLE_CONFIG.ABSORPTION_COLOR, 0.9);
-                    ctx.fillText(b.absClass.label, b.x, b.y + b.radius + 8);
-                }
-            }
+        // WebGL frame for overlays
+        const _useWebGL = _drawBubbles && typeof WebGLOverlay !== 'undefined' && WebGLOverlay.isReady();
+        if (_useWebGL) {
+            WebGLOverlay.beginFrame();
+            WebGLOverlay.flush();
         }
 
 
         // ══════════════════════════════════════════════════════════════
-        // LAYER 6.3: VOLUME RATE ACCELERATION (dV/dt)
-        // Double-chevron marker when volume at a price level is
-        // accelerating (ratio > 1.8). Signals active loading.
+        // LAYER 8: ABSORPTION BUBBLES (L2 DOM snapshot vs trade tape)
+        //
+        // Data source: bar.originalData.absorption from l2_worker.py v2 engine
+        // Each entry is a CLUSTER anchor (adjacent levels pre-merged by backend).
+        //
+        // Tiering (from refill_ratio = refilled / traded):
+        //   FORTRESS (tier 3) — refill ≥ 0.7, traded ≥ 100 → bright glow, large
+        //   SOLID    (tier 2) — refill ≥ 0.5, traded ≥ 50  → medium glow
+        //   HELD     (tier 1) — refill ≥ 0.3, traded ≥ 30  → basic bubble
+        //   FAKE     (fake=true) — pull_ratio ≥ 0.6       → dashed red X (spoof)
+        //
+        // Color:
+        //   bid side = cyan (passive buyers absorbing)
+        //   ask side = magenta (passive sellers absorbing)
+        // Contract count shown inside bubble (total_traded).
         // ══════════════════════════════════════════════════════════════
 
         if (_drawBubbles) {
-            const allBubbles = [...buyBubbles, ...sellBubbles, ...absorbBubbles];
-            for (const b of allBubbles) {
-                if (b.dvdt < 1.8 || b.radius < 5) continue;
+            // Compute visible price range from all bars (clamp absorption to candle range)
+            let _visHigh = -Infinity, _visLow = Infinity;
+            for (let i = from; i < to; i++) {
+                const bar = d.bars[i];
+                if (!bar?.originalData) continue;
+                const h = bar.originalData.h || bar.originalData.high;
+                const l = bar.originalData.l || bar.originalData.low;
+                if (h > _visHigh) _visHigh = h;
+                if (l < _visLow) _visLow = l;
+            }
+            const _visRange = _visHigh - _visLow;
+            const _visMargin = Math.max(_visRange * 0.15, 2.0);
 
-                const isBuy = b.buyVol >= b.sellVol;
-                const chevronX = b.x + b.radius + 5;
-                const chevronSize = Math.min(3 + (b.dvdt - 1.8) * 2, 8);
+            // Collect all absorption entries across visible bars, dedupe by price
+            // (latest bar wins for each price level since absorption is cumulative)
+            const _absMap = {}; // {priceStr: {data, barX, barIdx}}
+            for (let i = from; i < to; i++) {
+                const bar = d.bars[i];
+                if (!bar?.originalData?.absorption) continue;
+                const abs = bar.originalData.absorption;
+                for (const priceStr in abs) {
+                    const entry = abs[priceStr];
+                    if (!entry) continue;
+                    // Gate: tier >= 1 OR explicitly flagged fake (show spoofs too)
+                    if (!entry.fake && (entry.tier || 0) < 1) continue;
+                    // Clamp to visible candle range — absorption data is global, skip far prices
+                    const p = parseFloat(priceStr);
+                    if (isFinite(_visHigh) && isFinite(_visLow)) {
+                        if (p > _visHigh + _visMargin || p < _visLow - _visMargin) continue;
+                    }
+                    _absMap[priceStr] = { data: entry, barX: bar.x, barIdx: i };
+                }
+            }
 
-                // Intensity from acceleration ratio: 1.8→dim, 3.0+→bright
-                const accelAlpha = Math.min(0.3 + (b.dvdt - 1.8) * 0.25, 0.9);
-                const color = isBuy ? BUBBLE_CONFIG.BUY_COLOR : BUBBLE_CONFIG.SELL_COLOR;
-                ctx.strokeStyle = _rgba(color, accelAlpha);
-                ctx.lineWidth = 1.5;
+            const _absEntries = Object.values(_absMap);
 
-                // Double chevron: ▸▸ (buy=up, sell=down)
-                const dir = isBuy ? -1 : 1; // up for buy, down for sell
-                for (let c = 0; c < 2; c++) {
-                    const cy = b.y + dir * (c * chevronSize * 0.8);
+            // ── Bar gap — horizontal offset so bubbles sit to the RIGHT of the
+            // candle body, never on top of it. Computed once per frame from
+            // the visible bar spacing. Fallback to 8px when only one bar visible.
+            let _barGap = 8;
+            if (d.bars.length >= 2) {
+                const _b0 = d.bars[0]?.x || 0;
+                const _b1 = d.bars[1]?.x || 0;
+                const _dx = Math.abs(_b1 - _b0);
+                if (_dx > 0) _barGap = Math.max(_dx * 0.55, 8);
+            }
+
+            // ── Horizontal zone bands — multi-level cluster defense zones ──
+            // Faint tinted band across the full chart width at each cluster's
+            // price span, so traders can see candles approaching / inside a
+            // defended zone (the most valuable MM signal when scanning).
+            // Skipped when VP Intel pane owns the zone-band rendering (with range label).
+            const _vpIntelActiveZ = (typeof VolumeProfileOverlay !== 'undefined' && typeof VolumeProfileOverlay.isIntelActive === 'function') ? VolumeProfileOverlay.isIntelActive() : false;
+            if (_showAbsZoneBand && !_vpIntelActiveZ && _absEntries.length > 0) {
+                ctx.save();
+                for (const { data: abs } of _absEntries) {
+                    if (abs.fake) continue;
+                    const cs = abs.cluster_size || 1;
+                    if (cs < 2) continue; // single-level = no band
+                    const prices = abs.cluster_prices || [];
+                    if (prices.length < 2) continue;
+                    let pLo = Infinity, pHi = -Infinity;
+                    for (const p of prices) {
+                        if (p < pLo) pLo = p;
+                        if (p > pHi) pHi = p;
+                    }
+                    const yLo = priceConverter(pLo);
+                    const yHi = priceConverter(pHi);
+                    if (yLo == null || yHi == null || isNaN(yLo) || isNaN(yHi)) continue;
+                    const top = Math.min(yLo, yHi);
+                    const bandH = Math.max(Math.abs(yLo - yHi) + 3, 4);
+                    const tier = abs.tier || 0;
+                    const isBid = abs.side === 'bid';
+                    const rgb = isBid ? [0, 220, 240] : [240, 60, 180];
+                    const fillAlpha = tier >= 3 ? 0.09 : tier >= 2 ? 0.06 : 0.04;
+                    const lineAlpha = tier >= 3 ? 0.35 : tier >= 2 ? 0.25 : 0.18;
+                    // Tint band
+                    ctx.fillStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${fillAlpha})`;
+                    ctx.fillRect(0, top, mediaSize.width, bandH);
+                    // Top/bottom edge lines (thin)
+                    ctx.strokeStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${lineAlpha})`;
+                    ctx.lineWidth = 0.5;
+                    ctx.setLineDash([4, 3]);
                     ctx.beginPath();
-                    ctx.moveTo(chevronX - chevronSize * 0.5, cy - dir * chevronSize * 0.5);
-                    ctx.lineTo(chevronX, cy);
-                    ctx.lineTo(chevronX - chevronSize * 0.5, cy + dir * chevronSize * 0.5);
+                    ctx.moveTo(0, top); ctx.lineTo(mediaSize.width, top);
+                    ctx.moveTo(0, top + bandH); ctx.lineTo(mediaSize.width, top + bandH);
                     ctx.stroke();
+                    ctx.setLineDash([]);
                 }
+                ctx.restore();
+            }
 
-                // Rate label for strong acceleration (3x+)
-                if (b.dvdt >= 3.0 && b.radius >= 8) {
-                    ctx.font = '7px "JetBrains Mono", monospace';
-                    ctx.textAlign = 'left';
-                    ctx.textBaseline = 'middle';
-                    ctx.fillStyle = _rgba(color, accelAlpha);
-                    ctx.fillText(`${b.dvdt.toFixed(1)}×`, chevronX + chevronSize, b.y);
-                    ctx.textAlign = 'center'; // reset
+            if (_absEntries.length > 0) {
+                // Sort by tier DESC so FORTRESS > SOLID > HELD render last
+                // and the vertical dedup keeps the strongest tag.
+                const _sortedAbs = Object.entries(_absMap).sort((a, b) => {
+                    return (b[1].data.tier || 0) - (a[1].data.tier || 0);
+                });
+                let _lastAbsTagY = -Infinity;
+                ctx.save();
+                for (const [priceStr, entry] of _sortedAbs) {
+                    const { data: abs, barX } = entry;
+
+                    const price = parseFloat(priceStr);
+                    if (isNaN(price)) continue;
+                    const y = priceConverter(price);
+                    if (y === null || y === undefined || isNaN(y)) continue;
+                    if (y < -10 || y > mediaSize.height + 10) continue;
+
+                    const tier = abs.tier || 0;
+                    const isFake = !!abs.fake;
+                    const isBid = abs.side === 'bid';
+
+                    // Bubble offset — sit to the right of the candle body.
+                    // Radius is computed below; use generous r≈15 hint for right-edge skip.
+                    const bubbleX = barX + _barGap;
+                    // Right-edge skip — better to drop the bubble than stomp the axis.
+                    if (bubbleX > mediaSize.width - 18) continue;
+
+                    // ── FAKE walls: dashed red X (spoof warning) ──
+                    if (isFake) {
+                        const sz = 7;
+                        ctx.strokeStyle = 'rgba(255,80,80,0.75)';
+                        ctx.lineWidth = 1.5;
+                        ctx.setLineDash([3, 2]);
+                        ctx.beginPath();
+                        ctx.moveTo(bubbleX - sz, y - sz); ctx.lineTo(bubbleX + sz, y + sz);
+                        ctx.moveTo(bubbleX + sz, y - sz); ctx.lineTo(bubbleX - sz, y + sz);
+                        ctx.stroke();
+                        ctx.setLineDash([]);
+                        continue;
+                    }
+
+                    // Color: cyan for bid (passive buyers), magenta for ask (passive sellers)
+                    const rgb = isBid ? [0, 220, 240] : [240, 60, 180];
+
+                    // Radius: tier-scaled, HELD=6, SOLID=9, FORTRESS=13
+                    const baseR = tier >= 3 ? 13 : tier >= 2 ? 9 : 6;
+                    // Boost by refill_ratio conviction (up to +2px)
+                    const refill = abs.refill_ratio || 0;
+                    const r = baseR + Math.min(refill * 2, 2);
+
+                    // Opacity: tier-based
+                    const alpha = tier >= 3 ? 0.90 : tier >= 2 ? 0.75 : 0.55;
+
+                    // ── FORTRESS: pulsing outer ring ──
+                    if (tier >= 3) {
+                        ctx.fillStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0.12)`;
+                        ctx.beginPath();
+                        ctx.arc(bubbleX, y, r + 5, 0, Math.PI * 2);
+                        ctx.fill();
+                    }
+
+                    // ── SOLID/FORTRESS: inner glow ──
+                    if (tier >= 2) {
+                        ctx.fillStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${alpha * 0.12})`;
+                        ctx.beginPath();
+                        ctx.arc(bubbleX, y, r + 2, 0, Math.PI * 2);
+                        ctx.fill();
+                    }
+
+                    // Filled bubble — translucent so candles show through
+                    ctx.fillStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${alpha * 0.35})`;
+                    ctx.beginPath();
+                    ctx.arc(bubbleX, y, r, 0, Math.PI * 2);
+                    ctx.fill();
+
+                    // Border — brightened to compensate for translucent fill
+                    ctx.strokeStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${Math.min(alpha + 0.30, 0.98)})`;
+                    ctx.lineWidth = tier >= 3 ? 2 : tier >= 2 ? 1.5 : 1;
+                    ctx.stroke();
+
+                    // ── Refill-class pip (colored dot on NE edge of bubble) ──
+                    // Derive from refill_ratio: ≥0.8 instant (green), ≥0.5 fast (yellow), else slow (red)
+                    if (_showRefillPip && tier >= 1) {
+                        const rr = abs.refill_ratio || 0;
+                        const pipColor = rr >= 0.8 ? 'rgba(40,255,140,0.95)' :
+                                         rr >= 0.5 ? 'rgba(255,220,40,0.92)' :
+                                                     'rgba(255,80,80,0.88)';
+                        const pipR = Math.max(2, Math.min(r * 0.28, 3.5));
+                        // NE edge, offset along 45°
+                        const off = r * 0.72;
+                        ctx.fillStyle = pipColor;
+                        ctx.beginPath();
+                        ctx.arc(bubbleX + off, y - off, pipR, 0, Math.PI * 2);
+                        ctx.fill();
+                        // Thin outline for contrast
+                        ctx.strokeStyle = 'rgba(0,0,0,0.45)';
+                        ctx.lineWidth = 0.75;
+                        ctx.stroke();
+                    }
+
+                    // ── FORTRESS/SOLID/HELD text tag on LEFT edge column ──
+                    // 14px vertical dedup — sorted by tier DESC above, so the
+                    // strongest bubble in a vertical neighborhood keeps the tag.
+                    // Skipped when VP Intel pane owns the pill badge rendering.
+                    const _vpIntelActive = (typeof VolumeProfileOverlay !== 'undefined' && typeof VolumeProfileOverlay.isIntelActive === 'function') ? VolumeProfileOverlay.isIntelActive() : false;
+                    if (_showAbsTag && !_vpIntelActive && tier >= 1 && Math.abs(y - _lastAbsTagY) >= 14) {
+                        const tagText = tier >= 3 ? 'FORTRESS' : tier >= 2 ? 'SOLID' : 'HELD';
+                        const tagAlpha = tier >= 3 ? 0.95 : tier >= 2 ? 0.80 : 0.60;
+                        ctx.save();
+                        ctx.font = `bold ${tier >= 3 ? 8 : 7}px "JetBrains Mono", monospace`;
+                        const tm = ctx.measureText(tagText);
+                        const tagX = 4; // Left margin
+                        const tagY = y;
+                        const tagW = tm.width + 6;
+                        // Pill background
+                        ctx.fillStyle = 'rgba(0,0,0,0.72)';
+                        ctx.fillRect(tagX - 1, tagY - 6, tagW, 12);
+                        // Border matches bubble color
+                        ctx.strokeStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${tagAlpha})`;
+                        ctx.lineWidth = 0.75;
+                        ctx.strokeRect(tagX - 1, tagY - 6, tagW, 12);
+                        // Text
+                        ctx.fillStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${Math.min(tagAlpha + 0.05, 1)})`;
+                        ctx.textAlign = 'left';
+                        ctx.textBaseline = 'middle';
+                        ctx.fillText(tagText, tagX + 2, tagY);
+                        // Leader dot bridging pill → bubble
+                        const leaderFromX = tagX + tagW + 3;
+                        const leaderToX = bubbleX - r - 2;
+                        if (leaderToX > leaderFromX + 6) {
+                            ctx.strokeStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${tagAlpha * 0.45})`;
+                            ctx.lineWidth = 0.5;
+                            ctx.setLineDash([2, 3]);
+                            ctx.beginPath();
+                            ctx.moveTo(leaderFromX, tagY);
+                            ctx.lineTo(leaderToX, tagY);
+                            ctx.stroke();
+                            ctx.setLineDash([]);
+                        }
+                        ctx.restore();
+                        _lastAbsTagY = y;
+                    }
+
+                    // Cluster indicator: small dash above bubble if multi-level
+                    if ((abs.cluster_size || 1) > 1) {
+                        ctx.strokeStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0.85)`;
+                        ctx.lineWidth = 1.5;
+                        ctx.beginPath();
+                        const dashY = y - r - 3;
+                        ctx.moveTo(bubbleX - r * 0.5, dashY);
+                        ctx.lineTo(bubbleX + r * 0.5, dashY);
+                        ctx.stroke();
+                    }
+
+                    // Contract count: use total_traded (the real volume that hit this level)
+                    const contracts = abs.total_traded || (abs.buy_vol + abs.sell_vol) || 0;
+                    if (contracts > 0 && r >= 6) {
+                        ctx.font = `${Math.max(8, Math.min(r * 0.85, 12))}px "JetBrains Mono", monospace`;
+                        ctx.textAlign = 'center';
+                        ctx.textBaseline = 'middle';
+                        ctx.fillStyle = 'rgba(255,255,255,0.95)';
+                        const txt = contracts >= 1000 ? (contracts / 1000).toFixed(1) + 'k' : String(contracts);
+                        ctx.fillText(txt, bubbleX, y);
+                    }
                 }
+                ctx.restore();
             }
         }
 
 
         // ══════════════════════════════════════════════════════════════
-        // LAYER 6.5: HAWKES CLUSTER LINES (per-pane toggleable, follows bubbles)
-        // Uses self-exciting intensity for detection + WLS for acceleration.
+        // LAYER 10: EXHAUSTION BUBBLES
+        //
+        // When depth_deltas shows net negative (orders pulled > loaded)
+        // at the candle's close price, the candle is exhausting.
+        // Render a ring bubble (hollow, to distinguish from absorption fill).
+        //
+        // Purple ring = buy exhaustion (buyers drying up → short signal)
+        // Orange ring = sell exhaustion (sellers drying up → long signal)
+        //
+        // Size scales with |netDelta|. Ring is placed at the price level
+        // with the strongest pull (dominant_price), or candle close as fallback.
         // ══════════════════════════════════════════════════════════════
 
-        if (_drawBubbles) for (const [priceStr, cluster] of hawkesClusters) {
-            const price = parseFloat(priceStr);
-            if (isNaN(price)) continue;
-            const y = priceConverter(price);
-            if (y === null || y === undefined || isNaN(y)) continue;
-
-            const events = cluster.events;
-            // FIX 8: Adaptive minimum event count — bar-spacing aware.
-            // At scalp timeframes (30s, tight bars ≤8px): 3 rapid events = real institutional cluster.
-            // At swing timeframes (1h, wide bars ≥20px): need ≥4 events (coincidence filter).
-            // BUG 3 FIX: Was using target.mediaSize which is undefined outside the
-            // useMediaCoordinateSpace callback. mediaSize is the destructured closure
-            // parameter — already in scope here (this code IS inside that callback).
-            const _visibleBars = to - from;
-            const _chartWidth = mediaSize ? mediaSize.width : 1000;
-            const _barPx = _visibleBars > 0 ? _chartWidth / _visibleBars : 10;
-            const _minEvents = _barPx <= 8 ? 3 : 4; // scalp=3, swing=4
-            if (events.length < _minEvents) continue;
-
-            // Map bar indices to x coordinates
-            const hitPoints = [];
-            for (const ev of events) {
-                const bar = d.bars[ev.bar];
-                if (!bar) continue;
-                hitPoints.push({ x: bar.x, vol: ev.vol, buy: ev.buy, sell: ev.sell });
+        if (_drawBubbles) {
+            // Recompute bar gap for this block (separate scope from Layer 9).
+            let _exhBarGap = 8;
+            if (d.bars.length >= 2) {
+                const _b0 = d.bars[0]?.x || 0;
+                const _b1 = d.bars[1]?.x || 0;
+                const _dx = Math.abs(_b1 - _b0);
+                if (_dx > 0) _exhBarGap = Math.max(_dx * 0.55, 8);
             }
-            if (hitPoints.length < 2) continue;
-
-            // ── V2: Opacity from Hawkes intensity (not acceleration ratio) ──
-            const lineAlpha = Math.min(0.15 + cluster.clusterStrength * 0.70, 0.90);
-
-            // ── Color from dominant side ──
-            const lineColor = cluster.totalBuy >= cluster.totalSell
-                ? BUBBLE_CONFIG.BUY_COLOR : BUBBLE_CONFIG.SELL_COLOR;
-
-            // ── V2: Variable-width segments (unchanged logic, better data) ──
-            const vols = hitPoints.map(h => h.vol);
-            const maxHitVol = Math.max(...vols);
-            const minHitVol = Math.min(...vols);
-            const volRange = maxHitVol - minHitVol || 1;
-
-            // shadowBlur removed from inner segment loop — was causing 300+ GPU composites/frame.
-            // Cluster lines are bold enough at full alpha without glow.
             ctx.save();
+            for (let i = from; i < to; i++) {
+                const bar = d.bars[i];
+                if (!bar?.originalData) continue;
+                const deltas = bar.originalData.depth_deltas;
+                if (!deltas) continue;
 
-            for (let h = 0; h < hitPoints.length - 1; h++) {
-                const h1 = hitPoints[h], h2 = hitPoints[h + 1];
-                const segAvgVol = (h1.vol + h2.vol) / 2;
-                const widthRatio = (segAvgVol - minHitVol) / volRange;
-                const segWidth = BUBBLE_CONFIG.CLUSTER_LINE_WIDTH_MIN
-                    + widthRatio * (BUBBLE_CONFIG.CLUSTER_LINE_WIDTH_MAX - BUBBLE_CONFIG.CLUSTER_LINE_WIDTH_MIN);
+                const close = bar.originalData.c || bar.originalData.close;
+                const open = bar.originalData.o || bar.originalData.open;
+                if (!close || !open) continue;
 
-                ctx.strokeStyle = _rgba(lineColor, lineAlpha);
-                ctx.lineWidth = segWidth;
+                // Sum all depth deltas for this bar + track dominant-pull price
+                let netDelta = 0;
+                let deltaCount = 0;
+                let dominantPrice = null;
+                let dominantMag = 0;
+                for (const pk in deltas) {
+                    const dv = deltas[pk];
+                    netDelta += dv;
+                    deltaCount++;
+                    if (Math.abs(dv) > dominantMag) {
+                        dominantMag = Math.abs(dv);
+                        dominantPrice = parseFloat(pk);
+                    }
+                }
+                if (deltaCount === 0) continue;
+
+                // Noise gate
+                const avgDelta = Math.abs(netDelta) / deltaCount;
+                if (avgDelta < 10) continue;
+
+                const isBullCandle = close >= open;
+                const isBuyExhaustion = isBullCandle && netDelta < -50;
+                const isSellExhaustion = !isBullCandle && netDelta > 50;
+                if (!isBuyExhaustion && !isSellExhaustion) continue;
+
+                // Place bubble at dominant-pull price (fallback: close)
+                const bubblePrice = (dominantPrice != null && isFinite(dominantPrice)) ? dominantPrice : close;
+                const y = priceConverter(bubblePrice);
+                if (y == null || isNaN(y)) continue;
+                if (y < -10 || y > mediaSize.height + 10) continue;
+
+                // Size scales with |netDelta| — larger pull = larger ring
+                // Base 6px, +1px per 50 lots, capped at 14px
+                const r = Math.min(14, 6 + Math.abs(netDelta) / 50);
+
+                // Offset bubble to the right of the candle body
+                const bubbleX = bar.x + _exhBarGap;
+                // Right-edge skip — drop off-screen bubbles rather than stomp axis
+                if (bubbleX > mediaSize.width - r - 4) continue;
+
+                // Color: purple for buy exhaustion, orange for sell exhaustion
+                const rgb = isBuyExhaustion ? [160, 80, 220] : [255, 160, 40];
+                const alpha = Math.min(0.90, 0.45 + Math.abs(netDelta) / 400);
+
+                // ── Outer faint fill (ring halo) ──
+                ctx.fillStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${alpha * 0.15})`;
                 ctx.beginPath();
-                ctx.moveTo(h1.x, y);
-                ctx.lineTo(h2.x, y);
+                ctx.arc(bubbleX, y, r + 2, 0, Math.PI * 2);
+                ctx.fill();
+
+                // ── Ring outline (hollow — distinguishes from absorption) ──
+                ctx.strokeStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${alpha})`;
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.arc(bubbleX, y, r, 0, Math.PI * 2);
+                ctx.stroke();
+
+                // ── Inner dot marker ──
+                ctx.fillStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${alpha * 0.85})`;
+                ctx.beginPath();
+                ctx.arc(bubbleX, y, Math.max(2, r * 0.30), 0, Math.PI * 2);
+                ctx.fill();
+
+                // ── Directional tail arrow (down for buy exh, up for sell exh) ──
+                ctx.strokeStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${alpha * 0.9})`;
+                ctx.lineWidth = 1.5;
+                ctx.beginPath();
+                if (isBuyExhaustion) {
+                    // ▼ short-bias arrow below ring
+                    ctx.moveTo(bubbleX - 3, y + r + 2);
+                    ctx.lineTo(bubbleX,     y + r + 6);
+                    ctx.lineTo(bubbleX + 3, y + r + 2);
+                } else {
+                    // ▲ long-bias arrow above ring
+                    ctx.moveTo(bubbleX - 3, y - r - 2);
+                    ctx.lineTo(bubbleX,     y - r - 6);
+                    ctx.lineTo(bubbleX + 3, y - r - 2);
+                }
                 ctx.stroke();
             }
             ctx.restore();
-
-            // Dots at each hit
-            for (const hit of hitPoints) {
-                const dotRatio = (hit.vol - minHitVol) / volRange;
-                const dotRadius = BUBBLE_CONFIG.CLUSTER_DOT_RADIUS + dotRatio * 1.5;
-                ctx.fillStyle = _rgba(lineColor, Math.min(lineAlpha + 0.20, 0.92));
-                ctx.beginPath();
-                ctx.arc(hit.x, y, dotRadius, 0, Math.PI * 2);
-                ctx.fill();
-            }
-
-            // ── Badge X clamped to left edge of CumlDelta strip ──
-            // CumlDelta renders at rightX = mediaSize.width - 10.
-            // Bars extend leftward by CUML_DELTA_BAR_MAX_WIDTH + CUML_DELTA_RIGHT_MARGIN.
-            // Badge must not enter this reserved strip.
-            const _cumlLeft = (mediaSize.width - 10)
-                - BUBBLE_CONFIG.CUML_DELTA_BAR_MAX_WIDTH
-                - BUBBLE_CONFIG.CUML_DELTA_RIGHT_MARGIN
-                - 4;  // 4px breathing room between badge tail and bar edge
-            const xEnd = hitPoints[hitPoints.length - 1].x;
-            const bm0 = ctx.measureText(`${events.length}\u00d7`);
-            const badgeX = Math.min(xEnd + 8, _cumlLeft - bm0.width - 6);
-            ctx.font = BUBBLE_CONFIG.CLUSTER_BADGE_FONT;
-            ctx.textAlign = 'left';
-            ctx.textBaseline = 'middle';
-
-            const netDelta = cluster.totalBuy - cluster.totalSell;
-            const deltaSign = netDelta >= 0 ? '+' : '';
-
-            // ── V2.1: R²-gated acceleration arrow ──
-            // accelerationRSquared is now exposed from HawkesClusterDetector.getCluster().
-            // Only show direction arrow if R² >= 0.4.
-            // Below 0.4, the WLS slope is fitting noise — arrow would be misleading.
-            // Example: 3 events with random volumes → R² = 0.05 → no arrow
-            //          6 events with clear ramp-up → R² = 0.72 → show ↑
-            const rSquared = cluster.accelerationRSquared || 0;
-            const accelArrow = rSquared >= 0.4
-                ? (cluster.acceleration.direction === 'accelerating' ? ' ↑'
-                   : cluster.acceleration.direction === 'decelerating' ? ' ↓' : '')
-                : '';  // R² too low — slope is noise, suppress arrow
-
-            const badge = `${events.length}× ${deltaSign}${netDelta}Δ${accelArrow}`;
-            const badgeAlpha = Math.min(lineAlpha + 0.20, 0.92);
-
-            // Background pill
-            const bm = ctx.measureText(badge);
-            ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
-            ctx.beginPath();
-            ctx.roundRect(badgeX - 3, y - 7, bm.width + 6, 14, 3);
-            ctx.fill();
-
-            ctx.fillStyle = _rgba(lineColor, badgeAlpha);
-            ctx.fillText(badge, badgeX, y);
-            ctx.textAlign = 'center';
-        }
-
-
-        // ══════════════════════════════════════════════════════════════
-        // LAYER 7: CUMULATIVE DELTA SIDEBAR (per-pane toggleable)
-        // ══════════════════════════════════════════════════════════════
-
-        if (!_paneOverlay || _paneOverlay.cumlDelta) {
-            CumlDeltaRenderer.render(
-                ctx, cumlDelta, priceConverter, BUBBLE_CONFIG,
-                mediaSize.width - 10, cumlMinVol
-            );
-        }
-
-
-        // ══════════════════════════════════════════════════════════════
-        // LAYER 8: ICEBERG DETECTIONS (per-pane toggleable)
-        // Surfaces the backend's 30-field enriched iceberg intelligence.
-        // ══════════════════════════════════════════════════════════════
-
-        if (!_paneOverlay || _paneOverlay.iceberg) {
-            IcebergVisualizer.render(ctx, d, priceConverter, BUBBLE_CONFIG);
-        }
-
-
-        // ══════════════════════════════════════════════════════════════
-        // LAYER 9: SWEEP DETECTIONS (per-pane toggleable, follows iceberg)
-        // Multi-level aggressive fills within 200ms.
-        // ══════════════════════════════════════════════════════════════
-
-        if (!_paneOverlay || _paneOverlay.iceberg) {
-            SweepRenderer.render(ctx, d, priceConverter, BUBBLE_CONFIG);
-        }
-
-
-        // ══════════════════════════════════════════════════════════════
-        // LAYER 10: SPOOF DETECTIONS (pulsing threat rings)
-        // DOM orders appearing and vanishing before fills.
-        // Backend: _detect_spoof() → bar.originalData.spoofs
-        // ⚠ red ring = bid spoof (fake support), blue = ask spoof
-        // ══════════════════════════════════════════════════════════════
-
-        if (window.SpoofRenderer) {
-            SpoofRenderer.render(ctx, d, priceConverter, BUBBLE_CONFIG);
-        }
-
-
-        // ══════════════════════════════════════════════════════════════
-        // LAYER 11: MOMENTUM IGNITION (chevron cascade + ↩ TRAP)
-        // Small-clip monotonic price stepping (algos marking the market).
-        // Backend: _detect_ignition() → bar.originalData.ignition
-        // ↑↑↑ green = up ignition, ↓↓↓ red = down ignition
-        // ↩TRAP = confirmed reversal (failed ignition)
-        // ══════════════════════════════════════════════════════════════
-
-        if (window.IgnitionRenderer) {
-            IgnitionRenderer.render(ctx, d, priceConverter, BUBBLE_CONFIG);
-        }
-
-
-        // ══════════════════════════════════════════════════════════════
-        // LAYER 12: DELTA DIVERGENCE (hidden institutional pressure)
-        // Price makes new high/low but delta diverges — smart money fading.
-        // Backend: _detect_delta_divergence() → bar.originalData.delta_div
-        // ↘DIV red = bearish (price up, delta down = hidden selling)
-        // ↗DIV green = bullish (price down, delta up = hidden buying)
-        // ══════════════════════════════════════════════════════════════
-
-        if (window.DeltaDivergenceLayer) {
-            DeltaDivergenceLayer.render(ctx, d, priceConverter, BUBBLE_CONFIG);
-        }
-
-
-        // ══════════════════════════════════════════════════════════════
-        // LAYER 8.5: EXHAUSTION INDICATORS
-        // Flow-price divergence + Hawkes decay + volume climax.
-        // V2.1 FIX: Was dead code — now wired into pipeline.
-        // ══════════════════════════════════════════════════════════════
-
-        const exhaustedLevels = ExhaustionDetector.getExhaustedLevels(
-            to - 1, hawkesClusters
-        );
-
-        for (const [priceStr, exh] of exhaustedLevels) {
-            const price = parseFloat(priceStr);
-            if (isNaN(price)) continue;
-            const y = priceConverter(price);
-            if (y === null || y === undefined || isNaN(y)) continue;
-
-            // O(1) lookup from _priceBarX map (built in Phase 5 pre-pass).
-            // Eliminates the original O(bars) reverse scan per exhaustion level.
-            const exhX = (_priceBarX && _priceBarX[priceStr]) || null;
-            if (exhX === null) continue;
-
-            // ── Visual: desaturation ring + label ──
-            const isBuyExhaustion = exh.side === 'buy_exhaustion';
-
-            if (exh.tier >= 2) {
-                // Dashed gray ring: radius + alpha clamped — score can exceed 1.0
-                // (ExhaustionDetector intentionally allows > 1.0 on climax tier)
-                // Unclamped: 10 + 1.5 * 4 = 16px radius, alpha 0.40 + 0.60 = 1.0 → visible artifact
-                const _exhScore = Math.min(exh.score, 1.0);
-                ctx.strokeStyle = `rgba(160, 160, 180, ${0.4 + _exhScore * 0.35})`;
-                ctx.lineWidth = 2;
-                ctx.setLineDash([3, 2]);
-                ctx.beginPath();
-                ctx.arc(exhX, y, 10 + _exhScore * 4, 0, Math.PI * 2);
-                ctx.stroke();
-                ctx.setLineDash([]);
-            }
-
-            // Label
-            if (exh.label) {
-                const labelColor = exh.tier >= 3
-                    ? 'rgba(255, 200, 60, 0.95)'   // gold for CLIMAX
-                    : exh.tier >= 2
-                    ? 'rgba(200, 200, 220, 0.85)'   // silver for EXH
-                    : 'rgba(160, 160, 180, 0.6)';   // dim for exh
-
-                ctx.font = exh.tier >= 3
-                    ? 'bold 8px "JetBrains Mono", monospace'
-                    : '7px "JetBrains Mono", monospace';
-                ctx.textAlign = 'center';
-                ctx.textBaseline = 'bottom';
-
-                // Background pill
-                const lbl = exh.label + (isBuyExhaustion ? '↓' : '↑');
-                const bm = ctx.measureText(lbl);
-                ctx.fillStyle = 'rgba(0, 0, 0, 0.65)';
-                ctx.beginPath();
-                ctx.roundRect(exhX - bm.width / 2 - 3, y - 22, bm.width + 6, 13, 3);
-                ctx.fill();
-
-                ctx.fillStyle = labelColor;
-                ctx.fillText(lbl, exhX, y - 10);
-            }
-        }
-
-
-        // ══════════════════════════════════════════════════════════════
-        // Layer 9.5: Hawkes regime indicator badge
-        // Uses backend Kirchner 2017 bivariate Hawkes (spectral radius ρ)
-        // Renders regime badge at chart top-right showing cascade state
-        {
-            const lastBar = d.bars[to - 1];
-            const hawkesState = lastBar && lastBar.originalData ? lastBar.originalData.hawkes : null;
-            if (hawkesState && hawkesState.rho != null) {
-                const rho = hawkesState.rho;
-                const phase = hawkesState.phase || (rho >= 1 ? 'supercritical' : rho >= 0.8 ? 'near_critical' : 'subcritical');
-                const sideDom = hawkesState.side_dominance || '';
-
-                let phaseColor, phaseLabel;
-                if (phase === 'supercritical' || rho >= 1.0) {
-                    phaseColor = 'rgba(255, 60, 60, 0.9)';
-                    phaseLabel = 'CASCADE';
-                } else if (phase === 'near_critical' || rho >= 0.8) {
-                    phaseColor = 'rgba(255, 180, 40, 0.85)';
-                    phaseLabel = 'TRANSITION';
-                } else {
-                    phaseColor = 'rgba(60, 200, 120, 0.7)';
-                    phaseLabel = 'SUBCRIT';
-                }
-
-                const sideArrow = sideDom === 'buy' ? '▲BUY' : sideDom === 'sell' ? '▼SELL' : '';
-
-                // Render badge at top-right of chart area
-                const badgeX = d.bars[to - 1] ? d.bars[to - 1].x - 10 : 100;
-                const badgeY = 20;
-
-                ctx.save();
-                ctx.font = 'bold 10px monospace';
-                const text = `ρ=${rho.toFixed(2)} ${phaseLabel} ${sideArrow}`;
-                const textW = ctx.measureText(text).width;
-
-                // Background pill
-                ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
-                const pad = 4;
-                ctx.beginPath();
-                ctx.roundRect(badgeX - textW - pad * 2, badgeY - 8, textW + pad * 4, 18, 4);
-                ctx.fill();
-
-                // Text
-                ctx.fillStyle = phaseColor;
-                ctx.fillText(text, badgeX - textW / 2 - pad, badgeY + 5);
-                ctx.restore();
-            }
         }
 
         // DIAGNOSTICS — window._v2Debug
@@ -1580,14 +1217,16 @@ VolumeBubbleRenderer.prototype.draw = function(target, priceConverter) {
         };
 
 
-    }); } catch(e) { /* LWC not ready */ } // close useMediaCoordinateSpace
+    }); } catch(e) { console.error('[V3-draw] error:', e); } // close useMediaCoordinateSpace
+
+    // Profiler removed — console.log in draw() causes DevTools repaint lag
 
 };  // close draw()
 
 console.log('[V2.1+Fix1] Integration patch loaded. Patched: VolumeBubbleRenderer.draw()');
 console.log('[V2.1+Fix1] Fix 1: 1.5σ hard floor + Wilson CI (95%) for all directional prints');
 console.log('[V2.1+Fix1] Fix 1: Absorption walls tier≥2 bypass at 1.0σ (direction-agnostic)');
-console.log('[V2.1+Fix1] Modules: Kalman, Hawkes, Absorption, Dominance, Decay, Regression, CumlDelta, Exhaustion, Iceberg, Sweep');
+console.log('[V2.1+Fix1] Modules: Kalman, Hawkes, Absorption, Dominance, Decay, Regression, CumlDelta, Exhaustion, Sweep');
 console.log('[V2.1+Fix1] Diagnostics: window._v2Debug | noise: window._v2Debug.noiseFilter');
 
 })(); // end IIFE

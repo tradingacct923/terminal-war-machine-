@@ -419,3 +419,4 @@ const VolSurfacePane = (() => {
 
     return { init, destroy, onOptionMark, onZoneUpdate };
 })();
+window.VolSurfacePane = VolSurfacePane;

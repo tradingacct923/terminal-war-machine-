@@ -272,7 +272,7 @@ void main() {
 // 2. GPGPU ENGINE
 // ─────────────────────────────────────────────────────────────────────────────
 
-const JACOBI_ITERATIONS = 20;
+const JACOBI_ITERATIONS = 6;  // Reduced from 20 — 6 is sufficient for visual quality, saves 70% GPU
 const GRID_WIDTH = 64;  // Fixed horizontal resolution
 const DISSIPATION_DEFAULT = 0.985; // Fallback when SigmaEngine unavailable
 const SPLAT_RADIUS = 0.02; // UV-space Gaussian radius
@@ -637,15 +637,19 @@ const PressureField = {
         gl.bindTexture(gl.TEXTURE_2D, this._obstacleTex);
         gl.uniform1i(gl.getUniformLocation(prog, 'u_obstacles'), 2);
 
-        // Jacobi iterations: default 20, low-latency override cuts to 10
+        // Jacobi iterations: default 6, low-latency override can cut further
         const iterations = this._jacobiOverride || JACOBI_ITERATIONS;
+        // Cache uniform location (was looked up inside loop = 20 lookups/frame)
+        if (!this._jacobiPressureLoc) {
+            this._jacobiPressureLoc = gl.getUniformLocation(prog, 'u_pressure');
+        }
         let pRead = 0;
         for (let i = 0; i < iterations; i++) {
             const pWrite = 1 - pRead;
 
             gl.activeTexture(gl.TEXTURE0);
             gl.bindTexture(gl.TEXTURE_2D, this._pressureTex[pRead]);
-            gl.uniform1i(gl.getUniformLocation(prog, 'u_pressure'), 0);
+            gl.uniform1i(this._jacobiPressureLoc, 0);
 
             gl.bindFramebuffer(gl.FRAMEBUFFER, this._pressureFB[pWrite]);
             this._drawQuad();
@@ -951,19 +955,17 @@ PressureField.monitorPerformance = function() {
         if (now - startTime >= 1000) {
             const fps = frameCount;
 
-            // Auto-throttle: FPS < 55 → cut Jacobi in half
-            if (fps < 55 && (!self._jacobiOverride || self._jacobiOverride > 10)) {
-                self._jacobiOverride = 10;
+            // Auto-throttle: FPS < 45 → cut Jacobi to 3
+            if (fps < 45 && (!self._jacobiOverride || self._jacobiOverride > 3)) {
+                self._jacobiOverride = 3;
                 self._dissipationOverride = 0.92;
                 self._lowLatencyMode = true;
-                console.warn(`%c ⚠️ AUTO-THROTTLE: FPS=${fps} → Jacobi 20→10`, 'color: #ffaa00; font-weight: bold;');
             }
-            // Auto-restore: FPS ≥ 60 → restore full Navier-Stokes
-            else if (fps >= 60 && self._lowLatencyMode && !self._manualLowLatency) {
+            // Auto-restore: FPS ≥ 58 → restore default (6)
+            else if (fps >= 58 && self._lowLatencyMode && !self._manualLowLatency) {
                 self._jacobiOverride = null;
                 self._dissipationOverride = null;
                 self._lowLatencyMode = false;
-                console.log(`%c ✅ AUTO-RESTORE: FPS=${fps} → Jacobi 10→20 (full fidelity)`, 'color: #00ff00;');
             }
 
             frameCount = 0;
@@ -986,7 +988,7 @@ function startQuantAudit() {
     let lastT = performance.now();
     let frames = 0;
 
-    console.log('%c 🕵️‍♂️ MONITORING MAC MINI GPU IMPACT...', 'color: #00ff00; font-weight: bold;');
+    console.log('%c MONITORING MAC MINI GPU IMPACT...', 'color: #00ff00; font-weight: bold;');
 
     const audit = () => {
         const now = performance.now();
@@ -999,17 +1001,9 @@ function startQuantAudit() {
 
             const statusColor = fps > 58 ? 'color: #00ff00' : 'color: #ff4444';
             const message = fps > 58 ? 'STABLE (Quant Grade)' : 'LAG DETECTED (GPU Throttled)';
-            const mode = PressureField._lowLatencyMode ? '⚡LOW-LAT' : '🎯HI-FI';
+            const mode = PressureField._lowLatencyMode ? 'LOW-LAT' : 'HI-FI';
 
-            console.log(`%c [${new Date().toLocaleTimeString()}] FPS: ${fps} | ${frameTime}ms | ${mode} | Jacobi: ${PressureField._jacobiOverride || 20} | ${message}`, statusColor);
-
-            // Sigma Engine stats
-            if (typeof SigmaEngine !== 'undefined' && SigmaEngine.marketVolatility > 0) {
-                console.log(
-                    `%c   σ=${SigmaEngine.marketVolatility.toFixed(4)} | NoiseGate=${SigmaEngine.noiseFloor.toFixed(2)} | InstThresh=${SigmaEngine.instThreshold.toFixed(1)} | Samples=${SigmaEngine._tradeVols.length}`,
-                    'color: #888'
-                );
-            }
+            // Console logging removed — causes DevTools repaint lag when open
 
             frames = 0;
             lastT = now;
@@ -1042,13 +1036,13 @@ function setLowLatencyMode(active = true) {
         PressureField._manualLowLatency = true;   // Prevent auto-restore
         PressureField._jacobiOverride = 10;
         PressureField._dissipationOverride = 0.92;
-        console.warn('%c ⚠️ LOW LATENCY MODE ACTIVE: Physics simplified for speed.', 'color: #ffaa00; font-weight: bold;');
+        console.warn('%c [WARN] LOW LATENCY MODE ACTIVE: Physics simplified for speed.', 'color: #ffaa00; font-weight: bold;');
     } else {
         PressureField._lowLatencyMode = false;
         PressureField._manualLowLatency = false;
         PressureField._jacobiOverride = null;
         PressureField._dissipationOverride = null;
-        console.log('%c ✅ HIGH FIDELITY MODE: Full Navier-Stokes active.', 'color: #00ff00; font-weight: bold;');
+        console.log('%c [OK] HIGH FIDELITY MODE: Full Navier-Stokes active.', 'color: #00ff00; font-weight: bold;');
     }
 }
 

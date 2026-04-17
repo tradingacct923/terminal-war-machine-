@@ -23,6 +23,8 @@
 const _ladderMemory = {};    // { priceKey: { size, ts } }
 const _ladderFlash = {};     // { priceKey: { type:'pull'|'stack', ts, delta } }
 const FLASH_DURATION = 800;  // ms to show flash
+const MEMORY_TTL = 30000;    // evict stale prices after 30s
+let _lastMemoryGC = 0;
 
 // ── Cumulative delta — running aggression tracker ──
 let _cumulativeDelta = 0;
@@ -185,6 +187,23 @@ function renderDepthLadder(canvas, priceToY, domData, midPrice) {
         _ladderMemory[pKey] = { size: currentSize, ts: now };
     }
 
+    // ── GC: evict stale prices every 5s + hard cap ──
+    if (now - _lastMemoryGC > 5000) {
+        _lastMemoryGC = now;
+        for (const k in _ladderMemory) {
+            if (now - _ladderMemory[k].ts > MEMORY_TTL) delete _ladderMemory[k];
+        }
+        for (const k in _ladderFlash) {
+            if (now - _ladderFlash[k].ts > FLASH_DURATION + 1000) delete _ladderFlash[k];
+        }
+        // Hard cap: evict oldest entries when exceeding 200 keys (prevents unbounded growth during market spikes)
+        const memKeys = Object.keys(_ladderMemory);
+        if (memKeys.length > 200) {
+            memKeys.sort((a, b) => _ladderMemory[a].ts - _ladderMemory[b].ts);
+            for (let i = 0; i < memKeys.length - 150; i++) delete _ladderMemory[memKeys[i]];
+        }
+    }
+
     // ── Draw each price level ──
     for (const price of visiblePrices) {
         const y = ladderToY(price);
@@ -271,12 +290,9 @@ function renderDepthLadder(canvas, priceToY, domData, midPrice) {
             ctx.fillStyle = cpGrad;
             ctx.fillRect(0, rowTop, cssW, ROW_H);
 
-            ctx.shadowColor = 'rgba(255, 220, 50, 0.25)';
-            ctx.shadowBlur = 8;
-            ctx.strokeStyle = 'rgba(255, 220, 50, 0.4)';
-            ctx.lineWidth = 1;
+            ctx.strokeStyle = 'rgba(255, 220, 50, 0.5)';
+            ctx.lineWidth = 1.5;
             ctx.strokeRect(1, rowTop + 0.5, cssW - 2, ROW_H - 1);
-            ctx.shadowBlur = 0;
         } else if (isBestBid) {
             ctx.fillStyle = 'rgba(0, 230, 120, 0.06)';
             ctx.fillRect(0, rowTop, cssW, ROW_H);
@@ -307,11 +323,9 @@ function renderDepthLadder(canvas, priceToY, domData, midPrice) {
             const barTop = rowTop + 1.5;
             const barH = ROW_H - 3;
 
-            const bidGrad = ctx.createLinearGradient(barX, 0, bidBarRight, 0);
+            // Solid fill instead of per-row gradient (perf: eliminates 40+ gradient creations/frame)
             const intensity = 0.3 + norm * 0.5;
-            bidGrad.addColorStop(0, `rgba(0, 232, 123, ${(intensity * 0.4).toFixed(2)})`);
-            bidGrad.addColorStop(1, `rgba(0, 232, 123, ${intensity.toFixed(2)})`);
-            ctx.fillStyle = bidGrad;
+            ctx.fillStyle = `rgba(0, 232, 123, ${(intensity * 0.7).toFixed(2)})`;
 
             const r = Math.min(3, barH / 2);
             ctx.beginPath();
@@ -324,28 +338,17 @@ function renderDepthLadder(canvas, priceToY, domData, midPrice) {
             ctx.arcTo(barX, barTop, barX + r, barTop, r);
             ctx.fill();
 
-            if (norm > 0.6) {
-                ctx.shadowColor = 'rgba(0, 232, 123, 0.3)';
-                ctx.shadowBlur = 6;
-                ctx.fill();
-                ctx.shadowBlur = 0;
-            }
-
-            // ═══ ENGINE 1: Queue Dynamics — bid bar glow ═══
+            // Queue dynamics: use brighter fill instead of shadowBlur (GPU-heavy)
             const qdData = window._queueDynamics || {};
-            const qdBid = qdData[pKey2];  // backend keys are always .toFixed(2) format
+            const qdBid = qdData[pKey2];
             if (qdBid && qdBid.ratio != null) {
                 const qr = qdBid.ratio;
                 if (qr > 1.2) {
-                    ctx.shadowColor = `rgba(0,255,180,${Math.min((qr-1)*0.15, 0.35).toFixed(2)})`;
-                    ctx.shadowBlur = 4 + Math.min((qr - 1) * 3, 8);
+                    ctx.fillStyle = `rgba(0,255,180,${Math.min((qr-1)*0.08, 0.18).toFixed(2)})`;
                     ctx.fill();
-                    ctx.shadowBlur = 0;
                 } else if (qr < 0.8) {
-                    ctx.shadowColor = `rgba(255,80,60,${Math.min((1-qr)*0.15, 0.35).toFixed(2)})`;
-                    ctx.shadowBlur = 4 + Math.min((1 - qr) * 3, 8);
+                    ctx.fillStyle = `rgba(255,80,60,${Math.min((1-qr)*0.08, 0.18).toFixed(2)})`;
                     ctx.fill();
-                    ctx.shadowBlur = 0;
                 }
             }
 
@@ -372,11 +375,9 @@ function renderDepthLadder(canvas, priceToY, domData, midPrice) {
             const barTop = rowTop + 1.5;
             const barH = ROW_H - 3;
 
-            const askGrad = ctx.createLinearGradient(barX, 0, barX + barW, 0);
+            // Solid fill instead of per-row gradient (perf: eliminates 40+ gradient creations/frame)
             const intensity = 0.3 + norm * 0.5;
-            askGrad.addColorStop(0, `rgba(255, 59, 92, ${intensity.toFixed(2)})`);
-            askGrad.addColorStop(1, `rgba(255, 59, 92, ${(intensity * 0.4).toFixed(2)})`);
-            ctx.fillStyle = askGrad;
+            ctx.fillStyle = `rgba(255, 59, 92, ${(intensity * 0.7).toFixed(2)})`;
 
             const r = Math.min(3, barH / 2);
             ctx.beginPath();
@@ -388,27 +389,16 @@ function renderDepthLadder(canvas, priceToY, domData, midPrice) {
             ctx.lineTo(barX, barTop + barH);
             ctx.fill();
 
-            if (norm > 0.6) {
-                ctx.shadowColor = 'rgba(255, 59, 92, 0.3)';
-                ctx.shadowBlur = 6;
-                ctx.fill();
-                ctx.shadowBlur = 0;
-            }
-
-            // ═══ ENGINE 1: Queue Dynamics — ask bar glow ═══
-            const qdAsk = (window._queueDynamics || {})[pKey2];  // backend keys are always .toFixed(2) format
+            // Queue dynamics: brighter fill instead of shadowBlur (GPU-heavy)
+            const qdAsk = (window._queueDynamics || {})[pKey2];
             if (qdAsk && qdAsk.ratio != null) {
                 const qra = qdAsk.ratio;
                 if (qra > 1.2) {
-                    ctx.shadowColor = `rgba(0,255,180,${Math.min((qra-1)*0.15, 0.35).toFixed(2)})`;
-                    ctx.shadowBlur = 4 + Math.min((qra - 1) * 3, 8);
+                    ctx.fillStyle = `rgba(0,255,180,${Math.min((qra-1)*0.08, 0.18).toFixed(2)})`;
                     ctx.fill();
-                    ctx.shadowBlur = 0;
                 } else if (qra < 0.8) {
-                    ctx.shadowColor = `rgba(255,80,60,${Math.min((1-qra)*0.15, 0.35).toFixed(2)})`;
-                    ctx.shadowBlur = 4 + Math.min((1 - qra) * 3, 8);
+                    ctx.fillStyle = `rgba(255,80,60,${Math.min((1-qra)*0.08, 0.18).toFixed(2)})`;
                     ctx.fill();
-                    ctx.shadowBlur = 0;
                 }
             }
 

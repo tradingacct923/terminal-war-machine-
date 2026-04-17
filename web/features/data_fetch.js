@@ -6,6 +6,43 @@
     let _currentSymbol = 'NQ';
     let _currentTf = '1m';
 
+    // ── Performance: throttle helper ──
+    // During scroll: queue data but DON'T process until scroll stops.
+    // This keeps the main thread free for LWC's own candle rendering.
+    const _rafQueue = {};
+    function _throttleRAF(key, fn) {
+        return function(data) {
+            _rafQueue[key] = data;
+            if (_rafQueue[key + '_scheduled']) return;
+            _rafQueue[key + '_scheduled'] = true;
+            requestAnimationFrame(() => {
+                _rafQueue[key + '_scheduled'] = false;
+                const d = _rafQueue[key];
+                if (d !== undefined) fn(d);
+            });
+        };
+    }
+    // Throttle by interval (ms) — for events that don't need 60fps
+    function _throttleMs(fn, ms) {
+        let last = 0, queued = null, tid = 0;
+        return function(data) {
+            const now = performance.now();
+            if (now - last >= ms) {
+                last = now;
+                fn(data);
+            } else {
+                queued = data;
+                if (!tid) {
+                    tid = setTimeout(() => {
+                        tid = 0;
+                        last = performance.now();
+                        if (queued !== null) { fn(queued); queued = null; }
+                    }, ms - (now - last));
+                }
+            }
+        };
+    }
+
     window.authFetch = function(url, opts = {}) {
         const tok = sessionStorage.getItem('greeks-auth');
         if (tok) {
@@ -42,15 +79,53 @@
                 if (typeof AltarisToast !== 'undefined') AltarisToast.warn('Data stream disconnected — reconnecting…');
             });
 
+            // Candle OHLCV updates: NO throttle — price accuracy matches DOM speed
+            let _candleLatencySum = 0, _candleLatencyCount = 0;
             window._sio.on('candle_update', (data) => {
+                // Server only sends active tf — pass through directly
                 if (window.AltarisEvents) {
                     window.AltarisEvents.emit('data:candles:update', data);
                 }
             });
 
-            window._sio.on('trade_tick', (data) => {
+            // Candle enriched data (bp, signals, depth) at 5Hz — heavier payload
+            window._sio.on('candle_enriched', (data) => {
                 if (window.AltarisEvents) {
-                    window.AltarisEvents.emit('data:trades:update', data);
+                    window.AltarisEvents.emit('data:candles:enriched', data);
+                }
+            });
+
+            // Trade ticks: batched to 50ms (20Hz) — reduces 100+ events/sec to 20 batched emits
+            let _tradeLatencySum = 0, _tradeLatencyCount = 0;
+            let _tradeBatch = [];
+            let _tradeBatchTimer = 0;
+            function _flushTradeBatch() {
+                _tradeBatchTimer = 0;
+                if (_tradeBatch.length === 0) return;
+                const batch = _tradeBatch;
+                _tradeBatch = [];
+                if (window.AltarisEvents) {
+                    // Emit last trade for price display (most recent = most relevant)
+                    window.AltarisEvents.emit('data:trades:update', batch[batch.length - 1]);
+                    // Emit full batch for tape/pressure/kinetic that want all trades
+                    window.AltarisEvents.emit('data:trades:batch', batch);
+                }
+            }
+            window._sio.on('trade_tick', (data) => {
+                // Measure end-to-end latency (Python emit → JS receive)
+                if (data._emit_ts) {
+                    const latMs = (Date.now() / 1000 - data._emit_ts) * 1000;
+                    _tradeLatencySum += latMs;
+                    _tradeLatencyCount++;
+                    if (_tradeLatencyCount % 100 === 0) {
+                        const avg = (_tradeLatencySum / _tradeLatencyCount).toFixed(0);
+                        console.log(`[LATENCY] trade_tick avg: ${avg}ms over ${_tradeLatencyCount} trades`);
+                        _tradeLatencySum = 0; _tradeLatencyCount = 0;
+                    }
+                }
+                _tradeBatch.push(data);
+                if (!_tradeBatchTimer) {
+                    _tradeBatchTimer = setTimeout(_flushTradeBatch, 50);
                 }
             });
 
@@ -80,11 +155,12 @@
             });
 
             // ── spot_update: Live NQ/QQQ/SPY/VIX spot price from Schwab streamer ──
-            window._sio.on('spot_update', (data) => {
+            // Throttle to 100ms (10Hz) — spot prices don't need 60fps updates
+            window._sio.on('spot_update', _throttleMs((data) => {
                 if (window.AltarisEvents) {
                     window.AltarisEvents.emit('data:spot:update', data);
                 }
-            });
+            }, 100));
 
             // ── edge_signal: Cross-asset conviction signals from EdgeDetector ──
             window._sio.on('edge_signal', (data) => {
@@ -94,11 +170,12 @@
             });
 
             // ── eq_book_update: QQQ NASDAQ L2 book depth from Schwab ──
-            window._sio.on('eq_book_update', (data) => {
+            // Throttle to rAF — book depth visualization doesn't need >60fps
+            window._sio.on('eq_book_update', _throttleRAF('eqbook', (data) => {
                 if (window.AltarisEvents) {
                     window.AltarisEvents.emit('data:eqbook:update', data);
                 }
-            });
+            }));
 
             // ── screener_option_update: Unusual options activity from Schwab screener ──
             window._sio.on('screener_option_update', (data) => {
@@ -122,15 +199,17 @@
             });
 
             // ── equity_tape: Venue-tagged equity trades (MIC routing) ──
-            window._sio.on('equity_tape', (data) => {
+            // Throttle to 50ms — tape rows batch better than 1-by-1
+            window._sio.on('equity_tape', _throttleMs((data) => {
                 if (typeof EquityTapePane !== 'undefined') EquityTapePane.onTick(data);
-            });
+            }, 50));
 
             // ── option_mark_update: Live options mark/IV/Greeks per contract ──
-            window._sio.on('option_mark_update', (data) => {
+            // Throttle to 50ms — Greeks don't change faster than this meaningfully
+            window._sio.on('option_mark_update', _throttleMs((data) => {
                 if (typeof OptionsFlowPane !== 'undefined') OptionsFlowPane.onOptionMark(data);
                 if (typeof VolSurfacePane !== 'undefined') VolSurfacePane.onOptionMark(data);
-            });
+            }, 50));
 
             // ── dealer_session_flow: Dealer hedge session stats ──
             window._sio.on('dealer_session_flow', (data) => {
@@ -144,7 +223,8 @@
                 }
             });
 
-            // ── l2_update: Full L2 state push (replaces REST /api/l2 poll) ──
+            // ── l2_update: Full L2 state push — NO scroll gate ──
+            // L2 order book must always update immediately. Market makers need real-time DOM.
             window._sio.on('l2_update', (data) => {
                 if (window.AltarisEvents) {
                     window.AltarisEvents.emit('data:l2:update', data);

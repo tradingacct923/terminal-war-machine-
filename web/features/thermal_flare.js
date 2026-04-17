@@ -46,8 +46,16 @@
     }
 
     // ── Core Render ────────────────────────────────────────────────────────────
+    let _renderScheduled = false;
+    function _scheduleRender() {
+        if (_renderScheduled) return;
+        _renderScheduled = true;
+        requestAnimationFrame(() => { _renderScheduled = false; _render(); });
+    }
+
     function _render() {
         if (!_visible || !_data.length) return;
+        if (window._chartScrolling) return; // skip during scroll
 
         // Render flares on ALL active instances (per-pane toggleable)
         for (const inst of _instances) {
@@ -65,16 +73,19 @@
 
             inst.ctx.clearRect(0, 0, width, height);
 
-            // Measure price axis width from DOM
-            let priceScaleWidth = 0;
-            try {
-                if (inst.container) {
-                    const tds = inst.container.querySelectorAll('tr:first-child > td');
-                    if (tds.length > 1) priceScaleWidth = tds[tds.length - 1].offsetWidth || 55;
-                    else priceScaleWidth = 55;
-                }
-            } catch(e) { priceScaleWidth = 55; }
-            const rightEdge = width - priceScaleWidth;
+            // Use cached price scale width (measured once, not per frame)
+            // Re-measure every 2 seconds at most to handle resize
+            const now = performance.now();
+            if (!inst._psWidth || now - (inst._psWidthTs || 0) > 2000) {
+                try {
+                    if (inst.container) {
+                        const tds = inst.container.querySelectorAll('tr:first-child > td');
+                        inst._psWidth = tds.length > 1 ? (tds[tds.length - 1].offsetWidth || 55) : 55;
+                    } else { inst._psWidth = 55; }
+                } catch(e) { inst._psWidth = 55; }
+                inst._psWidthTs = now;
+            }
+            const rightEdge = width - inst._psWidth;
 
             // Find z-score range for normalization
             const zValues = _data.map(d => d.z || 0).filter(z => z >= _threshold);
@@ -110,13 +121,23 @@
                     gradient.addColorStop(1, 'rgba(0, 200, 80, 0.0)');
                 }
 
+                // Outer glow: thicker stroke with lower alpha (no GPU filter)
                 inst.ctx.beginPath();
                 inst.ctx.moveTo(rightEdge, y);
                 inst.ctx.lineTo(rightEdge - flareLength, y);
-                inst.ctx.lineWidth = thickness;
+                inst.ctx.lineWidth = thickness + t * 8;
                 inst.ctx.lineCap = 'round';
                 inst.ctx.strokeStyle = gradient;
-                inst.ctx.filter = `blur(${Math.round(1 + t * 5)}px)`;
+                inst.ctx.globalAlpha = 0.4 + t * 0.3;
+                inst.ctx.stroke();
+                inst.ctx.globalAlpha = 1;
+
+                // Core line: sharp bright center
+                inst.ctx.beginPath();
+                inst.ctx.moveTo(rightEdge, y);
+                inst.ctx.lineTo(rightEdge - flareLength, y);
+                inst.ctx.lineWidth = thickness * 0.5;
+                inst.ctx.strokeStyle = gradient;
                 inst.ctx.stroke();
 
                 const coreR = isResistance ? 255 : (200 + Math.round(t * 55));
@@ -126,12 +147,10 @@
                 inst.ctx.moveTo(rightEdge, y);
                 inst.ctx.lineTo(rightEdge - (flareLength * t), y);
                 inst.ctx.lineWidth = 1 + t * 2;
-                inst.ctx.filter = 'none';
                 inst.ctx.strokeStyle = `rgba(${coreR}, ${coreG}, ${coreB}, ${alpha})`;
                 inst.ctx.stroke();
                 rendered++;
             }
-            inst.ctx.filter = 'none';
             if (rendered === 0 && window.location.port !== '3000') {
                // Silence spam but keep it in mind
             }
@@ -153,7 +172,7 @@
             mockData.push({ price, dex, gex: dex * 0.1, z });
         }
         _data = mockData;
-        requestAnimationFrame(_render);
+        _scheduleRender();
         console.log('[ThermalFlare] Debug data injected:', mockData);
     }
 
@@ -179,7 +198,7 @@
         pnl.style.boxShadow = '0 8px 24px rgba(0,0,0,0.5)';
         pnl.style.minWidth = '220px';
         pnl.innerHTML = `
-            <div style="font-weight:600;margin-bottom:12px;font-size:13px;color:#aab">🔥 Thermal Flare Settings</div>
+            <div style="font-weight:600;margin-bottom:12px;font-size:13px;color:#aab">Thermal Flare</div>
             <label style="display:flex;align-items:center;gap:8px;font-size:12px;margin-bottom:10px;cursor:pointer">
                 <input type="checkbox" id="tf-toggle-chk" ${_visible ? 'checked' : ''}> Enable Heatmap
             </label>
@@ -203,17 +222,17 @@
                     if (inst.ctx) inst.ctx.clearRect(0, 0, inst.canvas.width / dpr, inst.canvas.height / dpr);
                 }
             }
-            requestAnimationFrame(_render);
+            _scheduleRender();
         });
         document.getElementById('tf-sens-range').addEventListener('input', (ev) => {
             _sensitivity = parseFloat(ev.target.value);
             document.getElementById('tf-sens-val').textContent = _sensitivity.toFixed(1) + 'x';
-            requestAnimationFrame(_render);
+            _scheduleRender();
         });
         document.getElementById('tf-thresh-range').addEventListener('input', (ev) => {
             _threshold = parseFloat(ev.target.value);
             document.getElementById('tf-thresh-val').textContent = _threshold.toFixed(1) + 'σ';
-            requestAnimationFrame(_render);
+            _scheduleRender();
         });
 
         const settingsBtn = document.getElementById('tf-settings-btn');
@@ -251,13 +270,13 @@
             // Subscribe so flares re-render on every scroll/zoom
             if (chart && chart.timeScale) {
                 chart.timeScale().subscribeVisibleLogicalRangeChange(() => {
-                    requestAnimationFrame(_render);
+                    _scheduleRender();
                 });
             }
         });
 
         // Re-render on generic chart pan / zoom event
-        AltarisEvents.on('chart:scroll', () => requestAnimationFrame(_render));
+        AltarisEvents.on('chart:scroll', () => _scheduleRender());
 
         // CRITICAL FIX: Only resize the instance that matches the resized container!
         AltarisEvents.on('chart:resize', ({ width, height, container }) => {
@@ -268,7 +287,7 @@
                 inst.canvas.height = height * dpr;
                 inst.ctx = inst.canvas.getContext('2d');
                 inst.ctx.scale(dpr, dpr);
-                requestAnimationFrame(_render);
+                _scheduleRender();
             }
         });
     }
@@ -296,7 +315,7 @@
 
         updateData(dexProfile) {
             _data = dexProfile;
-            requestAnimationFrame(_render);
+            _scheduleRender();
         },
 
         render() { _render(); },

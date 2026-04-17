@@ -36,13 +36,12 @@ class SchwabAuth:
             print(f"[AUTH] Loaded saved tokens. Refreshing...")
             try:
                 self._refresh()
-                print(f"[AUTH] ✅ Token refreshed successfully")
+                print(f"[AUTH] Token refreshed successfully")
                 self._start_auto_refresh()
             except Exception as e:
-                print(f"[AUTH] ⚠️  Refresh failed ({e}). Need new authorization.")
-                self._prompt_authorization()
+                print(f"[AUTH] Refresh failed ({e}). Schwab unavailable — NQ-only mode.")
         else:
-            self._prompt_authorization()
+            print(f"[AUTH] No saved tokens. Schwab unavailable — run schwab_login.py to authorize.")
 
     def _get_auth_header(self):
         """Base64 encoded app_key:app_secret for token requests"""

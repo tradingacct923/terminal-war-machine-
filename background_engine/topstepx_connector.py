@@ -256,7 +256,7 @@ class TopStepXConnector:
     def start(self, symbols: list[str] = None):
         """Connect and start streaming. Runs in a background thread."""
         if symbols is None:
-            symbols = ["NQ", "GC"]
+            symbols = ["NQ"]
 
         self.authenticate()
         contract_ids = self._resolve_contracts(symbols)

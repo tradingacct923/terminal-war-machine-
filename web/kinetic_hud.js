@@ -197,7 +197,7 @@ function _initPhysicsHUD() {
 
     hud.innerHTML = `
         <div class="kh-header" id="kh-drag-handle">
-            <span class="kh-title">⚡ PHYSICS</span>
+            <span class="kh-title">PHYSICS</span>
             <div class="kh-header-right">
                 <select class="kh-preset" id="kh-preset">
                     <option value="default">Default</option>
@@ -284,7 +284,7 @@ function _addToolbarButton() {
     btn.id = 't-physics-btn';
     btn.className = 't-settings-btn';
     btn.title = 'Physics Settings';
-    btn.textContent = '⚡';
+    btn.textContent = 'P';
     btn.style.marginRight = '4px';
 
     btn.addEventListener('click', () => {

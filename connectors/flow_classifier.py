@@ -5,11 +5,10 @@ Uses Level 2 book data from the Schwab WebSocket streamer to classify
 order flow as likely institutional or retail based on:
 
 1. Size Analysis — odd lots vs round lots
-2. Iceberg Detection — size replenishing at the same price level
-3. Multi-Exchange Resting — institutional algo splitting across venues
-4. Book Pressure — which side is getting absorbed
-5. Sweep Detection — aggressive multilevel hitting
-6. Quote Stuffing — rapid add/cancel patterns
+2. Multi-Exchange Resting — institutional algo splitting across venues
+3. Book Pressure — which side is getting absorbed
+4. Sweep Detection — aggressive multilevel hitting
+5. Quote Stuffing — rapid add/cancel patterns
 
 Outputs a flow score from 0 (retail) to 100 (institutional) per symbol.
 
@@ -44,10 +43,6 @@ BLOCK_SIZE = 200              # >= 200 contracts = block trade
 INSTITUTIONAL_VENUES = {'CBOE', 'PHLX', 'MIAX', 'ISEX', 'AMEX', 'NYSE'}
 RETAIL_PFOF_VENUES = {'EDGX', 'NSDQ', 'MEMX'}  # Common PFOF destinations
 
-# Iceberg detection
-ICEBERG_REPLENISH_WINDOW = 5.0     # seconds to detect replenishment
-ICEBERG_MIN_REPLENISH_COUNT = 3    # minimum replenish events to flag
-
 # Rolling window for analysis
 HISTORY_WINDOW = 300  # 5 minutes of history
 
@@ -73,22 +68,13 @@ class FlowClassifier:
 
             # Size distribution tracking
             'size_history': deque(maxlen=500),     # (timestamp, side, size, venue, price)
-            'book_snapshots': deque(maxlen=100),   # full book snapshots for iceberg detection
-
-            # Iceberg tracking per price level
-            'iceberg_tracker': defaultdict(lambda: {
-                'replenish_count': 0,
-                'last_size': 0,
-                'last_time': 0,
-                'total_replenished': 0,
-            }),
+            'book_snapshots': deque(maxlen=100),
 
             # Sweep detection
             'sweep_events': deque(maxlen=50),
 
             # Aggregated scores
             'size_score': 50,          # 0=retail, 100=institutional
-            'iceberg_score': 50,
             'venue_score': 50,
             'pressure_score': 50,      # 0=selling pressure, 100=buying pressure
             'sweep_score': 50,
@@ -98,7 +84,6 @@ class FlowClassifier:
             'total_updates': 0,
             'institutional_events': 0,
             'retail_events': 0,
-            'iceberg_detections': 0,
             'sweep_detections': 0,
 
             # Volume tracking
@@ -145,7 +130,6 @@ class FlowClassifier:
 
             # Run all analysis
             self._analyze_size_distribution(symbol, book_data, now)
-            self._analyze_iceberg(symbol, now)
             self._analyze_venue_routing(symbol, book_data, now)
             self._analyze_book_pressure(symbol, book_data, now)
             self._detect_sweeps(symbol, now)
@@ -197,48 +181,6 @@ class FlowClassifier:
 
         d['retail_events'] += retail_count
         d['institutional_events'] += institutional_count
-
-    def _analyze_iceberg(self, symbol, now):
-        """
-        Detect iceberg orders — size that keeps replenishing at the same price.
-        Institutional traders hide large orders behind small displayed quantities.
-        """
-        d = self._data[symbol]
-        prev = d['prev_book']
-        curr = d['curr_book']
-
-        if not prev or not curr:
-            return
-
-        # Check each side
-        for side in ['bids', 'asks']:
-            prev_levels = {l.get('price', 0): l.get('size', 0)
-                          for l in (prev.get(side) or []) if l.get('price', 0) > 0}
-            curr_levels = {l.get('price', 0): l.get('size', 0)
-                          for l in (curr.get(side) or []) if l.get('price', 0) > 0}
-
-            for price in curr_levels:
-                curr_size = curr_levels[price]
-                prev_size = prev_levels.get(price, 0)
-
-                tracker = d['iceberg_tracker'][price]
-
-                # Size decreased then came back — replenishment!
-                if prev_size > 0 and curr_size >= prev_size * 0.8 and prev_size < tracker.get('last_size', 0) * 0.5:
-                    if now - tracker['last_time'] < ICEBERG_REPLENISH_WINDOW:
-                        tracker['replenish_count'] += 1
-                        tracker['total_replenished'] += curr_size
-
-                        if tracker['replenish_count'] >= ICEBERG_MIN_REPLENISH_COUNT:
-                            d['iceberg_detections'] += 1
-
-                tracker['last_size'] = curr_size
-                tracker['last_time'] = now
-
-        # Score based on iceberg detections
-        if d['total_updates'] > 10:
-            iceberg_ratio = d['iceberg_detections'] / max(d['total_updates'] / 10, 1)
-            d['iceberg_score'] = min(100, 50 + iceberg_ratio * 50)
 
     def _analyze_venue_routing(self, symbol, book_data, now):
         """
@@ -327,12 +269,11 @@ class FlowClassifier:
 
         # Weighted combination
         d['overall_score'] = (
-            d['size_score'] * 0.35 +           # Size is strongest signal
-            d['venue_score'] * 0.20 +           # Venue routing
-            d['iceberg_score'] * 0.20 +         # Iceberg behavior
-            d['sweep_score'] * 0.15 +           # Sweep activity
+            d['size_score'] * 0.50 +           # Size is strongest signal
+            d['venue_score'] * 0.25 +           # Venue routing
+            d['sweep_score'] * 0.25 +           # Sweep activity
             d['pressure_score'] * 0.10 * 0      # Pressure is directional, not inst/retail
-        ) / (0.35 + 0.20 + 0.20 + 0.15)
+        ) / (0.50 + 0.25 + 0.25)
 
     # ─── PUBLIC API ─────────────────────────────────────
 
@@ -343,10 +284,10 @@ class FlowClassifier:
         Returns dict with:
             overall_score: 0-100 (0=retail, 100=institutional)
             classification: 'RETAIL', 'MIXED', 'INSTITUTIONAL'
-            size_score, venue_score, iceberg_score, sweep_score, pressure_score
+            size_score, venue_score, sweep_score, pressure_score
             bid_volume, ask_volume, net_delta
             institutional_events, retail_events
-            iceberg_detections, sweep_detections
+            sweep_detections
         """
         with self._lock:
             d = self._data[symbol]
@@ -365,7 +306,6 @@ class FlowClassifier:
                 'classification': classification,
                 'size_score': round(d['size_score'], 1),
                 'venue_score': round(d['venue_score'], 1),
-                'iceberg_score': round(d['iceberg_score'], 1),
                 'sweep_score': round(d['sweep_score'], 1),
                 'pressure_score': round(d['pressure_score'], 1),
                 'pressure_direction': 'BUYING' if d['pressure_score'] > 55 else ('SELLING' if d['pressure_score'] < 45 else 'NEUTRAL'),
@@ -375,7 +315,6 @@ class FlowClassifier:
                 'total_updates': d['total_updates'],
                 'institutional_events': d['institutional_events'],
                 'retail_events': d['retail_events'],
-                'iceberg_detections': d['iceberg_detections'],
                 'sweep_detections': d['sweep_detections'],
                 'recent_sweeps': [
                     {'type': t, 'time': datetime.fromtimestamp(ts).strftime('%H:%M:%S'), 'levels': lvl}
@@ -433,7 +372,6 @@ def format_flow_report(report):
     lines.append(f"  Component Scores:")
     lines.append(f"    Size:     {_score_bar(report['size_score'])}  {report['size_score']:.0f}")
     lines.append(f"    Venue:    {_score_bar(report['venue_score'])}  {report['venue_score']:.0f}")
-    lines.append(f"    Iceberg:  {_score_bar(report['iceberg_score'])}  {report['iceberg_score']:.0f}")
     lines.append(f"    Sweep:    {_score_bar(report['sweep_score'])}  {report['sweep_score']:.0f}")
 
     lines.append(f"\n  Book Pressure: {report['pressure_direction']}")
@@ -442,7 +380,6 @@ def format_flow_report(report):
     lines.append(f"\n  Event Counts ({report['total_updates']} updates):")
     lines.append(f"    Institutional-size events: {report['institutional_events']:,}")
     lines.append(f"    Retail-size events:        {report['retail_events']:,}")
-    lines.append(f"    Iceberg detections:        {report['iceberg_detections']}")
     lines.append(f"    Sweep detections:          {report['sweep_detections']}")
 
     if report.get('recent_sweeps'):
@@ -466,7 +403,7 @@ def format_flow_summary(reports):
     lines.append(f"  ORDER FLOW CLASSIFICATION SUMMARY")
     lines.append(f"  {datetime.now().strftime('%H:%M:%S ET')}")
     lines.append(f"{'═' * 70}")
-    lines.append(f"  {'Symbol':<12s} {'Score':>5s}  {'Class':<15s} {'Size':>5s} {'Venue':>5s} {'Ice':>5s} {'Sweep':>5s} {'Pressure':<8s}")
+    lines.append(f"  {'Symbol':<12s} {'Score':>5s}  {'Class':<15s} {'Size':>5s} {'Venue':>5s} {'Sweep':>5s} {'Pressure':<8s}")
     lines.append(f"  {'─' * 65}")
 
     for r in sorted(reports.values(), key=lambda x: x['overall_score'], reverse=True):
@@ -474,7 +411,7 @@ def format_flow_summary(reports):
         lines.append(
             f"  {sym:<12s} {r['overall_score']:>5.0f}  {r['classification']:<15s} "
             f"{r['size_score']:>5.0f} {r['venue_score']:>5.0f} "
-            f"{r['iceberg_score']:>5.0f} {r['sweep_score']:>5.0f} "
+            f"{r['sweep_score']:>5.0f} "
             f"{r['pressure_direction']:<8s}"
         )
 

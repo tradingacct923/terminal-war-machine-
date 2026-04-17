@@ -1025,7 +1025,7 @@ const CumlDeltaRenderer = {
      * @param {number} cumlMinVol - minimum cumulative volume to display
      */
     render(ctx, cumlDelta, priceConverter, config, chartRightEdge, cumlMinVol) {
-        if (!config.CUML_DELTA_ENABLED) return;
+        return; // Disabled — cumulative delta sidebar removed
 
         const entries = Object.entries(cumlDelta);
         if (entries.length === 0) return;
@@ -1068,22 +1068,18 @@ const CumlDeltaRenderer = {
             const barX = leftMargin;
             const barY = y - barH / 2;
 
-            // ── Glow for large bars ──
-            if (normWidth / barMaxW > glowThreshold) {
-                ctx.shadowColor = `rgba(${rgb}, 0.4)`;
-                ctx.shadowBlur = 6;
-            }
+            // ── Glow for large bars (brighter fill instead of GPU-expensive shadowBlur) ──
+            const isGlow = normWidth / barMaxW > glowThreshold;
+            const glowBoost = isGlow ? 0.15 : 0;
 
             // ── Fill bar ──
-            ctx.fillStyle = `rgba(${rgb}, ${barAlpha})`;
+            ctx.fillStyle = `rgba(${rgb}, ${Math.min(1, barAlpha + glowBoost)})`;
             ctx.fillRect(barX, barY, normWidth, barH);
 
             // ── Border ──
-            ctx.strokeStyle = `rgba(${rgb}, ${barAlpha + 0.2})`;
-            ctx.lineWidth = 0.5;
+            ctx.strokeStyle = `rgba(${rgb}, ${Math.min(1, barAlpha + 0.2 + glowBoost)})`;
+            ctx.lineWidth = isGlow ? 1 : 0.5;
             ctx.strokeRect(barX, barY, normWidth, barH);
-
-            ctx.shadowBlur = 0;
 
             // ── Label for significant bars ──
             if (normWidth > barMaxW * 0.3) {
@@ -1499,8 +1495,34 @@ const AbsorptionZoneDetector = {
         }
         if (run.length >= 2) zones.push(this._buildZone(run));
 
-        this._zones = zones;
-        return zones;
+        // ── Statistical filtering: only keep structurally dominant zones ──
+        // Instead of hardcoded thresholds, use the distribution of zone scores
+        // to determine which zones are significant. Same principle as KDE prominence.
+        if (zones.length >= 3) {
+            const scores = zones.map(z => z.totalScore);
+            scores.sort((a, b) => a - b);
+            const median = scores[Math.floor(scores.length / 2)];
+            const q75 = scores[Math.floor(scores.length * 0.75)];
+            const q90 = scores[Math.floor(scores.length * 0.90)];
+
+            // Reclassify based on percentile rank within THIS set of zones
+            for (const z of zones) {
+                if (z.totalScore >= q90) {
+                    z.tier = 3; z.label = 'FORTRESS';
+                } else if (z.totalScore >= q75) {
+                    z.tier = 2; z.label = 'WALL';
+                } else if (z.totalScore >= median) {
+                    z.tier = 1; z.label = 'POCKET';
+                } else {
+                    z.tier = 0; z.label = ''; // below median = noise, don't render
+                }
+            }
+            // Filter out noise (below median)
+            this._zones = zones.filter(z => z.tier >= 1);
+        } else {
+            this._zones = zones;
+        }
+        return this._zones;
     },
 
     _buildZone(levels) {
@@ -1517,6 +1539,8 @@ const AbsorptionZoneDetector = {
 
         // Tier from aggregate: score density × width
         let tier, label;
+        // Tier classification — will be overridden by statistical filtering
+        // in AbsorptionZoneDetector.detect() after all zones are built
         if (ticks >= 7 || totalScore >= 40) { tier = 3; label = 'FORTRESS'; }
         else if (ticks >= 4 || totalScore >= 15) { tier = 2; label = 'WALL'; }
         else { tier = 1; label = 'POCKET'; }

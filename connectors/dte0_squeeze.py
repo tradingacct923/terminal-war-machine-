@@ -21,7 +21,7 @@ Architecture:
 Integration:
   - schwab_bridge._on_options_quote() feeds data into this engine
   - Alerts forwarded to edge_detector.on_dte0_squeeze()
-  - SQUEEZE + NQ iceberg alignment = highest-conviction signal
+  - SQUEEZE + NQ sweep/absorption alignment = highest-conviction signal
 """
 
 import time

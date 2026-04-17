@@ -553,8 +553,12 @@ const KineticText = {
         const render = () => {
             if (this._destroyed) return;
             this._rafId = requestAnimationFrame(render);
-            this._render();
+            if (this._dirty) {
+                this._dirty = false;
+                this._render();
+            }
         };
+        this._dirty = true;
         this._rafId = requestAnimationFrame(render);
     },
 
@@ -618,6 +622,11 @@ const KineticText = {
             if (!phys) {
                 phys = new PhysicsRow();
                 this.state.set(physKey, phys);
+                // Cap state map at 500 entries — prune oldest to prevent memory leak
+                if (this.state.size > 500) {
+                    const it = this.state.keys();
+                    for (let i = 0; i < 50; i++) this.state.delete(it.next().value);
+                }
             }
 
             // ── Step tension spring physics for this price level ──
@@ -775,6 +784,7 @@ const KineticText = {
      */
     setLadderData(data) {
         this._ladderData = data;
+        this._dirty = true;
     },
 
     /**
@@ -875,18 +885,18 @@ const KineticText = {
      * Heat scars decay slower (0.97x) to create visual inertia.
      */
     _decayHeat() {
+        let anyHot = false;
         for (const [, phys] of this.state) {
-            // Record scar before decay: if heat was high, scar stays longer
             if (phys.heat > phys.heatScar) {
                 phys.heatScar = phys.heat;
             }
-            // Primary heat decays (rate overridden by HUD patch)
             phys.heat *= 0.90;
             if (phys.heat < 0.005) phys.heat = 0;
-            // Scar decays slower — thermal inertia
             phys.heatScar *= 0.97;
             if (phys.heatScar < 0.005) phys.heatScar = 0;
+            if (phys.heat > 0 || phys.heatScar > 0) anyHot = true;
         }
+        if (anyHot) this._dirty = true;
     },
 
     destroy() {

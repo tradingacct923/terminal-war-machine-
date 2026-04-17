@@ -7,16 +7,8 @@
 //  ET label formatter – visual only, data stays in UTC
 // --------------------------------------------------------------
 function _applyETLabelFormatter(chart) {
-    const ET_OFFSET_MS = 4 * 60 * 60 * 1000; // UTC‑4 (EDT)
-    chart.timeScale().applyOptions({
-        tickMarkFormatter: time => {
-            const utc = new Date(time * 1000);
-            const et  = new Date(utc.getTime() - ET_OFFSET_MS);
-            const hh = String(et.getHours()).padStart(2, '0');
-            const mm = String(et.getMinutes()).padStart(2, '0');
-            return `${hh}:${mm}`;
-        }
-    });
+    // Candle times are already shifted to ET by _utcToET() in app.js
+    // LWC displays them directly — no additional offset needed in labels
 }
     
     window.ChartCore = {
@@ -37,6 +29,15 @@ function _applyETLabelFormatter(chart) {
 
             // Unmount existing chart in this container if any
             this.destroy(container);
+
+            // Fix #10 — purge any orphan instances whose container was detached
+            // from the DOM (happens when layout engine wipes a slot before the
+            // unmount handler runs). These leak ResizeObservers, canvases, and
+            // primitives that keep firing into the void.
+            // Guard: only pass truthy containers to destroy() — a null container
+            // would trigger the "destroy all" branch and nuke valid charts too.
+            const _orphans = _instances.filter(i => i.container && !i.container.isConnected);
+            _orphans.forEach(inst => { try { this.destroy(inst.container); } catch(e) {} });
 
             const chartW = container.clientWidth;
             const chartH = container.clientHeight;
@@ -99,8 +100,6 @@ function _applyETLabelFormatter(chart) {
                 container._overlayConfig = {
                     bubbles: true,
                     flare: true,
-                    cumlDelta: true,
-                    iceberg: true,
                     vp: true,
                     walls: true,
                 };
@@ -114,12 +113,12 @@ function _applyETLabelFormatter(chart) {
             const showCandles = (featureKey !== 'heatmap');
 
             const _candleSeries = _chart.addCandlestickSeries({
-                upColor:         showCandles ? '#26A69A' : 'transparent',
-                downColor:       showCandles ? '#EF5350' : 'transparent',
-                borderUpColor:   showCandles ? '#26A69A' : 'transparent',
-                borderDownColor: showCandles ? '#EF5350' : 'transparent',
-                wickUpColor:     showCandles ? 'rgba(38,166,154,.7)' : 'transparent',
-                wickDownColor:   showCandles ? 'rgba(239,83,80,.7)' : 'transparent',
+                upColor:         showCandles ? '#00E676' : 'transparent',
+                downColor:       showCandles ? '#FF1744' : 'transparent',
+                borderUpColor:   showCandles ? '#00C853' : 'transparent',
+                borderDownColor: showCandles ? '#D50000' : 'transparent',
+                wickUpColor:     showCandles ? '#00E676' : 'transparent',
+                wickDownColor:   showCandles ? '#FF1744' : 'transparent',
                 priceFormat: { type: 'price', precision: 2, minMove: L2_TICK_SIZES[initialSymbol] || 0.25 },
             });
 
@@ -180,9 +179,76 @@ function _applyETLabelFormatter(chart) {
                 heatmapCanvas.height = (container.clientHeight || chartH) * dpr;
             }
 
+            // ── WebGL Overlay Canvas: GPU-accelerated bubbles + VP bars + zones ──
+            // Deferred: LWC creates its DOM async, so we wait a frame before attaching.
+            let _webglCanvas = null;
+            let _textCanvas = null;
+            if (featureKey !== 'heatmap' && typeof WebGLOverlay !== 'undefined') {
+                requestAnimationFrame(() => {
+                    // Leak-fix: if this chart was destroyed before the rAF fired
+                    // (rapid layout swap), skip attachment — otherwise we'd
+                    // orphan canvases into a detached DOM subtree.
+                    if (!container.isConnected || !_instances.some(i => i.chart === _chart)) {
+                        // _chart exists only if pushed into _instances; if not found
+                        // it's because destroy() already ran. Bail.
+                        if (_chart && !_instances.some(i => i.chart === _chart)) return;
+                    }
+                    const lwcEl2 = container.querySelector('.tv-lightweight-charts');
+                    const chartArea2 = lwcEl2 && lwcEl2.querySelector('tr td:nth-child(2) > div');
+                    const parentEl = chartArea2 || container;
+                    if (!parentEl || !parentEl.isConnected) return;
+
+                    _webglCanvas = document.createElement('canvas');
+                    _webglCanvas.id = 'webgl-overlay-' + Date.now();
+                    _webglCanvas.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:6;';
+                    parentEl.appendChild(_webglCanvas);
+
+                    _textCanvas = document.createElement('canvas');
+                    _textCanvas.id = 'text-overlay-' + Date.now();
+                    _textCanvas.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:7;';
+                    parentEl.appendChild(_textCanvas);
+
+                    // Leak-fix: update the already-pushed instance object so destroy()
+                    // can clean up the canvases we just created (they were attached
+                    // AFTER the instance record was built).
+                    const _liveInst = _instances.find(i => i.chart === _chart);
+                    if (_liveInst) {
+                        _liveInst.webglCanvas = _webglCanvas;
+                        _liveInst.textCanvas = _textCanvas;
+                    }
+
+                    const cw = container.clientWidth || 900;
+                    const ch = container.clientHeight || chartH;
+                    if (WebGLOverlay.init(_webglCanvas)) {
+                        WebGLOverlay.resize(cw, ch);
+                        console.log('[WebGL] Overlay canvas attached and initialized');
+                    } else {
+                        console.warn('[WebGL] Init failed — Canvas 2D fallback active');
+                    }
+                    const dpr2 = window.devicePixelRatio || 1;
+                    _textCanvas.width = Math.round(cw * dpr2);
+                    _textCanvas.height = Math.round(ch * dpr2);
+                });
+            }
+
             // ── Resize Observer ──
             const _heatmapCanvas = heatmapCanvas; // closure ref
-            let _firstResize = true;
+            // `_needsInitialFit` stays true until fitContent actually runs with
+            // a real width AND data is present. Prevents "chart shows no
+            // candles" when pane mounts hidden (width=0) or when RO fires
+            // before setData lands.
+            let _needsInitialFit = true;
+            const _tryInitialFit = () => {
+                if (!_needsInitialFit || !_chart) return;
+                try {
+                    const w = container.clientWidth;
+                    const hasData = _candleSeries && _candleSeries.data && _candleSeries.data().length > 0;
+                    if (w > 10 && hasData) {
+                        _chart.timeScale().fitContent();
+                        _needsInitialFit = false;
+                    }
+                } catch(e) {}
+            };
             const ro = new ResizeObserver(entries => {
                 for (const entry of entries) {
                     const { width, height } = entry.contentRect;
@@ -193,14 +259,19 @@ function _applyETLabelFormatter(chart) {
                             _heatmapCanvas.width = width * dpr;
                             _heatmapCanvas.height = (height || chartH) * dpr;
                         }
-                        // On first resize, fit content so candles are visible
-                        if (_firstResize) {
-                            _firstResize = false;
-                            setTimeout(() => {
-                                try {
-                                    _chart.timeScale().fitContent();
-                                } catch(e) {}
-                            }, 150);
+                        if (_webglCanvas && typeof WebGLOverlay !== 'undefined' && WebGLOverlay.isReady()) {
+                            WebGLOverlay.resize(width, height || chartH);
+                        }
+                        if (_textCanvas) {
+                            const dpr = window.devicePixelRatio || 1;
+                            _textCanvas.width = Math.round(width * dpr);
+                            _textCanvas.height = Math.round((height || chartH) * dpr);
+                        }
+                        // Retry fit until it actually succeeds (width+data both ready)
+                        if (_needsInitialFit) {
+                            setTimeout(_tryInitialFit, 50);
+                            setTimeout(_tryInitialFit, 250);
+                            setTimeout(_tryInitialFit, 800);
                         }
                         if (window.AltarisEvents) {
                             window.AltarisEvents.emit('chart:resize', { width, height: height || chartH, container });
@@ -210,8 +281,13 @@ function _applyETLabelFormatter(chart) {
             });
             ro.observe(container);
 
-            // ── Scroll Event ──
+            // ── Scroll Event + Global scroll flag ──
+            // ALL overlays check window._chartScrolling to skip rendering during scroll.
+            // This is the single source of truth — no per-overlay scroll detection needed.
             _chart.timeScale().subscribeVisibleLogicalRangeChange(() => {
+                window._chartScrolling = true;
+                clearTimeout(window._chartScrollTimer);
+                window._chartScrollTimer = setTimeout(() => { window._chartScrolling = false; }, 80);
                 if (window.AltarisEvents) {
                     window.AltarisEvents.emit('chart:scroll', { container });
                 }
@@ -227,9 +303,14 @@ function _applyETLabelFormatter(chart) {
                 volumeSeries: _volumeSeries,
                 bubbleSeries: _bubbleSeries,
                 heatmapCanvas,
-                ro
+                webglCanvas: _webglCanvas,
+                textCanvas: _textCanvas,
+                ro,
+                // Leak-fix: expose fit retry so external data handlers
+                // (candle_history replay) can re-arm after late data lands.
+                _tryInitialFit: _tryInitialFit,
             };
-            
+
             _instances.push(instance);
 
             // ── Emit Ready Event ──
@@ -271,6 +352,27 @@ function _applyETLabelFormatter(chart) {
                 if (inst.heatmapCanvas && inst.heatmapCanvas.parentNode) {
                     inst.heatmapCanvas.parentNode.removeChild(inst.heatmapCanvas);
                 }
+                // Leak-fix: WebGL + text overlay canvases were attached via a
+                // deferred rAF path and never removed on destroy. Orphaned
+                // canvases accumulated on every layout switch, eventually
+                // covering the real chart canvas → "no candles visible".
+                if (inst.webglCanvas && inst.webglCanvas.parentNode) {
+                    try {
+                        if (typeof WebGLOverlay !== 'undefined' && WebGLOverlay.destroy) {
+                            WebGLOverlay.destroy();
+                        }
+                    } catch(e) {}
+                    inst.webglCanvas.parentNode.removeChild(inst.webglCanvas);
+                }
+                if (inst.textCanvas && inst.textCanvas.parentNode) {
+                    inst.textCanvas.parentNode.removeChild(inst.textCanvas);
+                }
+                inst.webglCanvas = null;
+                inst.textCanvas = null;
+                inst.chart = null;
+                inst.candleSeries = null;
+                inst.volumeSeries = null;
+                inst.bubbleSeries = null;
                 _instances.splice(idx, 1);
             }
         }

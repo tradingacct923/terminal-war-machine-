@@ -76,7 +76,6 @@
                         const cGex = c.gex || 0;
                         const pGex = p.gex || 0;
                         const netGex = cGex + pGex;
-                        const iceActive = (c.iceberg || p.iceberg) ? true : false;
 
                         // P/C color: < 0.7 = bullish (green), > 1.3 = bearish (red)
                         const pcColor = pcRatio < 0.7 ? '#1fd17a' : pcRatio > 1.3 ? '#e03060' : 'rgba(140,160,200,.65)';
@@ -91,7 +90,6 @@
                         const classes = [
                             isATM ? 'oc-atm' : '',
                             isITMCall ? 'oc-itm' : '',
-                            iceActive ? 'oc-ice-active' : '',
                         ].filter(Boolean).join(' ');
 
                         return `<tr class="${classes}" data-strike="${strike}">
@@ -103,7 +101,6 @@
                             <td class="oc-fusion-cell" style="color:${pcColor}">${pcRatio.toFixed(2)}</td>
                             <td class="oc-strike-cell">${strike}</td>
                             <td class="oc-fusion-cell" style="color:${gexColor};font-size:.7rem">${gexStr}</td>
-                            <td class="oc-fusion-cell">${iceActive ? '<span style="color:#00d4ff;text-shadow:0 0 8px rgba(0,212,255,.6);font-size:1rem">🧊</span>' : ''}</td>
                             <td class="oc-put-cell">${(p.bid || 0).toFixed(2)}</td>
                             <td class="oc-put-cell">${(p.ask || 0).toFixed(2)}</td>
                             <td class="oc-put-cell">${(p.volume || 0).toLocaleString()}</td>
@@ -124,9 +121,7 @@
                             const isCallSide = gex.type === 'call_wall';
                             const gexColor = isCallSide ? 'rgba(31,209,122,.45)' : 'rgba(224,48,96,.45)';
                             const gexTag = isCallSide ? 'γ RESIST' : 'γ SUPPORT';
-                            const gexLabel = gex.iceberg
-                                ? `🛡️ ${gexTag} ${(gex.gex/1e6).toFixed(1)}M 🧊`
-                                : `${gexTag} ${(gex.gex/1e6).toFixed(1)}M`;
+                            const gexLabel = `${gexTag} ${(gex.gex/1e6).toFixed(1)}M`;
                             const pl = _series.createPriceLine({
                                 price: gex.nq_price,
                                 color: gexColor,
@@ -139,28 +134,8 @@
                         }
                     }
 
-                    // ── Fusion Signal Alert (gamma-backed iceberg) ──
                     const fusionBox = document.getElementById('oc-fusion-alert');
-                    if (data.top_gex && data.active_icebergs && data.active_icebergs.length > 0) {
-                        const gammaIces = data.top_gex.filter(g => g.iceberg);
-                        if (gammaIces.length > 0 && fusionBox) {
-                            const gi = gammaIces[0];
-                            const gexM = (gi.gex / 1e6).toFixed(1);
-                            const verdict = gi.gex > 0 ? 'Wall will HOLD (MM support)' : 'Wall will BREAK (MM pressure)';
-                            const verdictColor = gi.gex > 0 ? '#1fd17a' : '#e03060';
-                            fusionBox.innerHTML = `
-                                <div style="padding:8px 12px;background:rgba(0,212,255,.08);border:1px solid rgba(0,212,255,.25);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:.7rem;line-height:1.5">
-                                    <div style="color:#00d4ff;font-weight:700;margin-bottom:4px">🛡️ GAMMA-BACKED ICEBERG at ${gi.nq_price.toFixed(0)}</div>
-                                    <div style="color:rgba(140,160,200,.8)">GEX: <span style="color:${gi.gex > 0 ? '#1fd17a' : '#e03060'}">${gi.gex > 0 ? '+' : ''}$${gexM}M</span> ${gi.type === 'call_wall' ? 'positive' : 'negative'} gamma</div>
-                                    <div style="color:${verdictColor};font-weight:600;margin-top:4px">⚡ VERDICT: ${verdict}</div>
-                                </div>`;
-                            fusionBox.style.display = 'block';
-                        } else if (fusionBox) {
-                            fusionBox.style.display = 'none';
-                        }
-                    } else if (fusionBox) {
-                        fusionBox.style.display = 'none';
-                    }
+                    if (fusionBox) fusionBox.style.display = 'none';
 
                     // Update expiry label if present
                     const expLabel = document.getElementById('oc-exp-label');

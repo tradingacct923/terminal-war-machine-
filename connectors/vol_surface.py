@@ -27,6 +27,7 @@ Integration:
 import time
 import math
 from collections import deque
+from connectors.hmm_regime import OnlineHMM
 
 
 class VolSurface:
@@ -67,7 +68,11 @@ class VolSurface:
         self._last_regime_change = 0
 
         # ── Regime transition smoothing (prevent flapping) ──
-        self._regime_votes = deque(maxlen=12)  # Last 12 updates (~60s)
+        self._regime_votes = deque(maxlen=12)  # Last 12 updates (~60s) [legacy fallback]
+
+        # ── HMM regime detector (replaces majority voting) ──
+        self._hmm = OnlineHMM(n_states=3, n_features=4, ema_halflife=100)
+        self._vpin_value = 0.5  # updated externally by schwab_bridge
 
     def update(self, zone_data, realized_vol=0.0):
         """Called every zone emission cycle with Greek surface data.
@@ -127,23 +132,27 @@ class VolSurface:
         if vol_premium != 0:
             self._vol_premium_history.append(vol_premium)
 
-        # ── Regime Classification ──
-        new_regime = self._classify_regime(
+        # ── Regime Classification via HMM forward filtering ──
+        hmm_result = self._hmm.observe({
+            'iv_rank': iv_rank,
+            'iv_skew': iv_skew,
+            'vol_premium': vol_premium,
+            'vpin': self._vpin_value,
+        })
+        hmm_regime = hmm_result['regime']
+        hmm_probs = hmm_result['state_probs']
+        regime_confidence = max(hmm_probs) * 100
+
+        # Legacy fallback: also track votes for comparison logging
+        legacy_regime = self._classify_regime(
             iv_skew, term_structure, vol_premium, iv_rank,
             skew_velocity, iv_velocity
         )
+        self._regime_votes.append(legacy_regime)
 
-        # Smoothed regime: majority vote over last 12 updates
-        self._regime_votes.append(new_regime)
-        regime_counts = {}
-        for v in self._regime_votes:
-            regime_counts[v] = regime_counts.get(v, 0) + 1
-        smoothed_regime = max(regime_counts, key=regime_counts.get)
-        regime_confidence = regime_counts[smoothed_regime] / len(self._regime_votes) * 100
-
-        # Only transition if confidence > 50% (majority)
-        if smoothed_regime != self._regime and regime_confidence >= 50:
-            self._regime = smoothed_regime
+        # Use HMM regime as authoritative
+        if hmm_regime != self._regime:
+            self._regime = hmm_regime
             self._regime_start_ts = now
             self._last_regime_change = now
 
@@ -164,6 +173,12 @@ class VolSurface:
             'regime_duration_s': round(regime_duration, 0),
             'iv_0dte': round(iv_0dte, 2),
             'iv_next_dte': round(iv_next, 2),
+            # HMM state probabilities
+            'hmm_prob_low_vol': round(hmm_probs[0], 4),
+            'hmm_prob_normal': round(hmm_probs[1], 4),
+            'hmm_prob_stressed': round(hmm_probs[2], 4),
+            'hmm_state': hmm_result['state'],
+            'legacy_regime': legacy_regime,
         }
 
         return self._state
@@ -233,6 +248,10 @@ class VolSurface:
             return 'COMPLACENT'
         else:
             return 'NORMAL'
+
+    def set_vpin(self, vpin_value):
+        """Update VPIN input for HMM. Called by schwab_bridge or l2_worker."""
+        self._vpin_value = max(0.0, min(1.0, vpin_value))
 
     def get_state(self):
         """Return current vol surface state dict."""

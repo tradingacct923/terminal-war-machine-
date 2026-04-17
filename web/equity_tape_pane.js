@@ -132,3 +132,4 @@ const EquityTapePane = (() => {
 
     return { init, destroy, onTick };
 })();
+window.EquityTapePane = EquityTapePane;

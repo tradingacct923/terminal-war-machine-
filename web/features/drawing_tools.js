@@ -139,9 +139,16 @@
             _container.appendChild(_overlay);
 
             // Subscribe to chart movements to redraw HTML overlays
-            _chartInstance.timeScale().subscribeVisibleLogicalRangeChange(() => _updateOverlayCoordinates());
-            _chartInstance.timeScale().subscribeVisibleTimeRangeChange(() => _updateOverlayCoordinates());
-            _chartInstance.subscribeCrosshairMove(() => _updateOverlayCoordinates());
+            // Throttle overlay updates to 30fps max to prevent lag
+            let _updatePending = false;
+            function _throttledUpdate() {
+                if (_updatePending) return;
+                _updatePending = true;
+                requestAnimationFrame(() => { _updateOverlayCoordinates(); _updatePending = false; });
+            }
+            _chartInstance.timeScale().subscribeVisibleLogicalRangeChange(_throttledUpdate);
+            _chartInstance.timeScale().subscribeVisibleTimeRangeChange(_throttledUpdate);
+            _chartInstance.subscribeCrosshairMove(_throttledUpdate);
 
             // Global Mouse Events for Drag and Drop
             _overlay.addEventListener('mousedown', _onMouseDown);
@@ -287,13 +294,14 @@
         if (!_candleSeries) return;
 
         if (d.type === 'hline') {
+            const lineStyle = d.extend ? LightweightCharts.LineStyle.Solid : LightweightCharts.LineStyle.Dotted;
             const line = _candleSeries.createPriceLine({
                 price: d.price,
                 color: d.color,
-                lineWidth: 2,
-                lineStyle: LightweightCharts.LineStyle.Dotted,
+                lineWidth: d.extend ? 1 : 2,
+                lineStyle: lineStyle,
                 axisLabelVisible: true,
-                title: 'Level',
+                title: d.label || '',
             });
             _priceLineObjects.set(d.id, line);
         } else if (d.type === 'vline') {
@@ -539,6 +547,7 @@
         const bar = document.createElement('div');
         bar.id = 'drawing-tools-bar';
         bar.className = 'drawing-tools-bar';
+        bar.style.display = 'none'; // hidden — controls live in master settings panel
         bar.innerHTML = `
             <div class="dt-group">
                 <button class="dt-btn" data-mode="draw_hline" title="Horizontal Support/Resistance">── H</button>
@@ -553,7 +562,7 @@
             </div>
             <div class="dt-separator"></div>
             <button class="dt-btn" data-mode="delete" title="Delete a Shape (Click shape to Delete)">✕ Del</button>
-            <button class="dt-btn" data-mode="clear" title="Clear All Lines">🗑 Clear</button>
+            <button class="dt-btn" data-mode="clear" title="Clear All Lines">Clear</button>
         `;
         document.body.appendChild(bar);
 
@@ -676,7 +685,53 @@
             if (_currentSymbol === symbol) return;
             _currentSymbol = symbol;
             _loadDrawings();
-        }
+        },
+        setMode(mode) {
+            if (mode === 'draw_box') _mode = 'draw_box_start';
+            else _mode = mode || 'idle';
+            _tempPoint = null;
+            _updateUIClasses();
+        },
+        setColor(color) {
+            _activeColor = color || '#E0A800';
+            _updateUIClasses();
+        },
+        clearAll() {
+            _drawings = [];
+            _clearAll();
+            _saveDrawings();
+        },
+        setLabel(label) {
+            // Set label on currently selected drawing
+            if (!_selectedId) return;
+            const d = _drawings.find(x => x.id === _selectedId);
+            if (!d) return;
+            d.label = label || '';
+            if (d.type === 'hline') {
+                const line = _priceLineObjects.get(d.id);
+                if (line) line.applyOptions({ title: d.label });
+            }
+            _saveDrawings();
+        },
+        toggleExtend() {
+            // Toggle extend on currently selected hline
+            if (!_selectedId) return;
+            const d = _drawings.find(x => x.id === _selectedId);
+            if (!d || d.type !== 'hline') return;
+            d.extend = !d.extend;
+            const line = _priceLineObjects.get(d.id);
+            if (line) {
+                line.applyOptions({
+                    lineStyle: d.extend ? LightweightCharts.LineStyle.Solid : LightweightCharts.LineStyle.Dotted,
+                    lineWidth: d.extend ? 1 : 2,
+                });
+            }
+            _saveDrawings();
+        },
+        getSelected() {
+            if (!_selectedId) return null;
+            return _drawings.find(x => x.id === _selectedId) || null;
+        },
     };
 
     document.addEventListener('DOMContentLoaded', () => {

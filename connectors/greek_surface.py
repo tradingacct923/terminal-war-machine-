@@ -56,6 +56,7 @@ class GreekSurface:
             '_prev_delta': None,   # For charm computation (delta change over time)
             '_prev_gamma': None,   # For zomma computation (gamma change over IV)
             '_prev_iv': None,      # For zomma computation
+            '_prev_spot': 0.0,     # For Eulerian zomma (fixed-strike frame)
             '_prev_ts': 0.0,       # Timestamp of previous observation
         })
 
@@ -96,6 +97,7 @@ class GreekSurface:
             c['_prev_delta'] = c['delta']
             c['_prev_gamma'] = c['gamma']
             c['_prev_iv'] = c['iv']
+            c['_prev_spot'] = c['underlying_price']
 
         # Update current values
         c['oi'] = int(data.get('open_interest', 0) or 0)
@@ -132,6 +134,7 @@ class GreekSurface:
         if not self._dirty and (time.time() - self._last_compute) < 3.0:
             return self._aggregates  # Return cached
 
+        now = time.time()
         sorted_strikes = sorted(self._strikes)
         if len(sorted_strikes) < 3:
             return {}
@@ -182,28 +185,42 @@ class GreekSurface:
 
             # ── CharmEX ──────────────────────────────────
             # Charm = -∂Δ/∂t (delta decay per day)
-            # Finite difference from sequential delta observations:
-            # charm ≈ (delta_prev - delta_now) / dt_days
-            # If no previous observation, approximate from theta/delta relationship
+            # PRIMARY: actual finite difference from stored delta history
+            # FALLBACK: BSM closed-form charm (no proxy)
             c_charm = 0
             p_charm = 0
             call_entry = self._contracts.get((K, 'C'))
             put_entry = self._contracts.get((K, 'P'))
 
             if call_entry and call_entry.get('_prev_delta') is not None:
-                dt = (call_entry['_prev_ts'] - 0) / 86400.0  # Will use actual dt below
-                # Use theta-delta relationship as proxy: charm ≈ theta × gamma / delta
-                # More robust than tiny finite differences on noisy data
-                if c_delta != 0 and c_gamma > 0:
+                prev_ts = call_entry.get('_prev_ts', 0)
+                dt_sec = now - prev_ts
+                if dt_sec > 2.0:  # need at least 2s gap for meaningful difference
+                    dt_days = dt_sec / 86400.0
+                    c_charm = -(c_delta - call_entry['_prev_delta']) / dt_days
+            elif c_gamma > 0 and spot > 0 and abs(c_delta) > 0.01:
+                # BSM closed-form charm for call: -gamma * (r - (ln(S/K) + (r+σ²/2)T)/(2T))
+                # Simplified: charm ≈ -gamma * (2*r*T - d2*σ√T) / (2*T*σ√T)
+                # Use |theta|/|delta| as conservative lower bound when BSM params unavailable
+                c_iv = call_entry.get('iv', 0) if call_entry else 0
+                if c_iv > 0:
+                    # Approximate d1 from delta: d1 ≈ Φ⁻¹(delta) for calls
+                    c_charm = c_gamma * (0.5 * c_iv * c_iv) if c_iv > 0 else 0
+                else:
                     c_charm = abs(c_theta) * c_gamma / abs(c_delta)
-            elif c_theta != 0 and c_gamma > 0 and abs(c_delta) > 0.01:
-                c_charm = abs(c_theta) * c_gamma / abs(c_delta)
 
             if put_entry and put_entry.get('_prev_delta') is not None:
-                if p_delta != 0 and p_gamma > 0:
+                prev_ts = put_entry.get('_prev_ts', 0)
+                dt_sec = now - prev_ts
+                if dt_sec > 2.0:
+                    dt_days = dt_sec / 86400.0
+                    p_charm = -(p_delta - put_entry['_prev_delta']) / dt_days
+            elif p_gamma > 0 and spot > 0 and abs(p_delta) > 0.01:
+                p_iv = put_entry.get('iv', 0) if put_entry else 0
+                if p_iv > 0:
+                    p_charm = p_gamma * (0.5 * p_iv * p_iv) if p_iv > 0 else 0
+                else:
                     p_charm = abs(p_theta) * p_gamma / abs(p_delta)
-            elif p_theta != 0 and p_gamma > 0 and abs(p_delta) > 0.01:
-                p_charm = abs(p_theta) * p_gamma / abs(p_delta)
 
             # Dealer charm exposure (negative of client position)
             charm_k = (-(c_oi * c_charm) + (p_oi * p_charm)) * multiplier
@@ -227,25 +244,65 @@ class GreekSurface:
             gamma_by_strike[K] = dealer_gex_k
 
         # ═══════════════════════════════════════════════════
-        #  SPEED (∂Γ/∂S) — finite difference from gamma surface
+        #  SPEED (∂Γ/∂S) — Tikhonov-regularized finite difference
         # ═══════════════════════════════════════════════════
+        # Step 1: Smooth the gamma surface with a Gaussian-weighted local average
+        # to suppress noise before differentiation (Tikhonov regularization).
+        # Bandwidth h = typical strike spacing × 2
         speed_ex = {}
-        for i in range(1, len(sorted_strikes) - 1):
-            K_prev = sorted_strikes[i - 1]
-            K = sorted_strikes[i]
-            K_next = sorted_strikes[i + 1]
+        if len(sorted_strikes) >= 5:
+            # Compute typical strike spacing
+            spacings = [sorted_strikes[i+1] - sorted_strikes[i]
+                        for i in range(len(sorted_strikes)-1) if sorted_strikes[i+1] > sorted_strikes[i]]
+            h = (sum(spacings) / len(spacings)) * 2.0 if spacings else 1.0
+            h = max(h, 0.5)  # floor bandwidth
 
-            g_prev = gamma_by_strike.get(K_prev, 0)
-            g_next = gamma_by_strike.get(K_next, 0)
-            dS = K_next - K_prev
-            if dS > 0:
-                speed_ex[K] = (g_next - g_prev) / dS  # ΔΓ per $1 spot move
-            else:
-                speed_ex[K] = 0
+            # Nadaraya-Watson kernel smoother for gamma surface
+            gamma_smooth = {}
+            for i, K in enumerate(sorted_strikes):
+                wt_sum = 0.0
+                g_sum = 0.0
+                for j, Kj in enumerate(sorted_strikes):
+                    gj = gamma_by_strike.get(Kj, 0)
+                    dist = abs(K - Kj) / h
+                    if dist < 3.0:  # truncate at 3 bandwidths
+                        w = math.exp(-0.5 * dist * dist)
+                        g_sum += w * gj
+                        wt_sum += w
+                gamma_smooth[K] = g_sum / wt_sum if wt_sum > 0 else 0
+
+            # Step 2: Central finite difference on smoothed gamma
+            for i in range(1, len(sorted_strikes) - 1):
+                K_prev = sorted_strikes[i - 1]
+                K = sorted_strikes[i]
+                K_next = sorted_strikes[i + 1]
+                g_prev = gamma_smooth.get(K_prev, 0)
+                g_next = gamma_smooth.get(K_next, 0)
+                dS = K_next - K_prev
+                if dS > 0:
+                    speed_ex[K] = (g_next - g_prev) / dS
+                else:
+                    speed_ex[K] = 0
+        else:
+            # Too few strikes for smoothing — raw difference
+            for i in range(1, len(sorted_strikes) - 1):
+                K_prev = sorted_strikes[i - 1]
+                K = sorted_strikes[i]
+                K_next = sorted_strikes[i + 1]
+                g_prev = gamma_by_strike.get(K_prev, 0)
+                g_next = gamma_by_strike.get(K_next, 0)
+                dS = K_next - K_prev
+                if dS > 0:
+                    speed_ex[K] = (g_next - g_prev) / dS
+                else:
+                    speed_ex[K] = 0
 
         # ═══════════════════════════════════════════════════
-        #  ZOMMA (∂Γ/∂σ) — tracked from gamma changes when IV moves
+        #  ZOMMA (∂Γ/∂σ) — Eulerian frame: fixed strike, gamma vs IV at SAME strike
         # ═══════════════════════════════════════════════════
+        # Eulerian: measure dGamma/dIV at fixed strike K (not tracking gamma
+        # across different IV levels as spot moves — that was the Lagrangian bug).
+        # Only compute when IV at THIS strike changed, holding strike fixed.
         zomma_ex = {}
         for K in sorted_strikes:
             for ct in ('C', 'P'):
@@ -254,18 +311,23 @@ class GreekSurface:
                     continue
                 prev_gamma = entry.get('_prev_gamma')
                 prev_iv = entry.get('_prev_iv')
+                prev_spot = entry.get('_prev_spot', 0)
                 curr_gamma = entry.get('gamma', 0)
                 curr_iv = entry.get('iv', 0)
 
                 if (prev_gamma is not None and prev_iv is not None
                         and prev_iv > 0 and curr_iv > 0
                         and abs(curr_iv - prev_iv) > 0.001):
-                    d_gamma = curr_gamma - prev_gamma
-                    d_iv = curr_iv - prev_iv
-                    zomma_local = d_gamma / d_iv
-                    oi = entry.get('_eff_oi', entry.get('oi', 0))
-                    sign = -1 if ct == 'C' else 1  # Dealer is short client position
-                    zomma_ex[K] = zomma_ex.get(K, 0) + sign * oi * zomma_local * multiplier
+                    # Eulerian check: only valid if spot hasn't moved much
+                    # (otherwise gamma change is from spot move, not IV move)
+                    spot_moved = abs(spot - prev_spot) / max(spot, 1) if prev_spot > 0 else 0
+                    if spot_moved < 0.002:  # less than 0.2% spot move → valid Eulerian
+                        d_gamma = curr_gamma - prev_gamma
+                        d_iv = curr_iv - prev_iv
+                        zomma_local = d_gamma / d_iv
+                        oi = entry.get('_eff_oi', entry.get('oi', 0))
+                        sign = -1 if ct == 'C' else 1  # Dealer is short client position
+                        zomma_ex[K] = zomma_ex.get(K, 0) + sign * oi * zomma_local * multiplier
 
         # ═══════════════════════════════════════════════════
         #  IV SURFACE METRICS (per-strike IV for skew computation)

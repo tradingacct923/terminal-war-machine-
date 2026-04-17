@@ -52,7 +52,6 @@ If it cannot be proven, it does not go on screen. Period.
 ## Detection Logic (l2_worker.py)
 
 ### ALL detection thresholds MUST be σ-adaptive
-- Iceberg: clip consistency via CV, detection window tiered (5s/15s/60s)
 - Sweep: σ-adaptive volume threshold from rolling trade distribution
 - Spoof: σ-adaptive size threshold from rolling DOM depth distribution
 - Ignition: σ-adaptive trade count from rolling arrival rate distribution

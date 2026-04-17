@@ -176,3 +176,4 @@ const DealerFlowPane = (() => {
 
     return { init, destroy, onDealerFlow };
 })();
+window.DealerFlowPane = DealerFlowPane;

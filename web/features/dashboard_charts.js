@@ -572,15 +572,8 @@ function buildOI(oiBar, spot) {
         beforeDatasetsDraw(chart) {
             chart.ctx.save();
         },
-        beforeDatasetDraw(chart, args) {
-            const colors = ["rgba(0,210,255,.9)", "rgba(255,40,90,.9)"];  // Calls=cyan, Puts=crimson
-            chart.ctx.shadowColor = colors[args.index] || "transparent";
-            chart.ctx.shadowBlur = 14;
-        },
-        afterDatasetDraw(chart) {
-            chart.ctx.shadowBlur = 0;
-            chart.ctx.shadowColor = "transparent";
-        },
+        beforeDatasetDraw() { /* shadowBlur removed — GPU expensive in per-dataset hooks */ },
+        afterDatasetDraw() {},
         afterDatasetsDraw(chart) {
             chart.ctx.restore();
         },
@@ -600,13 +593,10 @@ function buildOI(oiBar, spot) {
             const { left, right } = chart.chartArea;
             const c2 = chart.ctx;
             c2.save();
-            c2.shadowColor = "rgba(96,165,250,.6)";
-            c2.shadowBlur = 8;
             c2.setLineDash([4, 3]);
-            c2.strokeStyle = "rgba(96,165,250,.8)";
+            c2.strokeStyle = "rgba(96,165,250,1)";
             c2.lineWidth = 1.5;
             c2.beginPath(); c2.moveTo(left, y); c2.lineTo(right, y); c2.stroke();
-            c2.shadowBlur = 0;
             c2.fillStyle = "rgba(96,165,250,.9)";
             c2.font = "bold 11px 'JetBrains Mono', monospace";
             c2.fillText("ATM $" + spot.toFixed(0), left + 4, y - 4);
@@ -824,17 +814,8 @@ function buildOI365(data) {
     // â”€â”€ Glow plugin
     const glowPlugin365 = {
         id: "barGlow365",
-        beforeDatasetDraw(chart, args) {
-            const ds = chart.data.datasets[args.index];
-            if (!ds._color) return;
-            const [r, g, b] = ds._color;
-            chart.ctx.shadowColor = `rgba(${r},${g},${b},.7)`;
-            chart.ctx.shadowBlur = 10;
-        },
-        afterDatasetDraw(chart) {
-            chart.ctx.shadowBlur = 0;
-            chart.ctx.shadowColor = "transparent";
-        },
+        beforeDatasetDraw() { /* shadowBlur removed — GPU expensive in per-dataset hooks */ },
+        afterDatasetDraw() {},
     };
 
     // â”€â”€ Spot line plugin
@@ -956,16 +937,8 @@ function buildNetBar(canvasId, barData, spot, colorPos, colorNeg) {
     // ATM bar glow plugin (keep for bars themselves)
     const _atmGlow = {
         id: "atmGlow",
-        beforeDatasetDraw(chart, args) {
-            const ds = chart.data.datasets[args.index];
-            const ctx = chart.ctx;
-            ctx.save();
-            ctx.shadowColor = "rgba(56,189,248,.7)";
-            ctx.shadowBlur = 14;
-        },
-        afterDatasetDraw(chart) {
-            chart.ctx.restore();
-        }
+        beforeDatasetDraw() { /* shadowBlur removed — GPU expensive in per-dataset hooks */ },
+        afterDatasetDraw() {}
     };
     // Zero-line & bg plugin
     const _bgPlugin = {
@@ -2851,7 +2824,7 @@ async function buildVolStats() {
             const kNow = kc.current;
             const kBadge = document.getElementById("kurt-badge");
             if (kBadge) {
-                const kLabel = kNow > 2 ? "FAT TAILS 🔴" : kNow > 0.5 ? "ELEVATED" : kNow < -0.5 ? "THIN TAILS" : "NORMAL";
+                const kLabel = kNow > 2 ? "FAT TAILS [X]" : kNow > 0.5 ? "ELEVATED" : kNow < -0.5 ? "THIN TAILS" : "NORMAL";
                 const kColor = kNow > 2 ? "#e8435a" : kNow > 0.5 ? "#f5c542" : kNow < -0.5 ? "#60a5fa" : "#2ecc8a";
                 kBadge.textContent = `${kNow > 0 ? "+" : ""}${kNow}  ${kLabel}`;
                 kBadge.style.color = kColor;
@@ -3830,12 +3803,12 @@ function _alertColor(level) {
 
 function _alertIcon(level) {
     const map = {
-        elevated: '⚠️', watch: '👁️', critical: '🔴', error: '❌',
-        inactive: '⏸️', stable: '✅', normal: '✅', structured: '🎯',
-        chaotic: '🌊', random: '🎲', laminar: '🏊', transitional: '⚡',
-        turbulent: '🌪️', coupled: '🔗', decoupled: '🔓', thin_calm: '❄️'
+        elevated: '[!]', watch: '[o]', critical: '[X]', error: '[ERR]',
+        inactive: '[-]', stable: '[OK]', normal: '[OK]', structured: '[+]',
+        chaotic: '[~]', random: '[?]', laminar: '[=]', transitional: '[>]',
+        turbulent: '[!!]', coupled: '[&]', decoupled: '[/]', thin_calm: '[.]'
     };
-    return map[level] || '📊';
+    return map[level] || '[i]';
 }
 
 function _signalCard(s) {
@@ -3882,7 +3855,7 @@ function loadCrashRisk() {
             el.innerHTML = `
               <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
                 <div style="background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:20px">
-                  <h3 style="color:var(--text);margin:0 0 12px;font-size:.9rem">🔮 LPPL Sornette — Crash Timing</h3>
+                  <h3 style="color:var(--text);margin:0 0 12px;font-size:.9rem">LPPL Sornette -- Crash Timing</h3>
                   <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-family:'JetBrains Mono',monospace;font-size:.75rem">
                     <div><span style="color:var(--dim)">Critical Date:</span><br><strong style="color:var(--text);font-size:1rem">${sornette.tc_date || '—'}</strong></div>
                     <div><span style="color:var(--dim)">Days to tc:</span><br><strong style="color:${(sornette.days_to_tc || 999) < 30 ? '#e8435a' : '#2ecc8a'};font-size:1rem">${sornette.days_to_tc ?? '—'}</strong></div>
@@ -3894,7 +3867,7 @@ function loadCrashRisk() {
                   <div style="margin-top:12px;padding:10px;background:var(--bg3);border-radius:8px;font-size:.72rem;color:var(--dim)">${sornette.interpretation || 'No data'}</div>
                 </div>
                 <div style="background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:20px">
-                  <h3 style="color:var(--text);margin:0 0 12px;font-size:.9rem">📊 Power-Law Tail α — Fat Tail Risk</h3>
+                  <h3 style="color:var(--text);margin:0 0 12px;font-size:.9rem">Power-Law Tail a -- Fat Tail Risk</h3>
                   <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-family:'JetBrains Mono',monospace;font-size:.75rem">
                     <div><span style="color:var(--dim)">α Combined:</span><br><strong style="color:${(powerlaw.alpha_combined || 4) < 3 ? '#e8435a' : '#2ecc8a'};font-size:1rem">${powerlaw.alpha_combined ? powerlaw.alpha_combined.toFixed(3) : '—'}</strong></div>
                     <div><span style="color:var(--dim)">α Left (crash):</span><br><strong style="color:var(--text)">${powerlaw.alpha_left ? powerlaw.alpha_left.toFixed(3) : '—'}</strong></div>

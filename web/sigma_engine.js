@@ -1,10 +1,10 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// SIGMA ENGINE v2 — EWMA Log-Transform Statistical Core + Iceberg Clustering
+// SIGMA ENGINE v2 — EWMA Log-Transform Statistical Core + Algo Clustering
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 // Senior quant upgrade over v1:
 //   1. EWMA (exponentially weighted) replaces simple mean — recency matters
-//   2. Time-density clustering — detects iceberg/algo execution (many small clips)
+//   2. Time-density clustering — detects algo execution (many small clips)
 //   3. Regime-aware thresholds — σ multiplier adjusts with market regime
 //   4. Side-aware distributions — separate buy vs sell σ tracking
 //   5. classifyTrade() — returns { tier, pctl, side } for any trade
@@ -59,7 +59,7 @@ const SigmaEngine = {
         'crash_tail_risk':      { noise: 0.6, sig: 1.0, inst: 1.8 },
     },
 
-    // ── Time-density clustering (Iceberg Detector) ──
+    // ── Time-density clustering ──
     _recentTrades: [],             // { price, side, ts, vol }
     _CLUSTER_WINDOW_MS: 500,       // trades within 500ms on same side = cluster
     _CLUSTER_MIN_CLIPS: 3,         // minimum clips to form a cluster
@@ -166,7 +166,7 @@ const SigmaEngine = {
     },
 
     // ══════════════════════════════════════════════════════════
-    //  ICEBERG / ALGO CLUSTER DETECTION
+    //  ALGO CLUSTER DETECTION
     // ══════════════════════════════════════════════════════════
 
     _detectCluster(now) {
@@ -202,7 +202,7 @@ const SigmaEngine = {
                     count: group.length,
                     duration: Math.round(duration),
                     ts: now,
-                    type: duration < 100 ? 'algo_burst' : 'iceberg_clip',
+                    type: duration < 100 ? 'algo_burst' : 'algo_clip',
                 };
             }
         }
