@@ -22,6 +22,15 @@ venv/
 Thumbs.db
 .DS_Store
 
+# ── Node / tooling ────────────────────────────────
+node_modules/
+package-lock.json
+test-results/
+playwright-report/
+
+# ── Claude Code workspace ─────────────────────────
+.claude/
+
 # ── Project ───────────────────────────────────────
 charts/
 *.log
