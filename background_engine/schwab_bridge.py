@@ -204,6 +204,17 @@ def _run_bridge():
         # Subscribe to NDX options for live GEX tracking
         _subscribe_qqq_options()
 
+        # Subscribe to SPY + Mag7 options for cross-ticker 0DTE flow tracking.
+        # Streamer symbol budget: QQQ (~200) + SPY (~80) + Mag7 (~140) = ~420 / 500.
+        try:
+            _subscribe_spy_options()
+        except Exception as e:
+            log.warning(f"[SCHWAB-BRIDGE] SPY options subscription error: {e}")
+        try:
+            _subscribe_mag7_options()
+        except Exception as e:
+            log.warning(f"[SCHWAB-BRIDGE] Mag7 options subscription error: {e}")
+
         # Subscribe to QQQ equity L2 book (NASDAQ_BOOK)
         _streamer.subscribe_nasdaq_book(['QQQ'])
         log.info("[SCHWAB-BRIDGE] Subscribed to NASDAQ_BOOK for QQQ")
@@ -298,6 +309,101 @@ def _subscribe_qqq_options():
         import traceback
         log.info(f"[SCHWAB-BRIDGE] ⚠️ QQQ options subscription failed: {e}")
         log.info(traceback.format_exc())
+
+
+# Tracked symbols per ticker — used by flow accumulator for ticker classification.
+# Maps ticker -> list of Schwab option symbols we've subscribed to.
+_subscribed_option_symbols_by_ticker: dict[str, list] = {}
+
+
+def _subscribe_options_for_ticker(
+    ticker: str,
+    strike_radius: float = None,
+    expiries_count: int = 2,
+    cap: int = 80,
+) -> int:
+    """
+    Subscribe to LEVELONE_OPTIONS for ATM contracts on a given ticker.
+
+    Mirrors _subscribe_qqq_options but generalized so SPY + Mag7 can reuse it.
+
+    strike_radius defaults to 3% of spot (tighter than QQQ's $60 because these
+    tickers range from $200 to $700 spots).
+    expiries_count: how many nearest expirations to subscribe (2 = 0DTE + next).
+    cap: max contracts per ticker to avoid blowing through Schwab's symbol limit.
+
+    Returns number of contracts subscribed.
+    """
+    try:
+        from server import _schwab_expirations, _schwab_chain_raw, _schwab_quote
+
+        spot = _schwab_quote(ticker)
+        if not spot or spot <= 0:
+            log.warning(f"[SCHWAB-BRIDGE] {ticker}: no live spot, skipping options subscription")
+            return 0
+
+        raw_dates = _schwab_expirations(ticker)
+        if not raw_dates:
+            log.warning(f"[SCHWAB-BRIDGE] {ticker}: no expirations, skipping")
+            return 0
+
+        exp_dates = raw_dates[:expiries_count]
+        radius = strike_radius if strike_radius is not None else max(2.0, spot * 0.03)
+
+        symbols = []
+        for exp_date in exp_dates:
+            try:
+                chain, _ = _schwab_chain_raw(ticker, exp_date)
+                for opt in chain:
+                    strike = float(opt.get("strike", 0))
+                    sym = opt.get("symbol", "")
+                    if sym and abs(strike - spot) <= radius:
+                        symbols.append(sym)
+            except Exception as e:
+                log.warning(f"[SCHWAB-BRIDGE] {ticker}: chain fetch failed for {exp_date}: {e}")
+
+        if not symbols:
+            log.warning(f"[SCHWAB-BRIDGE] {ticker}: no options within ±{radius:.2f} of spot={spot:.2f}")
+            return 0
+
+        symbols = symbols[:cap]
+        _streamer.subscribe_options(symbols)
+        _subscribed_option_symbols_by_ticker[ticker] = symbols
+        log.info(
+            f"[SCHWAB-BRIDGE] 📊 {ticker}: subscribed to {len(symbols)} options "
+            f"(spot={spot:.2f}, radius=±{radius:.2f}, exps={exp_dates})"
+        )
+        return len(symbols)
+    except Exception as e:
+        import traceback
+        log.warning(f"[SCHWAB-BRIDGE] {ticker} options subscription failed: {e}")
+        log.warning(traceback.format_exc())
+        return 0
+
+
+def _subscribe_spy_options() -> int:
+    """SPY: wide radius because SPY is high-liquidity, many traders pin here.
+    ATM ±$8 (~1.1% of spot $711), 2 expiries (0DTE + next), cap 80 contracts.
+    """
+    return _subscribe_options_for_ticker("SPY", strike_radius=8.0, expiries_count=2, cap=80)
+
+
+# Mag7 — each gets a small ATM window + single nearest expiry (0DTE).
+# 20 contracts × 7 tickers = 140 new subscriptions. Combined with QQQ 200 + SPY 80
+# = ~420 option symbols, under Schwab's 500-symbol streamer limit.
+MAG7_TICKERS = ("AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA")
+
+
+def _subscribe_mag7_options() -> int:
+    """Subscribe to 0DTE ATM options for each Mag7 name."""
+    total = 0
+    for ticker in MAG7_TICKERS:
+        n = _subscribe_options_for_ticker(
+            ticker, strike_radius=None, expiries_count=1, cap=20
+        )
+        total += n
+    log.info(f"[SCHWAB-BRIDGE] 📊 Mag7 total: {total} options across {len(MAG7_TICKERS)} tickers")
+    return total
 
 
 # ── NQ/QQQ/NDX price mapping ──────────────────────────────────────────────────
@@ -1435,10 +1541,10 @@ _screener_logged = False
 
 def _on_screener_option(data):
     """Handle real-time options screener updates — unusual activity radar.
-    
+
     Data from _process_screener now has:
       symbol: screener key (e.g., 'OPTION_ALL_VOLUME_0')
-      items: list of dicts with named keys (symbol, description, lastPrice, 
+      items: list of dicts with named keys (symbol, description, lastPrice,
              totalVolume, netChange, netPercentChange)
       sort_field, frequency, _timestamp
     """
@@ -1457,15 +1563,23 @@ def _on_screener_option(data):
     if not items:
         return
 
-    # Items have named keys from Schwab: symbol, description, lastPrice, 
-    # totalVolume, netChange, netPercentChange
+    # Items from Schwab carry:
+    #   symbol, description, lastPrice, netChange, netPercentChange,
+    #   marketShare, totalVolume (market-wide total — same on every item),
+    #   volume (per-contract), trades (per-contract trade count)
     alerts = []
+    market_total = 0
     for item in items[:20]:
         if isinstance(item, dict):
+            mt = _safe_num(item.get('totalVolume', 0))
+            if mt > market_total:
+                market_total = mt
             alerts.append({
                 'symbol': item.get('symbol', ''),
                 'description': item.get('description', ''),
-                'volume': _safe_num(item.get('totalVolume', 0)),
+                'volume': _safe_num(item.get('volume', 0)),
+                'trades': _safe_num(item.get('trades', 0)),
+                'marketShare': _safe_num(item.get('marketShare', 0)),
                 'percentChange': _safe_num(item.get('netPercentChange', 0)),
                 'lastPrice': _safe_num(item.get('lastPrice', 0)),
                 'netChange': _safe_num(item.get('netChange', 0)),
@@ -1475,6 +1589,7 @@ def _on_screener_option(data):
         _socketio.emit('screener_option_update', {
             'type': data.get('sort_field', 'VOLUME'),
             'alerts': alerts,
+            'market_total_volume': market_total,
             'timestamp': data.get('_timestamp', 0),
         })
 
