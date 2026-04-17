@@ -815,6 +815,24 @@ def _schwab_chain_raw(ticker, exp_date):
     return options, data.get("underlyingPrice", 0)
 
 
+@app.route("/api/flow")
+def api_flow():
+    """Return snapshot of signed + unsigned Δ notional flow per ticker.
+
+    Powers initial hydration when the flow pane mounts (live updates
+    arrive via the 'flow_update' socketio event).
+    """
+    try:
+        from connectors.flow_accumulator import get_accumulator
+        acc = get_accumulator()
+        if acc is None:
+            return jsonify({"tickers": [], "ready": False})
+        states = acc.get_all_states()
+        return jsonify({"tickers": list(states.values()), "ready": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/chain")
 def api_chain():
     """Return real options chain from Schwab for the terminal options panel.

@@ -184,6 +184,13 @@
                 }
             });
 
+            // ── flow_update: Per-ticker signed Δ notional curves (0DT-Hero-style) ──
+            window._sio.on('flow_update', (data) => {
+                if (window.AltarisEvents) {
+                    window.AltarisEvents.emit('data:flow:update', data);
+                }
+            });
+
             // ── book_microstructure: QQQ NASDAQ L2 venue quality + QA imbalance ──
             // Emitted at 2Hz. Contains per-level venue taxonomy (HFT vs institutional),
             // quality-adjusted imbalance (filters phantom HFT depth), and BBO quality scores.

@@ -230,6 +230,14 @@ def _run_bridge():
         except Exception as e:
             log.info(f"[SCHWAB-BRIDGE] SCREENER_OPTION subscription failed: {e}")
 
+        # Initialize signed-flow accumulator (0DT-Hero-style curves per ticker)
+        try:
+            from connectors.flow_accumulator import init_accumulator
+            init_accumulator(_socketio)
+            log.info("[SCHWAB-BRIDGE] Signed flow accumulator initialised")
+        except Exception as e:
+            log.warning(f"[SCHWAB-BRIDGE] Flow accumulator init failed: {e}")
+
         log.info("[SCHWAB-BRIDGE] All subscriptions active")
 
         # Keep thread alive and log stats periodically
@@ -600,6 +608,16 @@ def _on_options_quote(data):
     """
     global _gex_dirty, _last_option_update_ts
     _last_option_update_ts = time.time()
+
+    # Feed signed-flow accumulator (0DT-Hero-style curves per ticker).
+    # Runs on every message, but only counts actual trades (last_size > 0).
+    try:
+        from connectors.flow_accumulator import get_accumulator
+        _acc = get_accumulator()
+        if _acc is not None:
+            _acc.on_option_update(data)
+    except Exception as _:
+        pass
 
     strike = data.get('strike', 0)
     contract_type = data.get('contract_type', '')
