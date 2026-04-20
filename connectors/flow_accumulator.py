@@ -76,6 +76,10 @@ class FlowAccumulator:
         self._socketio = socketio
         self._emit_interval = emit_interval_sec
         self._state: dict[str, _TickerState] = {}
+        # Dedup: last `trade_time` seen per option symbol. Schwab repeats
+        # last_size on delta updates that don't represent new trades; without
+        # dedup we'd double-count ~10-20% of flow.
+        self._last_trade_time: dict[str, int] = {}
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -110,6 +114,7 @@ class FlowAccumulator:
         dte = data.get("dte")
         spot = data.get("underlying_price") or 0.0
         symbol = data.get("symbol", "") or ""
+        trade_time = int(data.get("trade_time") or 0)
 
         if not last or not spot or delta is None or dte is None or not symbol:
             return
@@ -119,6 +124,15 @@ class FlowAccumulator:
         ticker = symbol[:6].strip()
         if not ticker:
             return
+
+        # Dedup: if Schwab re-reports the same trade_time for this symbol,
+        # skip. Only dedup when trade_time is present (>0); otherwise count
+        # as a real trade. Check before expensive bucket classification.
+        if trade_time > 0:
+            with self._lock:
+                if self._last_trade_time.get(symbol) == trade_time:
+                    return  # already counted this trade
+                self._last_trade_time[symbol] = trade_time
 
         # Side inference (Lee-Ready quote rule)
         if ask > 0 and last >= ask:
