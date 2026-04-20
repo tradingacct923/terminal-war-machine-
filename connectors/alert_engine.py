@@ -52,6 +52,7 @@ DIVERGE_MIN_MAGNITUDE = 5_000_000   # $5M min signed flow to count a diverge
 DIVERGE_MIN_SPOT_MOVE_PCT = 0.15    # min 0.15% spot move to count
 DIVERGE_WINDOW_SEC = 300            # 5-min look-back for divergence detection
 COOLDOWN_SEC = 60                   # min seconds between same-type alerts per ticker
+MATRIX_TTL_SEC = 300                # State matrix cell decays to 'none' after 5 min idle
 
 
 def _stats(vals):
@@ -412,18 +413,40 @@ class AlertEngine:
 
     def get_state_matrix(self) -> dict:
         """Snapshot per-ticker last-known direction for each alert row.
-        Used by /api/alerts/state to power the AI Panel 4×3 matrix UI."""
-        def label(side: int) -> str:
+        Used by /api/alerts/state to power the AI Panel 4×3 matrix UI.
+
+        Cells decay to 'none' after MATRIX_TTL_SEC of silence for that
+        (ticker, type) pair — prevents a 10am signal from misleading a
+        noon trader who assumes the matrix shows current activity.
+        """
+        def label(side: int, alert_type_key: str, hist) -> str:
+            last_ts = hist.last_alert_ts.get(alert_type_key, 0)
+            # Special case: spike/dump have two keys (spike_<bucket>, dump_<bucket>)
+            if alert_type_key == 'spike_dump':
+                last_ts = max(
+                    hist.last_alert_ts.get('spike_all exp', 0),
+                    hist.last_alert_ts.get('spike_0dte', 0),
+                    hist.last_alert_ts.get('dump_all exp', 0),
+                    hist.last_alert_ts.get('dump_0dte', 0),
+                )
+            elif alert_type_key == 'key_level':
+                last_ts = max(
+                    hist.last_alert_ts.get('key_level_put_wall', 0),
+                    hist.last_alert_ts.get('key_level_call_wall', 0),
+                    hist.last_alert_ts.get('key_level_flip', 0),
+                )
+            if last_ts and (time.time() - last_ts) > MATRIX_TTL_SEC:
+                return 'none'
             if side > 0: return 'bullish'
             if side < 0: return 'bearish'
             return 'none'
         with self._lock:
             return {
                 t: {
-                    'flow_cross':      label(h.last_cross_side),
-                    'flow_divergence': label(h.last_diverge_side),
-                    'key_level':       label(h.last_key_level_side),
-                    'spike_dump':      label(h.last_spike_side),
+                    'flow_cross':      label(h.last_cross_side,       'flow_cross',       h),
+                    'flow_divergence': label(h.last_diverge_side,     'flow_divergence',  h),
+                    'key_level':       label(h.last_key_level_side,   'key_level',        h),
+                    'spike_dump':      label(h.last_spike_side,       'spike_dump',       h),
                 }
                 for t, h in self._history.items()
             }

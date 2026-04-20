@@ -107,6 +107,31 @@ class FlowAccumulator:
         Only counts messages where last_size > 0 (a real trade, not a quote-only update).
         Must be thread-safe — called from the streamer thread.
         """
+        # ── PRE-FILTER DIAGNOSTIC (hard-debug why 0DTE SPX shows 0 trades) ──
+        # Record every message we see for any SPX/SPXW symbol BEFORE filtering,
+        # so we can tell whether trades are arriving with last_size=0 or not
+        # arriving at all.
+        _sym = data.get("symbol", "") or ""
+        if _sym and (_sym.startswith('SPX') or _sym.startswith('SPXW')):
+            _raw = getattr(self, '_raw_spx_diag', None)
+            if _raw is None:
+                _raw = {'totals': {}, 'samples': []}
+                self._raw_spx_diag = _raw
+            _exp = _sym[6:12] if len(_sym) >= 12 else '?'
+            _sz = data.get("last_size", 0) or 0
+            _bucket = 'with_size' if _sz > 0 else 'no_size'
+            _k = (_exp, _bucket)
+            _raw['totals'][_k] = _raw['totals'].get(_k, 0) + 1
+            if len(_raw['samples']) < 5 and _exp == '260420':
+                _raw['samples'].append({
+                    'symbol': _sym, 'last_size': _sz,
+                    'last': data.get('last'), 'bid': data.get('bid'),
+                    'ask': data.get('ask'), 'delta': data.get('delta'),
+                    'dte': data.get('dte'), 'trade_time': data.get('trade_time'),
+                    'underlying_price': data.get('underlying_price'),
+                    'all_keys': list(data.keys()),
+                })
+
         size = data.get("last_size", 0) or 0
         if not size or size <= 0:
             return
@@ -119,6 +144,20 @@ class FlowAccumulator:
         spot = data.get("underlying_price") or 0.0
         symbol = data.get("symbol", "") or ""
         trade_time = int(data.get("trade_time") or 0)
+
+        # Schwab omits `dte` for $SPX / $NDX / $VIX / $RUT index options.
+        # Fall back to computing DTE from the OSI symbol's YYMMDD field so
+        # index-option trades don't get silently dropped. Without this fix,
+        # we lose ~100% of 0DTE SPX trade prints even though Schwab sends them.
+        if dte is None and len(symbol) >= 12:
+            try:
+                from datetime import date as _d
+                yymmdd = symbol[6:12]
+                if yymmdd.isdigit():
+                    y, m, dd = 2000 + int(yymmdd[:2]), int(yymmdd[2:4]), int(yymmdd[4:6])
+                    dte = max(0, (_d(y, m, dd) - _d.today()).days)
+            except Exception:
+                dte = None
 
         if not last or not spot or delta is None or dte is None or not symbol:
             return
@@ -335,6 +374,6 @@ def init_accumulator(socketio) -> FlowAccumulator:
     """Create the global singleton (idempotent)."""
     global _accumulator
     if _accumulator is None:
-        _accumulator = FlowAccumulator(socketio=socketio, emit_interval_sec=1.0)
+        _accumulator = FlowAccumulator(socketio=socketio, emit_interval_sec=0.5)
         _accumulator.start()
     return _accumulator

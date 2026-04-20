@@ -1026,6 +1026,27 @@ def api_alerts_state():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/_debug/spx_raw")
+def api_debug_spx_raw():
+    """PUBLIC — dump _raw_spx_diag from FlowAccumulator.
+    Shows EVERY SPX/SPXW message that arrived, even those dropped for
+    last_size==0. Reveals whether Schwab sends 0DTE trade prints at all."""
+    try:
+        from connectors.flow_accumulator import get_accumulator
+        acc = get_accumulator()
+        if acc is None:
+            return jsonify({"ready": False})
+        raw = getattr(acc, '_raw_spx_diag', None) or {}
+        # Convert tuple keys to strings for JSON serialization
+        totals = {f"{exp}__{bucket}": n for (exp, bucket), n in (raw.get('totals') or {}).items()}
+        return jsonify({
+            "totals": totals,
+            "samples_260420": raw.get('samples') or [],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/_debug/flow_classify")
 def api_debug_flow_classify():
     """PUBLIC — dump FlowAccumulator._classify_diag + _date_diag.

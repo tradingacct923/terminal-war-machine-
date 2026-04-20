@@ -2011,12 +2011,19 @@ def _on_screener_equity(data):
     alerts = []
     for item in items[:20]:
         if isinstance(item, dict):
+            sym = item.get('symbol', '')
+            lp  = _safe_num(item.get('lastPrice', 0))
+            # Cache spot so SCREENER_OPTION's 0DTE bridge can compute delta
+            # for tickers we don't otherwise subscribe to (expands flow beyond
+            # our 9 LEVELONE_EQUITIES names toward broader S&P coverage).
+            if sym and lp > 0:
+                _latest_spot_by_ticker[sym] = lp
             alerts.append({
-                'symbol':        item.get('symbol', ''),
+                'symbol':        sym,
                 'description':   item.get('description', ''),
                 'volume':        _safe_num(item.get('volume', 0)),
                 'trades':        _safe_num(item.get('trades', 0)),
-                'lastPrice':     _safe_num(item.get('lastPrice', 0)),
+                'lastPrice':     lp,
                 'netChange':     _safe_num(item.get('netChange', 0)),
                 'percentChange': _safe_num(item.get('netPercentChange', 0)),
                 'marketShare':   _safe_num(item.get('marketShare', 0)),
