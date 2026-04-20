@@ -286,13 +286,18 @@
             yMin -= pad; yMax += pad;
         }
 
-        // X range — market open to 4pm or data range, whichever wider
+        // X range — fit to actual data range + small right-pad for future
+        // samples. Earlier version pinned x-axis to 09:30-16:00 always, which
+        // crushed short sessions into a vertical sliver. 0DTHero shows only
+        // the data's time window. Mirror that behavior.
         const nowMs = Date.now();
-        const todayMidnight = new Date(); todayMidnight.setHours(0, 0, 0, 0);
-        const openMs = todayMidnight.getTime() + _sessionStartHr * 3600e3;
-        const closeMs = todayMidnight.getTime() + _sessionEndHr * 3600e3;
-        const tMin = Math.min(data[0].t, openMs);
-        const tMax = Math.max(nowMs, closeMs, data[data.length - 1].t);
+        const dataTMin = data[0].t;
+        const dataTMax = Math.max(nowMs, data[data.length - 1].t);
+        const dataSpan = Math.max(1, dataTMax - dataTMin);
+        // Right-pad 5% so the latest sample doesn't touch the right edge.
+        // Left edge stays at first data point (no pre-session empty space).
+        const tMin = dataTMin;
+        const tMax = dataTMax + dataSpan * 0.05;
         const tSpan = Math.max(1, tMax - tMin);
 
         // Horizontal grid lines (8 divisions)
