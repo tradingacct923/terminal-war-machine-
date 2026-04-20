@@ -46,13 +46,28 @@ class _TickerHistory:
     last_walls_update_ts: float = 0
 
 
-SIGMA_THRESHOLD_SPIKE = 2.5         # σ above rolling mean → spike
-SIGMA_THRESHOLD_VOLUME = 2.0        # σ above for bullish_volume
-DIVERGE_MIN_MAGNITUDE = 5_000_000   # $5M min signed flow to count a diverge
-DIVERGE_MIN_SPOT_MOVE_PCT = 0.15    # min 0.15% spot move to count
-DIVERGE_WINDOW_SEC = 300            # 5-min look-back for divergence detection
-COOLDOWN_SEC = 60                   # min seconds between same-type alerts per ticker
-MATRIX_TTL_SEC = 300                # State matrix cell decays to 'none' after 5 min idle
+# ────────────────────────────────────────────────────────────────────────────
+# ABSOLUTE-DOLLAR THRESHOLDS (0DTHero-style).
+# Calibrated from observed 0DTHero alert magnitudes:
+#   SPY dump -102.17M, -115.28M  → dump_floor must be ≥$50M
+#   QQQ dump -120.80M, QQQ spike +140.34M / +147.28M / +171.78M
+#   (their log never shows sub-$50M events)
+# Absolute floors mean a $0.05M retail-sized AMZN trade never trips a spike.
+# σ thresholds stayed in place as a SECONDARY filter — a move must be BOTH
+# big in dollars AND unusual vs the rolling window. (Before this change the
+# σ test alone could fire on $50k moves during a quiet window.)
+# ────────────────────────────────────────────────────────────────────────────
+SPIKE_DUMP_MIN_MAGNITUDE   = 50_000_000    # $50M floor for spike/dump [all exp]
+SPIKE_DUMP_MIN_MAGNITUDE_0DTE = 25_000_000 # $25M floor for 0DTE spike/dump (tighter window → smaller notional)
+BULLISH_VOLUME_MIN_MAGNITUDE  = 25_000_000 # $25M floor for bullish_volume
+FLOW_CROSS_MIN_MAGNITUDE      = 5_000_000  # $5M floor for flow cross (0dte−all_exp delta)
+SIGMA_THRESHOLD_SPIKE   = 2.5              # σ above rolling mean → spike (secondary filter)
+SIGMA_THRESHOLD_VOLUME  = 2.0              # σ above for bullish_volume (secondary filter)
+DIVERGE_MIN_MAGNITUDE   = 25_000_000       # $25M min signed flow to count a divergence
+DIVERGE_MIN_SPOT_MOVE_PCT = 0.15           # min 0.15% spot move to count
+DIVERGE_WINDOW_SEC   = 300                 # 5-min look-back for divergence detection
+COOLDOWN_SEC         = 60                  # min seconds between same-type alerts per ticker
+MATRIX_TTL_SEC       = 300                 # State matrix cell decays to 'none' after 5 min idle
 
 
 def _stats(vals):
@@ -199,6 +214,11 @@ class AlertEngine:
 
         if not (crossed_up or crossed_down):
             return out
+        # Absolute-dollar floor: don't alert on crosses where neither leg has
+        # meaningful notional. Retail $0.01M crosses between 0DTE and all-exp
+        # are not institutional signals — 0DTHero's log never shows them.
+        if abs(curr_diff) < FLOW_CROSS_MIN_MAGNITUDE:
+            return out
         # cooldown
         last_ts = hist.last_alert_ts.get('flow_cross', 0)
         if ts - last_ts < COOLDOWN_SEC:
@@ -248,8 +268,13 @@ class AlertEngine:
             if std < 1000:  # insufficient variance
                 continue
             z = (recent - mean * 30) / std if std > 0 else 0
+            # Absolute-dollar floor: 0DTHero's log shows spike/dump events ≥$50M
+            # for all-exp and ≥$25M for 0DTE. Anything smaller is retail noise
+            # that their platform never surfaces as an alert.
+            abs_floor = (SPIKE_DUMP_MIN_MAGNITUDE_0DTE if bucket_name == '0dte'
+                         else SPIKE_DUMP_MIN_MAGNITUDE)
             # Spike (positive): require both above-σ AND net positive magnitude
-            if z > SIGMA_THRESHOLD_SPIKE and recent > 0:
+            if z > SIGMA_THRESHOLD_SPIKE and recent > 0 and recent >= abs_floor:
                 last_ts = hist.last_alert_ts.get(f'spike_{bucket_name}', 0)
                 if ts - last_ts < COOLDOWN_SEC:
                     continue
@@ -266,7 +291,7 @@ class AlertEngine:
                     'label': f"{ticker} spike +{recent / 1e6:.2f}M [{bucket_name}]",
                 })
             # Dump (negative): require both below-σ AND net negative magnitude
-            elif z < -SIGMA_THRESHOLD_SPIKE and recent < 0:
+            elif z < -SIGMA_THRESHOLD_SPIKE and recent < 0 and abs(recent) >= abs_floor:
                 last_ts = hist.last_alert_ts.get(f'dump_{bucket_name}', 0)
                 if ts - last_ts < COOLDOWN_SEC:
                     continue
@@ -352,6 +377,10 @@ class AlertEngine:
             return out
         z = (recent_30s - mean_v * 30) / (std_v * (30 ** 0.5))
         if z < SIGMA_THRESHOLD_VOLUME:
+            return out
+        # Absolute floor: only surface bullish-volume alerts at institutional
+        # scale. Below $25M / 30s it's retail activity, not size.
+        if recent_30s < BULLISH_VOLUME_MIN_MAGNITUDE:
             return out
 
         # Direction check: signed flow over same window must be positive
