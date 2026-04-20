@@ -335,9 +335,10 @@ def _subscribe_options_for_ticker(
 
     Mirrors _subscribe_qqq_options but generalized so SPY + Mag7 can reuse it.
 
-    strike_radius defaults to 3% of spot (tighter than QQQ's $60 because these
-    tickers range from $200 to $700 spots).
-    expiries_count: how many nearest expirations to subscribe (2 = 0DTE + next).
+    strike_radius defaults to 6% of spot (wide enough to capture institutional
+    hedge put strikes that drive the biggest flow-dump alerts).
+    expiries_count: how many nearest expirations to subscribe (3 = 0DTE +
+    next weekly + next monthly for a ticker with monthly Fridays).
     cap: max contracts per ticker to avoid blowing through Schwab's symbol limit.
 
     Returns number of contracts subscribed.
@@ -356,7 +357,7 @@ def _subscribe_options_for_ticker(
             return 0
 
         exp_dates = raw_dates[:expiries_count]
-        radius = strike_radius if strike_radius is not None else max(2.0, spot * 0.03)
+        radius = strike_radius if strike_radius is not None else max(4.0, spot * 0.06)
 
         symbols = []
         for exp_date in exp_dates:
@@ -390,24 +391,26 @@ def _subscribe_options_for_ticker(
 
 
 def _subscribe_spy_options() -> int:
-    """SPY: wide radius because SPY is high-liquidity, many traders pin here.
-    ATM ±$8 (~1.1% of spot $711), 2 expiries (0DTE + next), cap 80 contracts.
+    """SPY: wide chain coverage for accurate flow-dump/cross detection.
+    ATM ±$30 (~4% of spot $711), 6 expiries (0DTE + next 5 weekly/monthly),
+    cap 400. Targets ~300 contracts in practice.
     """
-    return _subscribe_options_for_ticker("SPY", strike_radius=8.0, expiries_count=2, cap=80)
+    return _subscribe_options_for_ticker("SPY", strike_radius=30.0, expiries_count=6, cap=400)
 
 
-# Mag7 — each gets a small ATM window + single nearest expiry (0DTE).
-# 20 contracts × 7 tickers = 140 new subscriptions. Combined with QQQ 200 + SPY 80
-# = ~420 option symbols, under Schwab's 500-symbol streamer limit.
+# Mag7 — each gets a 6%-of-spot window + 3 nearest expiries (captures 0DTE +
+# next weekly + next monthly). Per-ticker cap 60 → ~40-60 contracts each.
+# Combined target: QQQ 200 + SPY 300 + Mag7 ~320 = ~820 symbols.
+# Tests whether Schwab streamer accepts 800+ simultaneous options.
 MAG7_TICKERS = ("AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA")
 
 
 def _subscribe_mag7_options() -> int:
-    """Subscribe to 0DTE ATM options for each Mag7 name."""
+    """Subscribe to ATM options (3 expiries) for each Mag7 name."""
     total = 0
     for ticker in MAG7_TICKERS:
         n = _subscribe_options_for_ticker(
-            ticker, strike_radius=None, expiries_count=1, cap=20
+            ticker, strike_radius=None, expiries_count=3, cap=60
         )
         total += n
     log.info(f"[SCHWAB-BRIDGE] 📊 Mag7 total: {total} options across {len(MAG7_TICKERS)} tickers")
