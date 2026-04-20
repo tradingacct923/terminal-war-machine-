@@ -627,15 +627,9 @@ def _on_options_quote(data):
     global _gex_dirty, _last_option_update_ts
     _last_option_update_ts = time.time()
 
-    # Feed signed-flow accumulator (0DT-Hero-style curves per ticker).
-    # Runs on every message, but only counts actual trades (last_size > 0).
-    try:
-        from connectors.flow_accumulator import get_accumulator
-        _acc = get_accumulator()
-        if _acc is not None:
-            _acc.on_option_update(data)
-    except Exception as _:
-        pass
+    # (flow accumulator feed moved AFTER cache merge — see bottom of function)
+    # Schwab sends delta-only updates; raw `data` often lacks delta/dte/spot.
+    # We need to call accumulator with the MERGED cached view.
 
     strike = data.get('strike', 0)
     contract_type = data.get('contract_type', '')
@@ -670,6 +664,28 @@ def _on_options_quote(data):
             if v is not None and v != 0 and v != '':
                 cached[k] = v
         _sym_cache[sym_key] = cached
+
+        # Feed signed-flow accumulator with the MERGED cached view so that
+        # delta/dte/underlying_price are always populated (Schwab sends
+        # delta-only updates where these fields are absent on most messages).
+        # Only count actual trades — last_size must be in THIS incoming delta
+        # (not cached) so we don't re-process stale trades.
+        if data.get('last_size', 0) > 0:
+            try:
+                from connectors.flow_accumulator import get_accumulator
+                _acc = get_accumulator()
+                if _acc is not None:
+                    # Build a merged snapshot: cached fills in missing fields,
+                    # but keep the current message's last_size/last/trade_time
+                    # so dedup works correctly.
+                    merged = dict(cached)  # cache has everything accumulated
+                    # Override with fresh trade-specific fields from this msg
+                    for k in ('last_size', 'last', 'trade_time', 'bid', 'ask'):
+                        if data.get(k) is not None:
+                            merged[k] = data[k]
+                    _acc.on_option_update(merged)
+            except Exception as _:
+                pass
     else:
         cached = {}
 

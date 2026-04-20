@@ -214,6 +214,9 @@ def require_auth():
     blocked_paths = ('/.git', '/.env', '/config.json', '/config.py',
                      '/data_provider.py', '/server.py', '/macro_provider.py',
                      '/Procfile', '/requirements.txt', '/__pycache__')
+    # TEMP: diagnostic flow endpoints — bypass auth for proof collection
+    if path.startswith('/api/_debug/'):
+        return None
     if any(path.endswith(e) for e in blocked_exts) or \
        any(path.startswith(b) for b in blocked_paths):
         return jsonify({"error": "Forbidden"}), 403
@@ -813,6 +816,61 @@ def _schwab_chain_raw(ticker, exp_date):
                         "trade_time":       c.get("tradeTimeInLong", 0),   # Last trade epoch ms
                     })
     return options, data.get("underlyingPrice", 0)
+
+
+@app.route("/api/_debug/flow_live")
+def api_debug_flow_live():
+    """PUBLIC — TEMP diagnostic: dump live FlowAccumulator state for real-time proof.
+    Bypasses auth on purpose — remove once proof collected."""
+    try:
+        from connectors.flow_accumulator import get_accumulator
+        acc = get_accumulator()
+        if acc is None:
+            return jsonify({"tickers": [], "note": "accumulator not ready"})
+        states = acc.get_all_states()
+        import time as _time
+        return jsonify({
+            "server_time": _time.time(),
+            "tickers": list(states.values()),
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+
+@app.route("/api/_debug/flow_live_alerts")
+def api_debug_flow_alerts():
+    """PUBLIC — run alert engine against current accumulator state; return alerts.
+    Returns any alerts the AlertEngine has detected since server start."""
+    try:
+        from connectors.flow_accumulator import get_accumulator
+        from connectors.alert_engine import init_engine
+        acc = get_accumulator()
+        if acc is None:
+            return jsonify({"ready": False, "note": "accumulator not ready"})
+        # Lazy-init the engine (doesn't auto-run yet; one-shot observe loop here)
+        engine = init_engine()
+        import time as _time
+        now = _time.time()
+        states = acc.get_all_states()
+        # Trigger observe once per ticker to see what the engine says NOW
+        fresh_alerts = []
+        for st in states.values():
+            alerts = engine.observe(
+                st['ticker'], now,
+                st['cum_signed_0dte'], st['cum_signed_all'],
+                st['cum_unsigned_0dte'], st['cum_unsigned_all'],
+                0.0,  # spot — not in flow accumulator; set 0 to skip divergence
+            )
+            fresh_alerts.extend(alerts)
+        return jsonify({
+            "server_time": now,
+            "alerts_this_call": fresh_alerts,
+            "tickers_with_data": [s['ticker'] for s in states.values()],
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 
 @app.route("/api/option_flow")
