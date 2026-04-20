@@ -572,6 +572,10 @@ def _on_equity_quote(data):
 
     _tick_count += 1
 
+    # Universal spot cache (used by screener→accumulator bridge for delta est)
+    if symbol and not symbol.startswith('$'):
+        _latest_spot_by_ticker[symbol] = last
+
     # Update NDX cache (critical for NQ conversion accuracy)
     if symbol in ('$NDX.X', 'NDX', '$NDX'):
         _latest_ndx = last
@@ -1622,7 +1626,160 @@ def _on_nyse_book(data):
             pass
 
 
+# Per-contract state cached between screener snapshots. Used to compute
+# incremental volume (delta trades since last update) and tick direction
+# (side inference: price up = buyer, price down = seller).
+_screener_prev: dict[str, dict] = {}  # symbol -> {volume, lastPrice}
+
+# Ticker → latest spot price. Populated from CHART_EQUITY bars + LEVELONE_EQUITIES.
+# Used by the screener→accumulator bridge to estimate delta for 0DTE contracts.
+_latest_spot_by_ticker: dict[str, float] = {}
+
 _screener_logged = False
+
+def _tape_spot_for(ticker: str) -> float:
+    """Latest underlying spot for a ticker. Fallback chain:
+      1. _latest_spot_by_ticker (populated by CHART_EQUITY + LEVELONE_EQUITIES)
+      2. Hard-coded _latest_qqq legacy cache
+    """
+    sp = _latest_spot_by_ticker.get(ticker, 0.0)
+    if sp > 0:
+        return sp
+    if ticker == 'QQQ':
+        return _latest_qqq
+    return 0.0
+
+
+def _estimate_delta_and_dte(symbol: str, last_price: float, spot: float) -> tuple:
+    """Best-effort delta + DTE + bucket from a Schwab option symbol.
+
+    Schwab symbol layout: `TICKER(6) YYMMDD C|P strike(8-digit × 1000)`
+      e.g. 'SPY   260420C00710000' → SPY, 2026-04-20, call, strike 710.00
+
+    Delta estimate: very simple moneyness proxy (better: use greek_surface
+    but it's only populated for QQQ).
+      ATM call: ~0.5, deep ITM call: ~0.9, deep OTM call: ~0.1
+      Linear interpolation over ±5% of spot.
+    """
+    try:
+        if len(symbol) < 15:
+            return (0.0, -1)
+        yy, mm, dd = symbol[6:8], symbol[8:10], symbol[10:12]
+        ct = symbol[12]  # 'C' or 'P'
+        strike_raw = int(symbol[13:21]) / 1000.0
+        from datetime import date as _date
+        exp = _date(2000 + int(yy), int(mm), int(dd))
+        dte = (exp - _date.today()).days
+        if spot <= 0 or strike_raw <= 0:
+            return (0.0, dte)
+        # Moneyness ratio — for calls: ITM when spot > strike, ATM at 1.0
+        if ct == 'C':
+            ratio = (spot - strike_raw) / max(spot, 1e-9)  # positive = ITM
+            # Map ratio → delta: ATM (0) = 0.5, +5% ITM = 0.85, -5% OTM = 0.15
+            delta = 0.5 + ratio * 7  # scale 1% moneyness ≈ 7pp delta
+            delta = max(0.02, min(0.98, delta))
+        else:  # put
+            ratio = (strike_raw - spot) / max(spot, 1e-9)  # positive = ITM put
+            delta = -(0.5 + ratio * 7)
+            delta = min(-0.02, max(-0.98, delta))
+        return (delta, dte)
+    except Exception:
+        return (0.0, -1)
+
+
+def _screener_to_accumulator(items: list, market_ts_ms: int) -> int:
+    """Synthesize LEVELONE_OPTIONS-like messages from screener items and
+    feed them into FlowAccumulator. Fills the 0DTE gap that LEVELONE
+    silently drops.
+
+    Per-item math (since screener gives cumulative session stats):
+      new_volume = curr.volume - prev.volume   # incremental contracts traded
+      side = +1 if lastPrice > prev.lastPrice  # tick-direction proxy
+              -1 if lastPrice < prev.lastPrice
+               0 if equal (skip signed, count unsigned)
+      delta = estimated from moneyness (spot vs strike)
+      signed_dn = side × new_volume × delta × spot × 100
+
+    Only processes contracts that are 0DTE (today's expiration) — we
+    already have LEVELONE for non-0DTE so no need to double-count.
+    """
+    if not items:
+        return 0
+    global _screener_prev
+    try:
+        from connectors.flow_accumulator import get_accumulator
+        acc = get_accumulator()
+        if acc is None:
+            return 0
+    except Exception:
+        return 0
+
+    processed = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        sym = item.get('symbol', '') or ''
+        if len(sym) < 15:
+            continue
+        ticker = sym[:6].strip()
+        if not ticker:
+            continue
+
+        # Skip if we don't have a live spot for this ticker (needed for delta)
+        spot = _tape_spot_for(ticker)
+        if spot <= 0:
+            # Try pulling from flow_accumulator's cached spot
+            try:
+                spot = acc._latest_spot.get(ticker, 0.0)
+            except Exception:
+                spot = 0.0
+        if spot <= 0:
+            continue
+
+        curr_vol = _safe_num(item.get('volume', 0))
+        curr_px  = _safe_num(item.get('lastPrice', 0))
+        if curr_vol <= 0 or curr_px <= 0:
+            continue
+
+        delta, dte = _estimate_delta_and_dte(sym, curr_px, spot)
+        if dte != 0:
+            continue  # only process 0DTE from screener (non-0DTE we get via LEVELONE)
+
+        prev = _screener_prev.get(sym)
+        new_vol = curr_vol - (prev['volume'] if prev else curr_vol)
+        px_diff = curr_px - (prev['lastPrice'] if prev else curr_px)
+        if new_vol <= 0 or not prev:
+            # First-observation: cache + skip (need prior to compute delta)
+            _screener_prev[sym] = {'volume': curr_vol, 'lastPrice': curr_px}
+            continue
+
+        if px_diff > 0:   # tick up → buyer-initiated
+            bid, ask = curr_px - 0.01, curr_px
+        elif px_diff < 0: # tick down → seller-initiated
+            bid, ask = curr_px, curr_px + 0.01
+        else:
+            bid, ask = curr_px, curr_px  # ambiguous; accumulator will skip signed
+
+        fake_msg = {
+            'symbol':           sym,
+            'bid':              bid,
+            'ask':              ask,
+            'last':             curr_px,
+            'last_size':        new_vol,
+            'delta':            delta,
+            'dte':              0,
+            'underlying_price': spot,
+            'trade_time':       int(market_ts_ms),
+        }
+        try:
+            acc.on_option_update(fake_msg)
+            processed += 1
+        except Exception:
+            pass
+        _screener_prev[sym] = {'volume': curr_vol, 'lastPrice': curr_px}
+
+    return processed
+
 
 def _on_screener_option(data):
     """Handle real-time options screener updates — unusual activity radar.
@@ -1632,6 +1789,10 @@ def _on_screener_option(data):
       items: list of dicts with named keys (symbol, description, lastPrice,
              totalVolume, netChange, netPercentChange)
       sort_field, frequency, _timestamp
+
+    Also bridges into FlowAccumulator for 0DTE contracts (Schwab's
+    LEVELONE_OPTIONS silently drops same-day-exp trade updates, so
+    screener is the only way we see 0DTE flow).
     """
     global _screener_logged
     if not _socketio:
@@ -1677,6 +1838,15 @@ def _on_screener_option(data):
             'market_total_volume': market_total,
             'timestamp': data.get('_timestamp', 0),
         })
+
+    # Feed 0DTE contracts into FlowAccumulator (LEVELONE doesn't push them)
+    try:
+        n = _screener_to_accumulator(items, data.get('_timestamp', int(time.time() * 1000)))
+        if n > 0 and not getattr(_on_screener_option, '_bridge_logged', False):
+            log.info(f"[SCHWAB-BRIDGE] Screener→FlowAccumulator bridge active (first batch: {n} 0DTE messages synthesized)")
+            _on_screener_option._bridge_logged = True
+    except Exception as e:
+        log.debug(f"[SCHWAB-BRIDGE] screener→accumulator bridge error: {e}")
 
 
 # ── Equity screener handler (NYSE + NASDAQ most-active stocks) ────────────────
@@ -1763,6 +1933,14 @@ def _on_chart_equity(data):
     if not _chart_equity_logged:
         log.info(f"[SCHWAB-BRIDGE] CHART_EQUITY first bar: {symbol} data_keys={list(data.keys())[:10]}")
         _chart_equity_logged = True
+
+    # Cache close price as spot (used by screener bridge for delta estimation)
+    close = data.get('close')
+    if close:
+        try:
+            _latest_spot_by_ticker[symbol] = float(close)
+        except (TypeError, ValueError):
+            pass
 
     _socketio.emit('chart_equity_update', {
         'symbol': symbol,
