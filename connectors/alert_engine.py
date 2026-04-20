@@ -314,21 +314,24 @@ class AlertEngine:
         """Spot crosses a wall/flip level with follow-through.
 
         Walls are fed in from schwab_bridge via update_walls(). Fires when the
-        previous sample's spot was on one side of a level and the current
-        sample is on the other side, with |delta_spot/prev_spot| ≥ 0.05%
-        (filters jitter at the close) and |spot − level| < 0.1% of spot.
+        spot from ~5s ago was on one side of a level and the current spot is
+        on the other side, with >=0.02% sustained move over the window
+        (filters 1-tick jitter). Cooldown (60s per level) prevents oscillation
+        fire-chains when spot hovers at a level.
         """
         out = []
         walls = hist.last_walls or {}
-        if not walls or len(hist.samples) < 5:
+        if not walls or len(hist.samples) < 10:
             return out
-        prev = hist.samples[-2]
+        # 5-sample lookback (~5s) vs current. Wider than adjacent samples so
+        # slow drifts into a level still register as a cross.
+        prev = hist.samples[-6]
         curr = hist.samples[-1]
         prev_spot, curr_spot = prev[5], curr[5]
         if prev_spot <= 0 or curr_spot <= 0:
             return out
         spot_pct_move = abs(curr_spot - prev_spot) / prev_spot
-        if spot_pct_move < 0.0005:  # 0.05% follow-through required
+        if spot_pct_move < 0.0002:  # 0.02% sustained over 5s
             return out
 
         for level_name, level in walls.items():

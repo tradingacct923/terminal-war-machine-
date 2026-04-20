@@ -145,13 +145,25 @@ const AIPanel = (() => {
         _logEl.innerHTML = frag;
     }
 
-    function _addLogEntry(alert) {
+    function _formatMsg(alert) {
+        // Backend `label` already contains magnitude + bucket for most alert
+        // types (e.g. "SPY dump -102.17M [all exp]"). Use it when present;
+        // only synthesize a fallback if label is missing. Never append mag/
+        // bucket twice.
+        if (alert.label) return alert.label;
         const mag = alert.magnitude_m;
         const bucket = alert.bucket ? ` [${alert.bucket}]` : '';
         const sign = (mag != null && mag >= 0) ? '+' : '';
         const magStr = (mag != null) ? ` ${sign}${mag.toFixed(2)}M` : '';
-        const msg = (alert.label || alert.type || '') + magStr + bucket;
-        _logRows.unshift({ msg, time: _fmtTime(alert.ts), direction: alert.direction });
+        return (alert.ticker || '') + ' ' + (alert.type || '') + magStr + bucket;
+    }
+
+    function _addLogEntry(alert) {
+        _logRows.unshift({
+            msg: _formatMsg(alert),
+            time: _fmtTime(alert.ts),
+            direction: alert.direction,
+        });
         if (_logRows.length > MAX_LOG_ROWS) _logRows.length = MAX_LOG_ROWS;
         _renderLogRows();
     }
@@ -189,24 +201,32 @@ const AIPanel = (() => {
             })
             .catch(() => {});
 
-        // Seed log
+        // Seed log. Preserve any live alerts that arrived between init and
+        // this response (hydration race): prepend existing _logRows after
+        // the server history so newest-first order is retained.
         fetch('/api/_debug/alert_log', { headers: hdrs })
             .then(r => r.json())
             .then(d => {
                 if (!_container) return;
                 const alerts = (d && d.alerts) || [];
-                _logRows = [];
+                const fromServer = [];
                 for (const a of alerts.slice(-MAX_LOG_ROWS).reverse()) {
-                    const mag = a.magnitude_m;
-                    const bucket = a.bucket ? ` [${a.bucket}]` : '';
-                    const sign = (mag != null && mag >= 0) ? '+' : '';
-                    const magStr = (mag != null) ? ` ${sign}${mag.toFixed(2)}M` : '';
-                    _logRows.push({
-                        msg: (a.label || a.type || '') + magStr + bucket,
+                    fromServer.push({
+                        msg: _formatMsg(a),
                         time: _fmtTime(a.ts),
                         direction: a.direction,
                     });
                 }
+                // Any live rows that arrived during fetch live at top of _logRows.
+                // Merge: live rows first (newest), then server history (older).
+                // De-duplicate by (msg, time) to avoid double-showing the same
+                // alert if both streams saw it.
+                const liveSeen = new Set(_logRows.map(r => r.msg + '|' + r.time));
+                const merged = _logRows.slice();
+                for (const r of fromServer) {
+                    if (!liveSeen.has(r.msg + '|' + r.time)) merged.push(r);
+                }
+                _logRows = merged.slice(0, MAX_LOG_ROWS);
                 _renderLogRows();
             })
             .catch(() => {});
