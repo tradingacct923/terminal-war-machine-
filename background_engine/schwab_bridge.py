@@ -238,6 +238,21 @@ def _run_bridge():
         except Exception as e:
             log.warning(f"[SCHWAB-BRIDGE] Flow accumulator init failed: {e}")
 
+        # Populate expiration-metadata cache for all subscribed tickers so
+        # flow trades can be bucketed as 0DTE / weekly / monthly / quarterly /
+        # LEAPS in the accumulator + alert labels.
+        try:
+            from connectors.expiration_cache import init_cache
+            from server import _schwab_get
+            _exp_cache = init_cache(refresh_interval_sec=3600)
+            _subscribed_tickers = ["QQQ", "SPY"] + list(MAG7_TICKERS)
+            _total_exps = 0
+            for _t in _subscribed_tickers:
+                _total_exps += _exp_cache.refresh(_t, _schwab_get)
+            log.info(f"[SCHWAB-BRIDGE] Expiration cache: {_total_exps} entries across {len(_subscribed_tickers)} tickers")
+        except Exception as e:
+            log.warning(f"[SCHWAB-BRIDGE] Expiration cache init failed: {e}")
+
         log.info("[SCHWAB-BRIDGE] All subscriptions active")
 
         # Keep thread alive and log stats periodically

@@ -36,8 +36,22 @@ log = logging.getLogger(__name__)
 
 
 @dataclass
+class _BucketState:
+    """Signed/unsigned + trade count for one (ticker, bucket) pair."""
+    cum_signed: float = 0.0
+    cum_unsigned: float = 0.0
+    trades: int = 0
+
+
+@dataclass
 class _TickerState:
-    """Per-ticker running totals. All dollar amounts in raw units (not millions)."""
+    """Per-ticker running totals.
+
+    Legacy 0DTE/all fields are preserved for backwards-compat with the
+    flow pane frontend. New bucket-level fields provide weekly/monthly/
+    LEAPS splits for 0DT-Hero-style alert labelling.
+    """
+    # Legacy 2-way split (kept for frontend compat)
     cum_signed_0dte: float = 0.0
     cum_signed_all: float = 0.0
     cum_unsigned_0dte: float = 0.0
@@ -46,6 +60,13 @@ class _TickerState:
     trades_all: int = 0
     ambiguous_trades: int = 0
     last_update_ts: float = 0.0
+
+    # New: per-bucket state. Keys: '0dte','weekly','monthly','quarterly','leaps','unknown'
+    buckets: dict = None
+
+    def __post_init__(self):
+        if self.buckets is None:
+            self.buckets = {}
 
 
 class FlowAccumulator:
@@ -114,8 +135,21 @@ class FlowAccumulator:
 
         is_0dte = int(dte) == 0
 
+        # Classify expiration bucket (0dte, weekly, monthly, quarterly, leaps)
+        bucket = '0dte' if is_0dte else 'unknown'
+        try:
+            from connectors.expiration_cache import get_cache
+            _c = get_cache()
+            if _c is not None:
+                _t2, _b = _c.classify_symbol(symbol)
+                if _b and _b != 'unknown':
+                    bucket = _b
+        except Exception:
+            pass
+
         with self._lock:
             st = self._state.setdefault(ticker, _TickerState())
+            # Legacy 2-way split (frontend compat)
             st.cum_unsigned_all += unsigned
             st.trades_all += 1
             if is_0dte:
@@ -128,6 +162,13 @@ class FlowAccumulator:
                 if is_0dte:
                     st.cum_signed_0dte += signed
             st.last_update_ts = time.time()
+
+            # Per-bucket aggregation (new: weekly/monthly/quarterly/leaps split)
+            bkt = st.buckets.setdefault(bucket, _BucketState())
+            bkt.cum_unsigned += unsigned
+            bkt.trades += 1
+            if side != 0:
+                bkt.cum_signed += signed
 
     def get_state(self, ticker: str) -> Optional[dict]:
         """Snapshot for a ticker — used by /api/flow diagnostic endpoints."""
@@ -152,14 +193,25 @@ class FlowAccumulator:
             return {t: self._ticker_dict(t, st) for t, st in self._state.items()}
 
     def _ticker_dict(self, ticker: str, st: _TickerState) -> dict:
+        bucket_data = {
+            name: {
+                "cum_signed": b.cum_signed,
+                "cum_unsigned": b.cum_unsigned,
+                "trades": b.trades,
+            }
+            for name, b in (st.buckets or {}).items()
+        }
         return {
             "ticker": ticker,
+            # Legacy 2-way split (flow pane keeps rendering from these)
             "cum_signed_0dte": st.cum_signed_0dte,
             "cum_signed_all": st.cum_signed_all,
             "cum_unsigned_0dte": st.cum_unsigned_0dte,
             "cum_unsigned_all": st.cum_unsigned_all,
             "trades_0dte": st.trades_0dte,
             "trades_all": st.trades_all,
+            # New: per-bucket breakdown for alert labels
+            "buckets": bucket_data,
         }
 
     def _emit_loop(self) -> None:
