@@ -1046,6 +1046,73 @@ def api_alerts_state():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/_debug/levelone_cache_probe")
+def api_debug_levelone_cache_probe():
+    """Probe: does our LEVELONE cache have the exact symbol SCREENER sends?"""
+    try:
+        from background_engine.schwab_bridge import _on_options_quote, _on_screener_option
+        cache = getattr(_on_options_quote, '_sym_cache', {}) or {}
+        raw = getattr(_on_screener_option, '_rawdiag', None) or {}
+        samples = raw.get('samples', [])
+        # For each screener sample, check if its symbol is in LEVELONE cache
+        probes = []
+        for s in samples[:5]:
+            sym = s.get('symbol', '')
+            cached = cache.get(sym) or {}
+            probes.append({
+                'screener_symbol': sym,
+                'in_levelone_cache': sym in cache,
+                'cached_delta': cached.get('delta'),
+                'cached_bid': cached.get('bid'),
+                'cached_ask': cached.get('ask'),
+                'cached_dte': cached.get('dte'),
+            })
+        # Also spot-check: how many total symbols are in LEVELONE cache?
+        return jsonify({
+            'levelone_cache_size': len(cache),
+            'sample_cache_keys': list(cache.keys())[:5],
+            'probes': probes,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/_debug/screener_delta_source")
+def api_debug_screener_delta_source():
+    """PUBLIC — ratio of SCREENER_OPTION items whose delta came from Schwab's
+    LEVELONE cache (real) vs a moneyness-linear fallback (estimated)."""
+    try:
+        from background_engine.schwab_bridge import _screener_to_accumulator
+        src = getattr(_screener_to_accumulator, '_src_diag', {}) or {}
+        total = sum(src.values()) or 1
+        return jsonify({
+            "counts": dict(src),
+            "pct_real": round(100 * src.get('levelone_cache', 0) / total, 2),
+            "pct_estimated": round(100 * src.get('estimated', 0) / total, 2),
+            "total": sum(src.values()),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/_debug/screener_raw")
+def api_debug_screener_raw():
+    """PUBLIC — dump what SCREENER_OPTION actually sends us from Schwab.
+    Reveals whether Schwab includes delta/bid/ask natively or whether we
+    truly need to estimate them."""
+    try:
+        from background_engine.schwab_bridge import _on_screener_option
+        raw = getattr(_on_screener_option, '_rawdiag', None) or {}
+        keys = sorted(raw.get('all_keys_seen', set()))
+        return jsonify({
+            "all_keys_ever_seen": keys,
+            "n_distinct_keys": len(keys),
+            "samples": raw.get('samples', []),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/_debug/spx_raw")
 def api_debug_spx_raw():
     """PUBLIC — dump _raw_spx_diag from FlowAccumulator.

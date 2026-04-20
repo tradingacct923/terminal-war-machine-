@@ -1880,7 +1880,41 @@ def _screener_to_accumulator(items: list, market_ts_ms: int) -> int:
         if curr_vol <= 0 or curr_px <= 0:
             continue
 
-        delta, dte = _estimate_delta_and_dte(sym, curr_px, spot)
+        # Prefer Schwab's REAL delta from the LEVELONE cache if this contract
+        # is already subscribed (SPX/SPY/QQQ/Mag7/NDX/VIX). Only fall back to
+        # linear estimation when the contract isn't in our subscription list.
+        # Same for real bid/ask — use Schwab's quotes when available.
+        #
+        # DTE note: Schwab sends dte=null for index options AND for 0DTE on
+        # equity options. Symbol-parsed dte (from the OSI YYMMDD slice) is
+        # ALWAYS correct, so we always derive dte from the symbol and only
+        # prefer Schwab-provided delta/bid/ask.
+        real_delta = None
+        real_bid = real_ask = None
+        try:
+            _levelone_cache = getattr(_on_options_quote, '_sym_cache', {})
+            cached = _levelone_cache.get(sym)
+            if cached:
+                _rd = cached.get('delta')
+                if _rd is not None and _rd != 0:
+                    real_delta = float(_rd)
+                _rb = cached.get('bid')
+                if _rb is not None and _rb > 0:
+                    real_bid = float(_rb)
+                _ra = cached.get('ask')
+                if _ra is not None and _ra > 0:
+                    real_ask = float(_ra)
+        except Exception:
+            pass
+
+        # Always derive dte from symbol (Schwab's null dte is useless).
+        _est_delta, dte = _estimate_delta_and_dte(sym, curr_px, spot)
+        if real_delta is not None:
+            delta = real_delta
+            delta_source = 'levelone_cache'
+        else:
+            delta = _est_delta
+            delta_source = 'estimated'
         if dte != 0:
             continue  # only process 0DTE from screener (non-0DTE we get via LEVELONE)
 
@@ -1892,12 +1926,22 @@ def _screener_to_accumulator(items: list, market_ts_ms: int) -> int:
             _screener_prev[sym] = {'volume': curr_vol, 'lastPrice': curr_px}
             continue
 
-        if px_diff > 0:   # tick up → buyer-initiated
+        # Prefer real bid/ask from LEVELONE cache; fall back to synthesized
+        # 1¢ spread ONLY for tickers we don't subscribe to via LEVELONE.
+        if real_bid is not None and real_ask is not None and real_bid > 0 and real_ask > 0:
+            bid, ask = real_bid, real_ask
+        elif px_diff > 0:   # tick up → buyer-initiated
             bid, ask = curr_px - 0.01, curr_px
         elif px_diff < 0: # tick down → seller-initiated
             bid, ask = curr_px, curr_px + 0.01
         else:
             bid, ask = curr_px, curr_px  # ambiguous; accumulator will skip signed
+
+        # Track delta-source ratio (diagnostic). ~90%+ should be 'levelone_cache'
+        # for tickers we subscribe to; 'estimated' only for market-wide names.
+        _srcdiag = getattr(_screener_to_accumulator, '_src_diag', {'levelone_cache': 0, 'estimated': 0})
+        _srcdiag[delta_source] = _srcdiag.get(delta_source, 0) + 1
+        _screener_to_accumulator._src_diag = _srcdiag
 
         fake_msg = {
             'symbol':           sym,
@@ -1943,6 +1987,19 @@ def _on_screener_option(data):
         items_sample = data.get('items', [])[:2]
         log.info(f"[SCHWAB-BRIDGE] SCREENER_OPTION sample items: {str(items_sample)[:500]}")
         _screener_logged = True
+
+    # Always capture the first 3 full raw items + key-set union for diagnostic
+    # so we can empirically see EVERY field Schwab sends (including delta/bid/ask
+    # if they exist).
+    _rawdiag = getattr(_on_screener_option, '_rawdiag', None)
+    if _rawdiag is None:
+        _rawdiag = {'samples': [], 'all_keys_seen': set()}
+        _on_screener_option._rawdiag = _rawdiag
+    for it in data.get('items', []):
+        if isinstance(it, dict):
+            _rawdiag['all_keys_seen'].update(it.keys())
+            if len(_rawdiag['samples']) < 3:
+                _rawdiag['samples'].append(dict(it))
 
     items = data.get('items', [])
     if not items:
