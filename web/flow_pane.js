@@ -53,14 +53,21 @@
     let _sessionStartHr = 9.5;  // 09:30 ET
     let _sessionEndHr = 16.0;   // 16:00 ET
 
+    // Indices we exclude from the S&P Equities aggregate (they're not
+    // equities — aggregating them double-counts the market).
+    const _INDEX_TICKERS = new Set(['SPX', 'NDX', 'RUT', 'VIX']);
+
     // ── Aggregation ───────────────────────────────────────────────────────
     function _computeAggregate(category) {
         if (category === 'MAG7') {
             return _aggregateByTime(MAG7);
         }
         if (category === 'S&PE') {
-            // Pseudo: SPY + QQQ + Mag7 weighted sum
-            const names = ['SPY', 'QQQ', ...MAG7];
+            // Broader aggregate: SPY + QQQ + Mag7 + any additional equity
+            // tickers the backend has seen (SCREENER_OPTION / SCREENER_EQUITY
+            // expand coverage beyond our fixed 9 subscriptions). Indices
+            // are excluded to avoid double-counting (SPX ≈ 500 names already).
+            const names = Object.keys(_series).filter(tk => !_INDEX_TICKERS.has(tk));
             return _aggregateByTime(names);
         }
         return _series[category] || [];
@@ -473,11 +480,32 @@
         updateDto();
         bar.appendChild(dto);
 
-        // Calendar placeholder
-        const cal = document.createElement('span');
-        cal.textContent = '📅';
-        cal.style.cssText = 'font-size:14px;opacity:0.4;cursor:default;padding:0 4px';
-        cal.title = 'Historical date picker — coming soon';
+        // Calendar — opens a native date input and reloads the page in
+        // historical-replay mode (AI Panel reads ?replay_date= param and
+        // switches its data source to /api/alerts/history).
+        const cal = document.createElement('input');
+        cal.type = 'date';
+        cal.style.cssText = 'background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);' +
+                            'color:rgba(200,210,230,0.7);font-family:Inter,system-ui,sans-serif;' +
+                            'font-size:11px;padding:4px 6px;border-radius:4px;cursor:pointer;';
+        const urlParams = new URLSearchParams(window.location.search);
+        const _replayDate = urlParams.get('replay_date') || '';
+        if (_replayDate && _replayDate.length === 8) {
+            cal.value = `${_replayDate.slice(0,4)}-${_replayDate.slice(4,6)}-${_replayDate.slice(6,8)}`;
+        }
+        cal.title = 'Load a past session\'s alert log';
+        cal.onchange = () => {
+            const v = cal.value; // YYYY-MM-DD
+            if (!v) return;
+            const compact = v.replace(/-/g, ''); // YYYYMMDD
+            const u = new URL(window.location.href);
+            if (compact === new Date().toISOString().slice(0,10).replace(/-/g,'')) {
+                u.searchParams.delete('replay_date');
+            } else {
+                u.searchParams.set('replay_date', compact);
+            }
+            window.location.href = u.toString();
+        };
         bar.appendChild(cal);
 
         function _rebuild() {

@@ -67,6 +67,20 @@ def _stats(vals):
     return (m, var ** 0.5)
 
 
+import json
+import os
+
+# Daily JSONL log — persists fired alerts across restarts so the UI can
+# replay today's flow after a reconnect. File name: logs/alerts_YYYYMMDD.jsonl
+_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'logs')
+
+
+def _daily_alert_log_path(when: float = 0) -> str:
+    from datetime import date as _d, datetime as _dt
+    dt = _dt.fromtimestamp(when) if when else _dt.now()
+    return os.path.join(_LOG_DIR, f'alerts_{dt.strftime("%Y%m%d")}.jsonl')
+
+
 class AlertEngine:
     """Per-ticker rolling-window alert detection."""
 
@@ -117,6 +131,53 @@ class AlertEngine:
     def get_log(self, last_n: int = 50) -> list:
         """Return most recent N alerts fired."""
         return list(self._alert_log)[-last_n:]
+
+    def load_from_disk(self, date_str: str = None) -> int:
+        """Load alerts from the daily JSONL file into the in-memory log.
+        Used on startup to restore today's alerts across restarts.
+        date_str format: 'YYYYMMDD' (defaults to today)."""
+        from datetime import date as _d
+        if date_str is None:
+            date_str = _d.today().strftime('%Y%m%d')
+        path = os.path.join(_LOG_DIR, f'alerts_{date_str}.jsonl')
+        if not os.path.exists(path):
+            return 0
+        loaded = 0
+        try:
+            with open(path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        a = json.loads(line)
+                        self._alert_log.append(a)
+                        loaded += 1
+                    except Exception:
+                        pass
+        except Exception as e:
+            log.warning(f"[ALERT] load_from_disk failed: {e}")
+        return loaded
+
+    def get_history(self, date_str: str, last_n: int = 500) -> list:
+        """Read a specific day's alerts off disk (for date-picker replay).
+        date_str format: 'YYYYMMDD'."""
+        path = os.path.join(_LOG_DIR, f'alerts_{date_str}.jsonl')
+        if not os.path.exists(path):
+            return []
+        out = []
+        try:
+            with open(path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            out.append(json.loads(line))
+                        except Exception:
+                            pass
+        except Exception as e:
+            log.warning(f"[ALERT] get_history failed: {e}")
+        return out[-last_n:]
 
     def get_sample_count(self, ticker: str) -> int:
         """How many samples has this ticker accumulated?"""
@@ -452,6 +513,14 @@ class AlertEngine:
             }
 
     def _emit(self, alert: dict) -> None:
+        # Persist to daily JSONL file before emitting, so alerts survive a
+        # server restart and the UI can replay today's flow on reconnect.
+        try:
+            os.makedirs(_LOG_DIR, exist_ok=True)
+            with open(_daily_alert_log_path(alert.get('ts', 0)), 'a') as f:
+                f.write(json.dumps(alert) + '\n')
+        except Exception as e:
+            log.debug(f"[ALERT] persist failed: {e}")
         if not self._socketio:
             return
         try:
@@ -471,4 +540,12 @@ def init_engine(socketio=None) -> AlertEngine:
     global _engine
     if _engine is None:
         _engine = AlertEngine(socketio=socketio)
+        # Restore today's persisted alerts so the UI doesn't lose its history
+        # across a server restart.
+        try:
+            n = _engine.load_from_disk()
+            if n > 0:
+                log.info(f"[ALERT] Restored {n} alerts from today's disk log")
+        except Exception as e:
+            log.debug(f"[ALERT] load_from_disk failed on init: {e}")
     return _engine

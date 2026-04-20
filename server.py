@@ -991,6 +991,26 @@ def api_debug_alert_log():
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 
+@app.route("/api/alerts/history")
+def api_alerts_history():
+    """Historical alert log for a specific date (YYYYMMDD).
+    Powers the date-picker's historical replay feature.
+    Falls back to today if no date supplied."""
+    try:
+        from connectors.alert_engine import get_engine, init_engine
+        from datetime import date as _d
+        eng = get_engine() or init_engine()
+        date_str = request.args.get("date", "").strip() or _d.today().strftime("%Y%m%d")
+        # Validate date format (YYYYMMDD, 8 digits)
+        if not date_str.isdigit() or len(date_str) != 8:
+            return jsonify({"error": "date must be YYYYMMDD"}), 400
+        last_n = min(int(request.args.get("last_n", 500) or 500), 5000)
+        alerts = eng.get_history(date_str, last_n=last_n)
+        return jsonify({"date": date_str, "count": len(alerts), "alerts": alerts})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/alerts/walls")
 def api_alerts_walls():
     """PUBLIC — current per-ticker walls cached on AlertEngine.

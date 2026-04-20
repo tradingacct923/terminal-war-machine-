@@ -183,9 +183,43 @@ const AIPanel = (() => {
         if (ts) ts.textContent = 'live';
     }
 
+    function _getReplayDate() {
+        try {
+            const u = new URLSearchParams(window.location.search);
+            const d = u.get('replay_date') || '';
+            return /^\d{8}$/.test(d) ? d : '';
+        } catch (_) { return ''; }
+    }
+
     function _hydrate() {
         const tok = sessionStorage.getItem('greeks-auth') || '';
         const hdrs = tok ? { 'X-Auth-Token': tok } : {};
+        const replayDate = _getReplayDate();
+
+        // Replay mode: skip the live matrix (it's always 'now'), paint log
+        // from the historical endpoint instead.
+        if (replayDate) {
+            const ts = document.getElementById('ap-ts');
+            if (ts) ts.textContent = 'replay ' + replayDate;
+            fetch('/api/alerts/history?date=' + replayDate + '&last_n=500',
+                  { headers: hdrs })
+                .then(r => r.json())
+                .then(d => {
+                    if (!_container) return;
+                    const alerts = (d && d.alerts) || [];
+                    _logRows = [];
+                    for (const a of alerts.slice(-MAX_LOG_ROWS).reverse()) {
+                        _logRows.push({
+                            msg: _formatMsg(a),
+                            time: _fmtTime(a.ts),
+                            direction: a.direction,
+                        });
+                    }
+                    _renderLogRows();
+                })
+                .catch(() => {});
+            return;
+        }
 
         // Matrix state (authoritative — overwrites per-event local state)
         fetch('/api/alerts/state', { headers: hdrs })
