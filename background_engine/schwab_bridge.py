@@ -180,6 +180,9 @@ def _run_bridge():
         _streamer.on('NASDAQ_BOOK', _on_nasdaq_book)
         _streamer.on('NYSE_BOOK', _on_nyse_book)
         _streamer.on('SCREENER_OPTION', _on_screener_option)
+        _streamer.on('SCREENER_EQUITY', _on_screener_equity)
+        _streamer.on('ACCT_ACTIVITY', _on_acct_activity)
+        _streamer.on('CHART_EQUITY', _on_chart_equity)
 
         # Wire FlowClassifier + streamer into EdgeDetector (Schwab-dependent)
         from connectors.flow_classifier import FlowClassifier
@@ -229,6 +232,28 @@ def _run_bridge():
             log.info("[SCHWAB-BRIDGE] Subscribed to SCREENER_OPTION")
         except Exception as e:
             log.info(f"[SCHWAB-BRIDGE] SCREENER_OPTION subscription failed: {e}")
+
+        # Subscribe to equity screener (NYSE + NASDAQ most-active)
+        for exch in ('NYSE', 'NASDAQ'):
+            try:
+                _streamer.subscribe_screener_equity(exch, 'VOLUME', '0')
+                log.info(f"[SCHWAB-BRIDGE] Subscribed to SCREENER_EQUITY ({exch})")
+            except Exception as e:
+                log.info(f"[SCHWAB-BRIDGE] SCREENER_EQUITY ({exch}) subscription failed: {e}")
+
+        # Subscribe to CHART_EQUITY for real-time 1-min candles on key tickers
+        try:
+            _streamer.subscribe_chart_equity(['QQQ', 'SPY', 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA'])
+            log.info("[SCHWAB-BRIDGE] Subscribed to CHART_EQUITY (9 tickers)")
+        except Exception as e:
+            log.info(f"[SCHWAB-BRIDGE] CHART_EQUITY subscription failed: {e}")
+
+        # Subscribe to account activity (user's own order fills, position changes)
+        try:
+            _streamer.subscribe_account_activity()
+            log.info("[SCHWAB-BRIDGE] Subscribed to ACCT_ACTIVITY")
+        except Exception as e:
+            log.info(f"[SCHWAB-BRIDGE] ACCT_ACTIVITY subscription failed: {e}")
 
         # Initialize signed-flow accumulator (0DT-Hero-style curves per ticker)
         try:
@@ -1644,6 +1669,102 @@ def _on_screener_option(data):
             'market_total_volume': market_total,
             'timestamp': data.get('_timestamp', 0),
         })
+
+
+# ── Equity screener handler (NYSE + NASDAQ most-active stocks) ────────────────
+_screener_equity_logged = False
+
+
+def _on_screener_equity(data):
+    """Handle SCREENER_EQUITY updates — top-N most-active stocks per exchange.
+    Same envelope as screener_option but for equities (e.g., NYSE_VOLUME_0).
+    """
+    global _screener_equity_logged
+    if not _socketio:
+        return
+
+    items = data.get('items', []) or []
+    key = data.get('sort_field') or data.get('symbol', 'UNKNOWN')
+
+    if not _screener_equity_logged and items:
+        log.info(f"[SCHWAB-BRIDGE] SCREENER_EQUITY key={key} items={len(items)}")
+        log.info(f"[SCHWAB-BRIDGE] SCREENER_EQUITY sample: {str(items[:2])[:400]}")
+        _screener_equity_logged = True
+
+    alerts = []
+    for item in items[:20]:
+        if isinstance(item, dict):
+            alerts.append({
+                'symbol':        item.get('symbol', ''),
+                'description':   item.get('description', ''),
+                'volume':        _safe_num(item.get('volume', 0)),
+                'trades':        _safe_num(item.get('trades', 0)),
+                'lastPrice':     _safe_num(item.get('lastPrice', 0)),
+                'netChange':     _safe_num(item.get('netChange', 0)),
+                'percentChange': _safe_num(item.get('netPercentChange', 0)),
+                'marketShare':   _safe_num(item.get('marketShare', 0)),
+            })
+    if alerts:
+        _socketio.emit('screener_equity_update', {
+            'key':       key,
+            'alerts':    alerts,
+            'timestamp': data.get('_timestamp', 0),
+        })
+
+
+# ── Account activity handler (user's own order fills + position updates) ──────
+def _on_acct_activity(data):
+    """Handle ACCT_ACTIVITY — order events, fills, position changes, balances.
+    Schwab payload: {SubscriptionKey, AccountNumber, MessageType, MessageData}.
+    MessageType examples: OrderActivity, SubscribedEvent, etc.
+    """
+    if not _socketio:
+        return
+
+    try:
+        msg_type = data.get('MessageType') or data.get('2', '')
+        msg_data = data.get('MessageData') or data.get('3', '')
+        account  = data.get('AccountNumber') or data.get('1', '')
+        log.info(f"[SCHWAB-BRIDGE] ACCT_ACTIVITY type={msg_type} account={account[:4]}***")
+        _socketio.emit('acct_activity', {
+            'type':      msg_type,
+            'account':   account,
+            'data':      msg_data,
+            'timestamp': data.get('_timestamp', 0),
+        })
+    except Exception as e:
+        log.debug(f"[SCHWAB-BRIDGE] acct_activity handler error: {e}")
+
+
+# ── Chart equity handler (real-time 1-min equity candles) ─────────────────────
+_chart_equity_logged = False
+
+
+def _on_chart_equity(data):
+    """Handle CHART_EQUITY — real-time 1-minute equity bars.
+    Schwab sends OHLCV for each minute close.
+    """
+    global _chart_equity_logged
+    if not _socketio:
+        return
+    # Skip futures (they go through _on_chart_candle as CHART_FUTURES)
+    symbol = data.get('symbol') or data.get('key', '')
+    if not symbol or symbol.startswith('/'):
+        return
+
+    if not _chart_equity_logged:
+        log.info(f"[SCHWAB-BRIDGE] CHART_EQUITY first bar: {symbol} data_keys={list(data.keys())[:10]}")
+        _chart_equity_logged = True
+
+    _socketio.emit('chart_equity_update', {
+        'symbol': symbol,
+        'open':   data.get('open'),
+        'high':   data.get('high'),
+        'low':    data.get('low'),
+        'close':  data.get('close'),
+        'volume': data.get('volume'),
+        'chart_time': data.get('chart_time'),
+    })
 
 
 def _safe_num(val):

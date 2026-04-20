@@ -244,6 +244,16 @@ class SchwabStreamer:
         # e.g., OPTION_ALL_VOLUME_0
         self._subscribe('SCREENER_OPTION', [f'OPTION_ALL_{sort}_{frequency}'], '0,1,2,3,4')
 
+    def subscribe_screener_equity(self, exchange='NYSE', sort='VOLUME', frequency='0'):
+        """Subscribe to real-time equity screener stream.
+        Args:
+            exchange: 'NYSE', 'NASDAQ', or 'OTCBB'
+            sort: Sort criterion (VOLUME, TRADES, PERCENT_CHANGE_UP, PERCENT_CHANGE_DOWN, AVERAGE_PERCENT_VOLUME)
+            frequency: '0' (all), '1', '5', '10', '30', '60' minute windows
+        Keys format: e.g., NYSE_VOLUME_0, NASDAQ_PERCENT_CHANGE_UP_5
+        """
+        self._subscribe('SCREENER_EQUITY', [f'{exchange}_{sort}_{frequency}'], '0,1,2,3,4')
+
     def get_book(self, symbol, exchange='NASDAQ_BOOK'):
         """Get latest Level 2 book snapshot for a symbol."""
         return self.book.get(exchange, {}).get(symbol)
@@ -504,7 +514,7 @@ class SchwabStreamer:
                     self._process_book(service, content, timestamp)
                 elif service == 'ACCT_ACTIVITY':
                     self._process_acct_activity(content, timestamp)
-                elif service == 'SCREENER_OPTION':
+                elif service in ('SCREENER_OPTION', 'SCREENER_EQUITY'):
                     self._process_screener(service, content, timestamp)
                 else:
                     self._process_level1(service, content, timestamp)
