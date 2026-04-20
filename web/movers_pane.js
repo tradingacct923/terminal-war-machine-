@@ -145,7 +145,15 @@ const MoversPane = (() => {
                     _updateTs(null);
                     return;
                 }
-                _lastMovers = Array.isArray(d.movers) ? d.movers : [];
+                let movers = Array.isArray(d.movers) ? d.movers : [];
+                // Schwab's PERCENT_CHANGE_UP/DOWN returns "top movers" by magnitude,
+                // including wrong-sign names. Post-filter to match requested direction.
+                if (_sortSel === 'PERCENT_CHANGE_UP') {
+                    movers = movers.filter(m => (m.netPercentChange ?? 0) >= 0);
+                } else if (_sortSel === 'PERCENT_CHANGE_DOWN') {
+                    movers = movers.filter(m => (m.netPercentChange ?? 0) < 0);
+                }
+                _lastMovers = movers;
                 _lastFetchMs = performance.now();
                 _renderRows();
                 _updateTs(d.cached_age);

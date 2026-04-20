@@ -143,7 +143,8 @@
             if (!f) continue;
             if (f.peRatio && isFinite(f.peRatio)) { pe_sum += f.peRatio; pe_n++; }
             if (f.beta && isFinite(f.beta))       { b_sum  += f.beta;    b_n++;  }
-            if (f.divYield != null && isFinite(f.divYield)) { dy_sum += f.divYield; dy_n++; }
+            const dy = f.dividendYield ?? f.divYield;
+            if (dy != null && isFinite(dy)) { dy_sum += dy; dy_n++; }
             if (f.marketCap && isFinite(f.marketCap)) mc_sum += f.marketCap;
         }
         return {
@@ -242,8 +243,9 @@
             const parts = [];
             if (fund.peRatio != null) parts.push(`P/E ${fund.peRatio.toFixed(1)}`);
             if (fund.beta != null)    parts.push(`β ${fund.beta.toFixed(2)}`);
-            if (fund.divYield != null) parts.push(`DivY ${fund.divYield.toFixed(2)}%`);
-            if (fund.marketCap)        parts.push(`MCap ${_fmtMCap(fund.marketCap)}`);
+            const dy = fund.dividendYield ?? fund.divYield;
+            if (dy != null)           parts.push(`DivY ${dy.toFixed(2)}%`);
+            if (fund.marketCap)       parts.push(`MCap ${_fmtMCap(fund.marketCap)}`);
             if (parts.length) {
                 _ctx.fillStyle = 'rgba(180,190,220,0.7)';
                 _ctx.font = '10px "JetBrains Mono", monospace';

@@ -2640,8 +2640,10 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     // ── Auto-start L2 chart (skip tab routing) ──
-    // Use rAF to ensure CSS grid layout is fully computed before chart reads container dimensions
-    requestAnimationFrame(() => {
+    // setTimeout(0) instead of rAF: rAF is paused when the tab is hidden/offscreen
+    // (e.g. Claude Preview iframe before user focus), preventing mount callbacks from wiring.
+    // setTimeout runs regardless of visibility, so panes always mount.
+    setTimeout(() => {
         if (window.AltarisLayout) {
             // ── Feature Mount: create DOM containers for each pane feature ──
             AltarisLayout.onFeatureMount = (paneIdx, featureKey, slotEl) => {

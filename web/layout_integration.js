@@ -69,7 +69,7 @@ const LAYOUTS = {
   'dealer-desk': { label:'Dealer Desk', slots:4, cols:2, rows:2, defaults:['chart','dealer','xdiv','optflow'] },
   'war-room':    { label:'War Room',    slots:6, cols:3, rows:2, defaults:['chart','eqtape','dealer','volsurf','xdiv','optflow'] },
   // ── Flow analytics ──
-  'flow-hero':   { label:'Flow Hero',   slots:4, cols:2, rows:2, defaults:['chart','flow','movers','vpintel'] },
+  'flow-hero':   { label:'Flow Hero',   slots:5, cols:3, rows:2, defaults:['chart','flow','movers','dealer','vpintel'] },
   // ── Pro Default ──
   'pro':         { label:'Pro',         slots:3, cols:3, rows:1, defaults:['chart','ladder','eqbook'] },
 };
@@ -797,18 +797,29 @@ window.AltarisLayout = {
   FEAT_KEYS,
   MAX_PANES,
   // Integration hooks — set these from app.js
-  set onFeatureMount(fn)    { _callbacks.onFeatureMount = fn; },
+  set onFeatureMount(fn) {
+    _callbacks.onFeatureMount = fn;
+    // Auto-trigger initial mounts as soon as app.js wires the callback.
+    // This is resilient to DOMContentLoaded/rAF ordering issues where
+    // triggerInitialMounts() may never fire if the DCL handler errors earlier.
+    if (!_initComplete && fn) {
+      _initComplete = true;
+      const info = LAYOUTS[_layout];
+      if (info) {
+        for (let i = 0; i < info.slots; i++) _mountFeature(i);
+        console.log('[AltarisLayout] Auto-mounted', info.slots, 'panes on callback wire');
+      }
+    }
+  },
   set onFeatureUnmount(fn)  { _callbacks.onFeatureUnmount = fn; },
   set onSymbolChange(fn)    { _callbacks.onSymbolChange = fn; },
   set onTimeframeChange(fn) { _callbacks.onTimeframeChange = fn; },
-  // Called by app.js after wiring all callbacks to fire initial mounts
+  // Kept for backwards-compat; callable by app.js if it wants to force a re-mount pass.
   triggerInitialMounts() {
     _initComplete = true;
     const info = LAYOUTS[_layout];
     if (!info) return;
-    for (let i = 0; i < info.slots; i++) {
-      _mountFeature(i);
-    }
+    for (let i = 0; i < info.slots; i++) _mountFeature(i);
     console.log('[AltarisLayout] Initial mounts triggered for', info.slots, 'panes');
   },
 };
