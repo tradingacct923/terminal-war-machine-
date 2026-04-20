@@ -35,6 +35,15 @@ _gex_dirty = False       # Flag: has GEX data changed since last emit?
 _last_zone_emit = 0.0    # Timestamp of last zone_update emission
 _ndx_option_symbols = [] # List of subscribed NDX option symbols
 
+# ── Per-ticker GEX (parallel to _live_gex — used to compute per-ticker walls
+#    for the AI Panel's Key Level row, without disrupting the QQQ zone_update
+#    pipeline the rest of the terminal consumes).
+#    Shape: { ticker: { strike: {call_oi, put_oi, call_gamma, put_gamma,
+#                                 call_delta, put_delta} } }
+_per_ticker_gex: dict = {}
+_last_key_level_push = 0.0
+_KEY_LEVEL_INDEX_TICKERS = ("SPX", "SPY", "QQQ")
+
 # ── Dealer session flow tracking ────────────────────────────────────────────
 _session_dealer_buys = 0.0
 _session_dealer_sells = 0.0
@@ -849,6 +858,41 @@ def _on_options_quote(data):
 
     _gex_dirty = True
 
+    # ── Per-ticker GEX (for Key Level detector / AI Panel) ────────────
+    # Mirror the write into a per-ticker dict so we can compute walls for
+    # SPX/SPY/QQQ independently. Normalize SPXW→SPX etc. (same rule as
+    # flow_accumulator).
+    _sym_root = sym_key[:6].strip() if sym_key else ''
+    if _sym_root in ('SPXW',): _sym_root = 'SPX'
+    elif _sym_root in ('NDXP',): _sym_root = 'NDX'
+    elif _sym_root in ('RUTW',): _sym_root = 'RUT'
+    elif _sym_root in ('VIXW',): _sym_root = 'VIX'
+    if _sym_root:
+        _pt = _per_ticker_gex.setdefault(_sym_root, {})
+        _pt_strike = _pt.setdefault(strike, {
+            'call_gamma': 0, 'put_gamma': 0,
+            'call_oi': 0, 'put_oi': 0,
+            'call_delta': 0, 'put_delta': 0,
+        })
+        # Per-ticker dollar-GEX: use the underlying_price from this message
+        # (SPX/SPY/QQQ each have their own spot — don't reuse QQQ's).
+        _pt_spot = underlying_price or 0
+        if _pt_spot > 0:
+            _pt_dollar_gex = gamma * effective_oi * 100 * (_pt_spot * _pt_spot / 100)
+        else:
+            _pt_dollar_gex = 0
+        if contract_type in ('C', 'CALL', 'call'):
+            _pt_strike['call_gamma'] = _pt_dollar_gex
+            _pt_strike['call_oi'] = effective_oi
+            _pt_strike['call_delta'] = abs(float(delta or 0))
+        elif contract_type in ('P', 'PUT', 'put'):
+            _pt_strike['put_gamma'] = _pt_dollar_gex
+            _pt_strike['put_oi'] = effective_oi
+            _pt_strike['put_delta'] = abs(float(delta or 0))
+        # Also stash the live spot per-ticker for reuse elsewhere
+        if _pt_spot > 0:
+            _latest_spot_by_ticker[_sym_root] = _pt_spot
+
     # Feed into GreekSurface engine for higher-order computations
     if _greek_surface:
         try:
@@ -903,6 +947,63 @@ def _on_options_quote(data):
                 _socketio.emit('option_mark_update', _payload)
         except Exception:
             pass
+
+
+def _compute_walls_for(ticker: str) -> dict:
+    """Compute {put_wall, call_wall, flip} for one ticker from _per_ticker_gex.
+    Wall = strike with max OI (put_oi or call_oi). Flip = strike where dealer
+    net gamma (-call_gamma + put_gamma) crosses zero. Returns {} if too thin.
+    """
+    per_strike = _per_ticker_gex.get(ticker)
+    if not per_strike or len(per_strike) < 3:
+        return {}
+    strikes = sorted(per_strike.keys())
+    call_oi = {k: per_strike[k].get('call_oi', 0) for k in strikes}
+    put_oi  = {k: per_strike[k].get('put_oi', 0)  for k in strikes}
+    if not any(call_oi.values()) and not any(put_oi.values()):
+        return {}
+    call_wall = max(call_oi, key=call_oi.get) if call_oi else 0.0
+    put_wall  = max(put_oi,  key=put_oi.get)  if put_oi  else 0.0
+    # Dealer net gamma = -call_gamma + put_gamma (clients long → dealer short)
+    dealer_net = {
+        k: -per_strike[k].get('call_gamma', 0) + per_strike[k].get('put_gamma', 0)
+        for k in strikes
+    }
+    flip = 0.0
+    for i in range(1, len(strikes)):
+        s0, s1 = strikes[i-1], strikes[i]
+        g0, g1 = dealer_net[s0], dealer_net[s1]
+        if g0 * g1 < 0:
+            denom = abs(g0) + abs(g1)
+            frac = abs(g0) / denom if denom > 0 else 0.5
+            flip = s0 + frac * (s1 - s0)
+            break
+    return {
+        'put_wall':  float(put_wall) if put_wall else 0.0,
+        'call_wall': float(call_wall) if call_wall else 0.0,
+        'flip':      float(flip) if flip else 0.0,
+    }
+
+
+def _push_key_level_walls():
+    """Push per-ticker walls to AlertEngine for Key Level detection.
+    Runs on the same cadence as _maybe_emit_zones (every 5s when dirty)."""
+    global _last_key_level_push
+    now = time.time()
+    if now - _last_key_level_push < 5.0:
+        return
+    try:
+        from connectors.alert_engine import get_engine
+        eng = get_engine()
+        if eng is None:
+            return
+        for ticker in _KEY_LEVEL_INDEX_TICKERS:
+            walls = _compute_walls_for(ticker)
+            if walls:
+                eng.update_walls(ticker, walls)
+        _last_key_level_push = now
+    except Exception as e:
+        log.debug(f"[KEY-LEVEL] push failed: {e}")
 
 
 def _maybe_emit_zones():
@@ -1272,6 +1373,10 @@ def _maybe_emit_zones():
         _socketio.emit('zone_update', zone_data)
         _last_zone_emit = time.time()
         _gex_dirty = False
+
+        # Push per-ticker walls (SPX/SPY/QQQ) into AlertEngine for Key Level
+        # detection. Computed from _per_ticker_gex (parallel to _live_gex).
+        _push_key_level_walls()
 
         # ── Dealer session hedge flow computation ────────────────────────
         # Uses aggregate GEX to estimate NQ hedging per zone cycle.

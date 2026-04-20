@@ -35,6 +35,15 @@ class _TickerHistory:
     last_diverge_side: int = 0         # current divergence direction (0 = aligned)
     last_diverge_start_ts: float = 0
     last_alert_ts: dict = field(default_factory=dict)   # {alert_type: ts} for cooldown
+    # Directional state for the AI Panel matrix (readable via get_state_matrix).
+    # last_key_level_side tracks the sign of the most recent wall/flip cross.
+    # last_spike_side: +1 on bullish spike, -1 on bearish dump.
+    last_key_level_side: int = 0
+    last_spike_side: int = 0
+    # Per-ticker key levels fed by schwab_bridge's per-ticker GEX pipeline.
+    # Shape: {'put_wall': float, 'call_wall': float, 'flip': float}
+    last_walls: dict = field(default_factory=dict)
+    last_walls_update_ts: float = 0
 
 
 SIGMA_THRESHOLD_SPIKE = 2.5         # σ above rolling mean → spike
@@ -94,6 +103,9 @@ class AlertEngine:
 
             # ── 4. BULLISH VOLUME ──────────────────────────────────────────
             alerts.extend(self._detect_bullish_volume(ticker, ts, hist))
+
+            # ── 5. KEY LEVEL (price breaks wall/flip) ─────────────────────
+            alerts.extend(self._detect_key_level(ticker, ts, hist))
 
         # Emit + log
         for a in alerts:
@@ -180,6 +192,7 @@ class AlertEngine:
                 if ts - last_ts < COOLDOWN_SEC:
                     continue
                 hist.last_alert_ts[f'spike_{bucket_name}'] = ts
+                hist.last_spike_side = +1
                 out.append({
                     'type': 'spike',
                     'ticker': ticker,
@@ -196,6 +209,7 @@ class AlertEngine:
                 if ts - last_ts < COOLDOWN_SEC:
                     continue
                 hist.last_alert_ts[f'dump_{bucket_name}'] = ts
+                hist.last_spike_side = -1
                 out.append({
                     'type': 'dump',
                     'ticker': ticker,
@@ -295,6 +309,121 @@ class AlertEngine:
             'magnitude_m': round(recent_30s / 1e6, 2),
             'label': f"{ticker} bullish volume",
         }]
+
+    def _detect_key_level(self, ticker, ts, hist) -> list[dict]:
+        """Spot crosses a wall/flip level with follow-through.
+
+        Walls are fed in from schwab_bridge via update_walls(). Fires when the
+        previous sample's spot was on one side of a level and the current
+        sample is on the other side, with |delta_spot/prev_spot| ≥ 0.05%
+        (filters jitter at the close) and |spot − level| < 0.1% of spot.
+        """
+        out = []
+        walls = hist.last_walls or {}
+        if not walls or len(hist.samples) < 5:
+            return out
+        prev = hist.samples[-2]
+        curr = hist.samples[-1]
+        prev_spot, curr_spot = prev[5], curr[5]
+        if prev_spot <= 0 or curr_spot <= 0:
+            return out
+        spot_pct_move = abs(curr_spot - prev_spot) / prev_spot
+        if spot_pct_move < 0.0005:  # 0.05% follow-through required
+            return out
+
+        for level_name, level in walls.items():
+            if not level or level <= 0:
+                continue
+            crossed_up   = prev_spot <= level < curr_spot
+            crossed_down = prev_spot >= level > curr_spot
+            if not (crossed_up or crossed_down):
+                continue
+
+            # Cooldown per level (not per ticker) — so flipping between put and
+            # call wall in the same minute can fire twice, but same level can't.
+            cooldown_key = f'key_level_{level_name}'
+            last_ts = hist.last_alert_ts.get(cooldown_key, 0)
+            if ts - last_ts < COOLDOWN_SEC:
+                continue
+
+            # Direction semantics:
+            #   call_wall crossed up   → bullish (breakout)
+            #   call_wall crossed down → bearish (rejection)
+            #   put_wall  crossed down → bearish (breakdown)
+            #   put_wall  crossed up   → bullish (reclaim)
+            #   flip      crossed up   → bullish (gamma regime flip positive)
+            #   flip      crossed down → bearish (gamma regime flip negative)
+            if level_name == 'call_wall':
+                side = +1 if crossed_up else -1
+                wall_label = 'call wall'
+            elif level_name == 'put_wall':
+                side = -1 if crossed_down else +1
+                wall_label = 'put wall'
+            else:
+                side = +1 if crossed_up else -1
+                wall_label = 'gamma flip'
+
+            hist.last_alert_ts[cooldown_key] = ts
+            hist.last_key_level_side = side
+            direction = 'bullish' if side > 0 else 'bearish'
+            out.append({
+                'type': 'key_level',
+                'ticker': ticker,
+                'direction': direction,
+                'ts': ts,
+                'level': round(level, 2),
+                'level_name': level_name,
+                'label': f"{ticker} {direction} key level break @ {level:.2f} {wall_label}",
+            })
+        return out
+
+    def update_walls(self, ticker: str, walls: dict) -> None:
+        """Called by schwab_bridge whenever per-ticker zone_update is recomputed.
+
+        Keeps a cached {put_wall, call_wall, flip} per ticker for the Key Level
+        detector. Rejects stale/tiny updates to avoid wall-jitter alert storms
+        (walls that move <0.3% within 60s are ignored).
+        """
+        if not walls or not ticker:
+            return
+        with self._lock:
+            hist = self._history.setdefault(ticker, _TickerHistory())
+            now = time.time()
+            prev = hist.last_walls or {}
+            # Jitter guard: reject micro-updates if we just updated recently.
+            if prev and (now - hist.last_walls_update_ts) < 60:
+                stable = True
+                for k in ('put_wall', 'call_wall', 'flip'):
+                    pv, nv = prev.get(k, 0) or 0, walls.get(k, 0) or 0
+                    if pv and nv and abs(nv - pv) / pv > 0.003:
+                        stable = False
+                        break
+                if stable:
+                    return
+            hist.last_walls = {
+                'put_wall':  walls.get('put_wall')  or 0.0,
+                'call_wall': walls.get('call_wall') or 0.0,
+                'flip':      walls.get('flip')      or 0.0,
+            }
+            hist.last_walls_update_ts = now
+
+    def get_state_matrix(self) -> dict:
+        """Snapshot per-ticker last-known direction for each alert row.
+        Used by /api/alerts/state to power the AI Panel 4×3 matrix UI."""
+        def label(side: int) -> str:
+            if side > 0: return 'bullish'
+            if side < 0: return 'bearish'
+            return 'none'
+        with self._lock:
+            return {
+                t: {
+                    'flow_cross':      label(h.last_cross_side),
+                    'flow_divergence': label(h.last_diverge_side),
+                    'key_level':       label(h.last_key_level_side),
+                    'spike_dump':      label(h.last_spike_side),
+                }
+                for t, h in self._history.items()
+            }
 
     def _emit(self, alert: dict) -> None:
         if not self._socketio:

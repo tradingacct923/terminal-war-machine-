@@ -982,9 +982,60 @@ def api_debug_alert_log():
             "alerts": eng.get_log(last_n=100),
             "sample_counts_per_ticker": {
                 t: eng.get_sample_count(t)
-                for t in ('QQQ', 'SPY', 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA')
+                for t in ('SPX', 'SPY', 'QQQ', 'NDX', 'VIX',
+                          'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA')
             },
         })
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+
+@app.route("/api/alerts/walls")
+def api_alerts_walls():
+    """PUBLIC — current per-ticker walls cached on AlertEngine.
+    Used to verify the Key Level detector is receiving fresh wall data."""
+    try:
+        from connectors.alert_engine import get_engine
+        eng = get_engine()
+        if eng is None:
+            return jsonify({"ready": False, "tickers": {}})
+        with eng._lock:
+            out = {t: dict(h.last_walls) for t, h in eng._history.items() if h.last_walls}
+        return jsonify({"ready": True, "server_time": time.time(), "tickers": out})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/alerts/state")
+def api_alerts_state():
+    """Per-ticker current-state matrix for the AI Panel 4×3 UI.
+    Returns {'flow_cross','flow_divergence','key_level','spike_dump'} →
+    'bullish'|'bearish'|'none' for every ticker the engine is tracking."""
+    try:
+        from connectors.alert_engine import get_engine
+        eng = get_engine()
+        if eng is None:
+            return jsonify({"ready": False, "tickers": {}})
+        return jsonify({
+            "ready": True,
+            "server_time": time.time(),
+            "tickers": eng.get_state_matrix(),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/_debug/flow_classify")
+def api_debug_flow_classify():
+    """PUBLIC — dump FlowAccumulator._classify_diag + _date_diag.
+    Reveals how trades are being bucketed per ticker (useful for SPX 0DTE audit)."""
+    try:
+        from connectors.flow_accumulator import get_accumulator
+        acc = get_accumulator()
+        if acc is None:
+            return jsonify({"ready": False})
+        return jsonify(acc.get_diag())
     except Exception as e:
         import traceback
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500

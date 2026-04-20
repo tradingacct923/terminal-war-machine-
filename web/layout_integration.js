@@ -43,6 +43,7 @@ const FEATURES = {
   vpintel:  { label: 'VP INTEL',  icon: '\u{1f4ca}', desc: 'Volume Profile Intelligence — Absorption, Depth, Zones' },
   flow:     { label: 'FLOW',      icon: '\u{1f4b0}', desc: 'Signed Δ Notional Flow (0DT-Hero-style) — SPY/QQQ/Mag7' },
   movers:   { label: 'MOVERS',    icon: '\u{1f680}', desc: 'Schwab Top Movers — SPX/DJI/NDX/RUT index-scoped' },
+  aipanel:  { label: 'AI PANEL',  icon: '\u{1f9e0}', desc: '0DT-Hero Alert Matrix (SPX/SPY/QQQ × 4 detectors) + Message Log' },
 };
 const FEAT_KEYS = Object.keys(FEATURES);
 
@@ -70,6 +71,7 @@ const LAYOUTS = {
   'war-room':    { label:'War Room',    slots:6, cols:3, rows:2, defaults:['chart','eqtape','dealer','volsurf','xdiv','optflow'] },
   // ── Flow analytics ──
   'flow-hero':   { label:'Flow Hero',   slots:5, cols:3, rows:2, defaults:['chart','flow','movers','dealer','vpintel'] },
+  'hero-v2':     { label:'Hero v2',     slots:6, cols:3, rows:2, defaults:['chart','flow','aipanel','movers','dealer','vpintel'] },
   // ── Pro Default ──
   'pro':         { label:'Pro',         slots:3, cols:3, rows:1, defaults:['chart','ladder','eqbook'] },
 };
