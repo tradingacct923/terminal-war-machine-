@@ -191,6 +191,13 @@
                 }
             });
 
+            // ── flow_alert: AlertEngine signals (cross/divergence/spike/dump) ──
+            window._sio.on('flow_alert', (alert) => {
+                if (window.AltarisEvents) {
+                    window.AltarisEvents.emit('data:flow:alert', alert);
+                }
+            });
+
             // ── book_microstructure: QQQ NASDAQ L2 venue quality + QA imbalance ──
             // Emitted at 2Hz. Contains per-level venue taxonomy (HFT vs institutional),
             // quality-adjusted imbalance (filters phantom HFT depth), and BBO quality scores.

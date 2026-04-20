@@ -263,6 +263,14 @@ def _run_bridge():
         except Exception as e:
             log.warning(f"[SCHWAB-BRIDGE] Flow accumulator init failed: {e}")
 
+        # Initialize alert engine (fed by flow_accumulator._emit_loop)
+        try:
+            from connectors.alert_engine import init_engine
+            init_engine(socketio=_socketio)
+            log.info("[SCHWAB-BRIDGE] AlertEngine initialised (fires 'flow_alert' events)")
+        except Exception as e:
+            log.warning(f"[SCHWAB-BRIDGE] AlertEngine init failed: {e}")
+
         # Populate expiration-metadata cache for all subscribed tickers so
         # flow trades can be bucketed as 0DTE / weekly / monthly / quarterly /
         # LEAPS in the accumulator + alert labels.

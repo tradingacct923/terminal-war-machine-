@@ -63,6 +63,8 @@ class AlertEngine:
     def __init__(self, socketio=None):
         self._socketio = socketio
         self._history: dict[str, _TickerHistory] = {}
+        # Rolling log of last N alerts (for diagnostic inspection)
+        self._alert_log: deque = deque(maxlen=200)
         self._lock = threading.Lock()
 
     def observe(self, ticker: str, ts: float, s0: float, sa: float,
@@ -93,10 +95,20 @@ class AlertEngine:
             # ── 4. BULLISH VOLUME ──────────────────────────────────────────
             alerts.extend(self._detect_bullish_volume(ticker, ts, hist))
 
-        # Emit
+        # Emit + log
         for a in alerts:
+            self._alert_log.append(a)
             self._emit(a)
         return alerts
+
+    def get_log(self, last_n: int = 50) -> list:
+        """Return most recent N alerts fired."""
+        return list(self._alert_log)[-last_n:]
+
+    def get_sample_count(self, ticker: str) -> int:
+        """How many samples has this ticker accumulated?"""
+        h = self._history.get(ticker)
+        return len(h.samples) if h else 0
 
     def _detect_cross(self, ticker, ts, hist) -> list[dict]:
         """0DTE curve crosses all-exp curve."""

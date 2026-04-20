@@ -838,6 +838,65 @@ def api_debug_flow_live():
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 
+@app.route("/api/_debug/subs")
+def api_debug_subs():
+    """PUBLIC — dump exactly what option symbols we subscribed to."""
+    try:
+        from background_engine import schwab_bridge as sb
+        subs = getattr(sb, '_subscribed_option_symbols_by_ticker', {})
+        out = {}
+        for ticker, syms in subs.items():
+            # Bucket by YYMMDD expiration
+            by_date = {}
+            for s in syms:
+                d = s[6:12] if len(s) >= 12 else '?'
+                by_date[d] = by_date.get(d, 0) + 1
+            out[ticker] = {
+                'total': len(syms),
+                'by_expiration': by_date,
+                'first_3': syms[:3],
+                'last_3': syms[-3:],
+            }
+        return jsonify(out)
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+
+@app.route("/api/_debug/flow_diag")
+def api_debug_flow_diag():
+    """PUBLIC — show what symbols are being classified into what buckets."""
+    try:
+        from connectors.flow_accumulator import get_accumulator
+        acc = get_accumulator()
+        if acc is None:
+            return jsonify({"note": "accumulator not ready"})
+        return jsonify(acc.get_diag())
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+
+@app.route("/api/_debug/alert_log")
+def api_debug_alert_log():
+    """PUBLIC — most recent alerts fired by the engine."""
+    try:
+        from connectors.alert_engine import get_engine
+        eng = get_engine()
+        if eng is None:
+            return jsonify({"note": "engine not ready"})
+        return jsonify({
+            "alerts": eng.get_log(last_n=100),
+            "sample_counts_per_ticker": {
+                t: eng.get_sample_count(t)
+                for t in ('QQQ', 'SPY', 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA')
+            },
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+
 @app.route("/api/_debug/flow_live_alerts")
 def api_debug_flow_alerts():
     """PUBLIC — run alert engine against current accumulator state; return alerts.

@@ -80,6 +80,10 @@ class FlowAccumulator:
         # last_size on delta updates that don't represent new trades; without
         # dedup we'd double-count ~10-20% of flow.
         self._last_trade_time: dict[str, int] = {}
+        # Latest underlying spot price per ticker — updated on every option
+        # message via the underlying_price field. Used by AlertEngine for
+        # flow_divergence / flow_convergence detection.
+        self._latest_spot: dict[str, float] = {}
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -151,6 +155,7 @@ class FlowAccumulator:
 
         # Classify expiration bucket (0dte, weekly, monthly, quarterly, leaps)
         bucket = '0dte' if is_0dte else 'unknown'
+        classify_source = 'dte_field'
         try:
             from connectors.expiration_cache import get_cache
             _c = get_cache()
@@ -158,10 +163,31 @@ class FlowAccumulator:
                 _t2, _b = _c.classify_symbol(symbol)
                 if _b and _b != 'unknown':
                     bucket = _b
+                    classify_source = 'cache'
         except Exception:
             pass
 
+        # TEMP DIAGNOSTIC: track first 50 per ticker-bucket combo
+        _diag = getattr(self, '_classify_diag', {})
+        if len(_diag) < 50:
+            key = (ticker, bucket, classify_source)
+            if key not in _diag:
+                _diag[key] = {'example_symbol': symbol, 'dte_field': dte, 'count': 0}
+            _diag[key]['count'] += 1
+            self._classify_diag = _diag
+
+        # TEMP DIAGNOSTIC 2: count by (ticker, expiration YYMMDD) to see if ANY
+        # 260420 symbols are reaching us
+        _date_diag = getattr(self, '_date_diag', {})
+        date_key = (ticker, symbol[6:12])
+        _date_diag[date_key] = _date_diag.get(date_key, 0) + 1
+        self._date_diag = _date_diag
+
         with self._lock:
+            # Track most recent spot per ticker for AlertEngine divergence
+            if spot > 0:
+                self._latest_spot[ticker] = float(spot)
+
             st = self._state.setdefault(ticker, _TickerState())
             # Legacy 2-way split (frontend compat)
             st.cum_unsigned_all += unsigned
@@ -183,6 +209,22 @@ class FlowAccumulator:
             bkt.trades += 1
             if side != 0:
                 bkt.cum_signed += signed
+
+    def get_diag(self) -> dict:
+        """TEMP diagnostic: show what we're classifying trades into."""
+        diag = getattr(self, '_classify_diag', {})
+        date_diag = getattr(self, '_date_diag', {})
+        # Aggregate by (ticker, date) showing trade counts
+        by_ticker_date = {}
+        for (t, d), c in date_diag.items():
+            by_ticker_date.setdefault(t, {})[d] = c
+        return {
+            'classify': {
+                f"{t}__{b}__via_{src}": {'symbol': v['example_symbol'], 'dte_field': v['dte_field'], 'count': v['count']}
+                for (t, b, src), v in diag.items()
+            },
+            'trades_by_expiration': by_ticker_date,
+        }
 
     def get_state(self, ticker: str) -> Optional[dict]:
         """Snapshot for a ticker — used by /api/flow diagnostic endpoints."""
@@ -229,27 +271,49 @@ class FlowAccumulator:
         }
 
     def _emit_loop(self) -> None:
-        """Background loop that broadcasts per-ticker flow every emit_interval seconds."""
+        """Background loop: broadcasts per-ticker flow every emit_interval,
+        and feeds AlertEngine with (state + spot) so divergence/cross/spike
+        detectors can fire on live data."""
         while self._running:
             time.sleep(self._emit_interval)
-            if not self._socketio:
-                continue
             with self._lock:
                 snapshot = [
                     self._ticker_dict(t, st)
                     for t, st in self._state.items()
                     if st.trades_all > 0
                 ]
+                spots = dict(self._latest_spot)
             if not snapshot:
                 continue
-            now_ms = int(time.time() * 1000)
+            now_sec = time.time()
+            now_ms = int(now_sec * 1000)
+
+            # Feed the alert engine (one observe call per active ticker)
             try:
-                self._socketio.emit(
-                    "flow_update",
-                    {"t": now_ms, "tickers": snapshot},
-                )
+                from connectors.alert_engine import get_engine
+                eng = get_engine()
+                if eng is not None:
+                    for st in snapshot:
+                        eng.observe(
+                            st['ticker'], now_sec,
+                            st['cum_signed_0dte'],
+                            st['cum_signed_all'],
+                            st['cum_unsigned_0dte'],
+                            st['cum_unsigned_all'],
+                            spots.get(st['ticker'], 0.0),
+                        )
             except Exception as e:
-                log.debug(f"[FLOW-ACC] emit failed: {e}")
+                log.debug(f"[FLOW-ACC] alert engine feed failed: {e}")
+
+            # Broadcast flow_update socket event
+            if self._socketio:
+                try:
+                    self._socketio.emit(
+                        "flow_update",
+                        {"t": now_ms, "tickers": snapshot},
+                    )
+                except Exception as e:
+                    log.debug(f"[FLOW-ACC] emit failed: {e}")
 
 
 # Global singleton, instantiated from schwab_bridge.start_schwab_bridge
