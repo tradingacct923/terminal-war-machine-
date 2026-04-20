@@ -818,6 +818,99 @@ def _schwab_chain_raw(ticker, exp_date):
     return options, data.get("underlyingPrice", 0)
 
 
+def _schwab_movers(symbol_id: str, sort: str = "PERCENT_CHANGE_UP",
+                   frequency: str = "0") -> list:
+    """Top movers within an index. symbol_id ∈ $SPX, $DJI, $COMPX, $IUXX, INDEX_ALL.
+    sort ∈ VOLUME, TRADES, PERCENT_CHANGE_UP, PERCENT_CHANGE_DOWN.
+    Returns list of {symbol, description, last, change, direction, totalVolume}.
+    """
+    data = _schwab_get(f"/marketdata/v1/movers/{symbol_id}",
+                       {"sort": sort, "frequency": frequency})
+    return data.get("screeners", []) or []
+
+
+def _schwab_fundamentals(symbols: list, projection: str = "fundamental") -> dict:
+    """Per-ticker fundamentals. symbols is a list (comma-joined for Schwab).
+    Schwab's /instruments endpoint uses `symbol` (singular) even for multi-symbol
+    queries — comma-separated in the single param.
+    Returns dict keyed by symbol → fundamentals dict (~40 fields).
+    """
+    if not symbols:
+        return {}
+    data = _schwab_get("/marketdata/v1/instruments",
+                       {"symbol": ",".join(symbols), "projection": projection})
+    out = {}
+    for inst in data.get("instruments", []) or []:
+        sym = inst.get("symbol")
+        fund = inst.get("fundamental") or {}
+        if sym and fund:
+            out[sym] = fund
+    return out
+
+
+# ── /api/movers + /api/fundamentals caches ───────────────────────────────────
+_movers_cache: dict = {}        # {(symbol_id, sort, frequency): (result, ts)}
+_MOVERS_TTL = 300               # 5 min
+_fundamentals_cache: dict = {}  # {symbol: (data, ts)}
+_FUNDAMENTALS_TTL = 3600        # 1 hr
+
+
+@app.route("/api/movers")
+def api_movers():
+    """Top movers in an index. ?index=$SPX&sort=PERCENT_CHANGE_UP&frequency=0."""
+    symbol_id = request.args.get("index", "$SPX")
+    sort = request.args.get("sort", "PERCENT_CHANGE_UP").upper()
+    frequency = request.args.get("frequency", "0")
+    key = (symbol_id, sort, frequency)
+    now = time.time()
+    cached = _movers_cache.get(key)
+    if cached and now - cached[1] < _MOVERS_TTL:
+        return jsonify({
+            "symbol_id": symbol_id, "sort": sort,
+            "cached_age": int(now - cached[1]),
+            "movers": cached[0],
+        })
+    try:
+        movers = _schwab_movers(symbol_id, sort, frequency)
+        _movers_cache[key] = (movers, now)
+        return jsonify({
+            "symbol_id": symbol_id, "sort": sort,
+            "cached_age": 0, "movers": movers,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/fundamentals")
+def api_fundamentals():
+    """Per-ticker fundamentals. ?symbols=AAPL,MSFT,NVDA.
+    Per-symbol 1-hour cache; partial cache hits refetch only stale symbols.
+    """
+    raw = request.args.get("symbols", "").strip()
+    if not raw:
+        return jsonify({"error": "symbols param required"}), 400
+    symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
+    if not symbols:
+        return jsonify({"error": "symbols param required"}), 400
+    now = time.time()
+    fresh, stale = {}, []
+    for s in symbols:
+        c = _fundamentals_cache.get(s)
+        if c and now - c[1] < _FUNDAMENTALS_TTL:
+            fresh[s] = c[0]
+        else:
+            stale.append(s)
+    if stale:
+        try:
+            new_data = _schwab_fundamentals(stale)
+            for s, v in new_data.items():
+                _fundamentals_cache[s] = (v, now)
+                fresh[s] = v
+        except Exception as e:
+            return jsonify({"error": str(e), "partial": fresh}), 500
+    return jsonify({"fundamentals": fresh, "count": len(fresh)})
+
+
 @app.route("/api/_debug/flow_live")
 def api_debug_flow_live():
     """PUBLIC — TEMP diagnostic: dump live FlowAccumulator state for real-time proof.
