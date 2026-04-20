@@ -128,6 +128,13 @@ class FlowAccumulator:
         ticker = symbol[:6].strip()
         if not ticker:
             return
+        # Normalize index-option roots to their underlying symbol so SPX+SPXW
+        # aggregate as "SPX", NDX+NDXP as "NDX", RUT+RUTW as "RUT", VIX+VIXW
+        # as "VIX". Otherwise flow splits across two buckets the UI never joins.
+        if ticker == 'SPXW': ticker = 'SPX'
+        elif ticker == 'NDXP': ticker = 'NDX'
+        elif ticker == 'RUTW': ticker = 'RUT'
+        elif ticker == 'VIXW': ticker = 'VIX'
 
         # Dedup: if Schwab re-reports the same trade_time for this symbol,
         # skip. Only dedup when trade_time is present (>0); otherwise count

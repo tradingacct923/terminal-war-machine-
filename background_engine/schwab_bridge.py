@@ -217,6 +217,10 @@ def _run_bridge():
             _subscribe_mag7_options()
         except Exception as e:
             log.warning(f"[SCHWAB-BRIDGE] Mag7 options subscription error: {e}")
+        try:
+            _subscribe_index_options()
+        except Exception as e:
+            log.warning(f"[SCHWAB-BRIDGE] Index options subscription error: {e}")
 
         # Subscribe to QQQ equity L2 book (NASDAQ_BOOK)
         _streamer.subscribe_nasdaq_book(['QQQ'])
@@ -278,7 +282,7 @@ def _run_bridge():
             from connectors.expiration_cache import init_cache
             from server import _schwab_get
             _exp_cache = init_cache(refresh_interval_sec=3600)
-            _subscribed_tickers = ["QQQ", "SPY"] + list(MAG7_TICKERS)
+            _subscribed_tickers = ["QQQ", "SPY"] + list(MAG7_TICKERS) + list(INDEX_OPTION_TICKERS)
             _total_exps = 0
             for _t in _subscribed_tickers:
                 _total_exps += _exp_cache.refresh(_t, _schwab_get)
@@ -462,6 +466,36 @@ def _subscribe_mag7_options() -> int:
         )
         total += n
     log.info(f"[SCHWAB-BRIDGE] 📊 Mag7 total: {total} options across {len(MAG7_TICKERS)} tickers")
+    return total
+
+
+# Index options — entitled on the standard Schwab API tier. Verified 2026-04-20:
+# $SPX (SPXW/SPX roots), $NDX (NDXP/NDX), $VIX (VIXW/VIX) all return live chains
+# with full Greeks. SPX is the headline signal; NDX + VIX round out the macro picture.
+INDEX_OPTION_TICKERS = ("$SPX", "$NDX", "$VIX")
+
+
+def _subscribe_index_options() -> int:
+    """Subscribe to ATM index options for $SPX / $NDX / $VIX.
+
+    Strike radii are tuned to each index's tick scale:
+      - SPX: ±150 pts (~2% of 7100 spot)
+      - NDX: ±500 pts (~1.9% of 26500 spot)
+      - VIX: ±8 pts (very wide relative to 19 spot — VIX trades wide OTM puts)
+    """
+    cfgs = {
+        "$SPX": dict(strike_radius=150.0, expiries_count=3, cap=150),
+        "$NDX": dict(strike_radius=500.0, expiries_count=3, cap=100),
+        "$VIX": dict(strike_radius=8.0,   expiries_count=3, cap=40),
+    }
+    total = 0
+    for ticker, cfg in cfgs.items():
+        try:
+            n = _subscribe_options_for_ticker(ticker, **cfg)
+            total += n
+        except Exception as e:
+            log.warning(f"[SCHWAB-BRIDGE] {ticker} index-options subscription error: {e}")
+    log.info(f"[SCHWAB-BRIDGE] 📊 Index options total: {total} contracts ($SPX + $NDX + $VIX)")
     return total
 
 

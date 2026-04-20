@@ -12,8 +12,8 @@
  * Data source: 'data:flow:update' bus event, backed by backend FlowAccumulator.
  *
  * Categories:
- *   SPX   — tier-blocked, button disabled
- *   SPY   — direct (we subscribe)
+ *   SPX   — direct (we subscribe; accumulator normalizes SPXW→SPX)
+ *   SPY   — direct
  *   QQQ   — direct
  *   Mag7  — client-side aggregate of 7 Mag7 names
  *   S&PE  — pseudo-aggregate: weighted sum of SPY + QQQ + Mag7 (70-85% of true signal)
@@ -55,11 +55,6 @@
 
     // ── Aggregation ───────────────────────────────────────────────────────
     function _computeAggregate(category) {
-        if (category === 'SPX') {
-            // Tier-blocked: return empty series but proxy with SPY ×10
-            const spy = _series['SPY'] || [];
-            return spy.map(d => ({t: d.t, s0: d.s0 * 10, sa: d.sa * 10}));
-        }
         if (category === 'MAG7') {
             return _aggregateByTime(MAG7);
         }
@@ -158,7 +153,8 @@
     function _fundamentalsForSelected() {
         if (_selected === 'MAG7') return _aggregateFundamentals(MAG7);
         if (_selected === 'S&PE') return _aggregateFundamentals(['SPY', 'QQQ', ...MAG7]);
-        if (_selected === 'SPX')  return _fundamentals['SPY'] || null;  // SPY proxy
+        // SPX has no fundamentals (it's an index, not an ETF) — fall through to null.
+        // For equity categories, look up directly; SPX returns null (rendered as hidden).
         return _fundamentals[_selected] || null;
     }
 
@@ -258,9 +254,7 @@
             _ctx.fillStyle = 'rgba(180,190,220,0.35)';
             _ctx.font = '11px "JetBrains Mono", monospace';
             _ctx.textAlign = 'center';
-            const msg = _selected === 'SPX'
-                ? 'SPX tier blocked — showing SPY × 10 proxy when SPY data arrives'
-                : `waiting for ${_selected} flow...`;
+            const msg = `waiting for ${_selected} flow...`;
             _ctx.fillText(msg, w / 2, h / 2);
             return;
         }
@@ -436,28 +430,24 @@
         bar.style.cssText = 'display:flex;gap:8px;padding:8px 14px;background:' + BG +
                             ';border-bottom:1px solid rgba(255,255,255,0.04);align-items:center;justify-content:center;flex-wrap:wrap';
 
-        const mkBtn = (label, onClick, isActive, isDisabled) => {
+        const mkBtn = (label, onClick, isActive) => {
             const b = document.createElement('button');
             b.textContent = label;
             const base = `font-family:"Inter",system-ui,sans-serif;font-size:12px;font-weight:700;` +
                          `padding:5px 14px;border-radius:4px;cursor:pointer;letter-spacing:0.02em;`;
-            if (isDisabled) {
-                b.style.cssText = base + `background:rgba(120,140,100,0.12);border:1px solid rgba(120,140,100,0.25);color:rgba(150,180,120,0.35);cursor:not-allowed`;
-                b.title = label === 'SPX' ? 'SPX requires Schwab index-options tier upgrade' : '';
-            } else if (isActive) {
+            if (isActive) {
                 b.style.cssText = base + `background:#5cb85c;border:1px solid #5cb85c;color:#0a0d14`;
             } else {
                 b.style.cssText = base + `background:rgba(120,180,90,0.15);border:1px solid rgba(120,180,90,0.4);color:#b6dd88`;
             }
-            if (!isDisabled) b.onclick = onClick;
+            b.onclick = onClick;
             return b;
         };
 
         const allBtns = [];
         for (const c of CATEGORIES) {
             const label = c === 'MAG7' ? 'Mag7' : c;
-            const disabled = c === 'SPX';
-            const b = mkBtn(label, () => { _selected = c; _dirty = true; _rebuild(); }, _selected === c, disabled);
+            const b = mkBtn(label, () => { _selected = c; _dirty = true; _rebuild(); }, _selected === c);
             b._cat = c;
             allBtns.push(b);
             bar.appendChild(b);
@@ -493,12 +483,9 @@
         function _rebuild() {
             for (const b of allBtns) {
                 const active = _selected === b._cat;
-                const disabled = b._cat === 'SPX';
                 const base = `font-family:"Inter",system-ui,sans-serif;font-size:12px;font-weight:700;` +
-                             `padding:5px 14px;border-radius:4px;cursor:${disabled ? 'not-allowed' : 'pointer'};letter-spacing:0.02em;`;
-                if (disabled) {
-                    b.style.cssText = base + `background:rgba(120,140,100,0.12);border:1px solid rgba(120,140,100,0.25);color:rgba(150,180,120,0.35)`;
-                } else if (active) {
+                             `padding:5px 14px;border-radius:4px;cursor:pointer;letter-spacing:0.02em;`;
+                if (active) {
                     b.style.cssText = base + `background:#5cb85c;border:1px solid #5cb85c;color:#0a0d14`;
                 } else {
                     b.style.cssText = base + `background:rgba(120,180,90,0.15);border:1px solid rgba(120,180,90,0.4);color:#b6dd88`;
