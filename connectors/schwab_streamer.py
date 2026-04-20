@@ -418,27 +418,46 @@ class SchwabStreamer:
     # ─── INTERNAL: SUBSCRIPTIONS ────────────────────────
 
     def _subscribe(self, service, symbols, fields):
-        """Queue a subscription (sends immediately if connected)."""
+        """Subscribe to symbols on a service.
+
+        First call for a service sends SUBS (establishes subscription).
+        Subsequent calls send ADD with only NEW symbols (preserves prior
+        subscriptions). Schwab's SUBS command REPLACES the active symbol
+        set; ADD appends to it. Using SUBS for every call would silently
+        evict earlier subscriptions.
+        """
         if isinstance(symbols, str):
             symbols = [symbols]
 
-        keys = ','.join(symbols)
-        self._subscriptions[service] = {'keys': keys, 'fields': fields}
+        # Split into existing (already subscribed) vs new (need to add)
+        prior = self._subscriptions.get(service, {'keys_set': set(), 'fields': fields})
+        prior_keys = prior.get('keys_set', set())
+        new_keys = [s for s in symbols if s not in prior_keys]
+        if not new_keys:
+            return  # Nothing to do — already subscribed
 
-        # Send immediately if connected
+        # Update local subscription state
+        updated_keys = prior_keys | set(symbols)
+        self._subscriptions[service] = {
+            'keys_set': updated_keys,
+            'keys': ','.join(updated_keys),
+            'fields': fields,
+        }
+
         if self._ws and self._loop and self._loop.is_running():
+            command = 'SUBS' if not prior_keys else 'ADD'
             asyncio.run_coroutine_threadsafe(
-                self._send_subscribe(service, keys, fields),
+                self._send_subscribe(service, ','.join(new_keys), fields, command),
                 self._loop
             )
 
-    async def _send_subscribe(self, service, keys, fields):
-        """Send a SUBS command to the WebSocket."""
+    async def _send_subscribe(self, service, keys, fields, command='SUBS'):
+        """Send a SUBS (initial) or ADD (append) command to the WebSocket."""
         req = {
             "requests": [{
                 "requestid": str(self._next_id()),
                 "service": service,
-                "command": "SUBS",
+                "command": command,
                 "SchwabClientCustomerId": self._customer_id,
                 "SchwabClientCorrelId": self._correl_id,
                 "parameters": {
@@ -449,9 +468,9 @@ class SchwabStreamer:
         }
         try:
             await self._ws.send(json.dumps(req))
-            print(f"[STREAM] 📡 Subscribed to {service}: {keys}")
+            print(f"[STREAM] 📡 {command} → {service}: {len(keys.split(','))} keys")
         except Exception as e:
-            print(f"[STREAM] ⚠️  Subscribe failed for {service}: {e}")
+            print(f"[STREAM] ⚠️  {command} failed for {service}: {e}")
 
     # ─── INTERNAL: MESSAGE PROCESSING ───────────────────
 
