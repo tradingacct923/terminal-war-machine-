@@ -42,6 +42,7 @@ const FEATURES = {
   bookms:   { label: 'BOOK MS',   icon: '\u{1f4d1}', desc: 'Book Microstructure (Venue Quality)' },
   vpintel:  { label: 'VP INTEL',  icon: '\u{1f4ca}', desc: 'Volume Profile Intelligence — Absorption, Depth, Zones' },
   flow:     { label: 'FLOW',      icon: '\u{1f4b0}', desc: 'Signed Δ Notional Flow (0DT-Hero-style) — SPY/QQQ/Mag7' },
+  movers:   { label: 'MOVERS',    icon: '\u{1f680}', desc: 'Schwab Top Movers — SPX/DJI/NDX/RUT index-scoped' },
 };
 const FEAT_KEYS = Object.keys(FEATURES);
 
@@ -68,7 +69,7 @@ const LAYOUTS = {
   'dealer-desk': { label:'Dealer Desk', slots:4, cols:2, rows:2, defaults:['chart','dealer','xdiv','optflow'] },
   'war-room':    { label:'War Room',    slots:6, cols:3, rows:2, defaults:['chart','eqtape','dealer','volsurf','xdiv','optflow'] },
   // ── Flow analytics ──
-  'flow-hero':   { label:'Flow Hero',   slots:4, cols:2, rows:2, defaults:['chart','flow','dealer','vpintel'] },
+  'flow-hero':   { label:'Flow Hero',   slots:4, cols:2, rows:2, defaults:['chart','flow','movers','vpintel'] },
   // ── Pro Default ──
   'pro':         { label:'Pro',         slots:3, cols:3, rows:1, defaults:['chart','ladder','eqbook'] },
 };

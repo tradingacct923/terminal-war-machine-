@@ -39,6 +39,10 @@
     let _selected = 'QQQ';
     let _dto_only = false;      // false = show BOTH lines (default), true = 0DTE only
 
+    // Fundamentals cache — keyed by ticker. Fetched on first mount + when ticker changes.
+    const _fundamentals = {};   // {ticker: {peRatio, beta, divYield, marketCap, ...}}
+    let _fundamentalsFetched = false;
+
     let _slotEl = null;
     let _canvas = null;
     let _ctx = null;
@@ -116,6 +120,55 @@
             .catch(() => {});
     }
 
+    function _fetchFundamentals() {
+        if (_fundamentalsFetched) return;
+        _fundamentalsFetched = true;
+        const tickers = ['QQQ', 'SPY', ...MAG7].join(',');
+        fetch(`/api/fundamentals?symbols=${tickers}`,
+              {headers: {'X-Auth-Token': sessionStorage.getItem('greeks-auth') || ''}})
+            .then(r => r.json())
+            .then(d => {
+                if (!d || !d.fundamentals) return;
+                Object.assign(_fundamentals, d.fundamentals);
+                _dirty = true;
+            })
+            .catch(() => { _fundamentalsFetched = false; });  // retry on next cycle if failed
+    }
+
+    function _aggregateFundamentals(tickers) {
+        // Average P/E, β, DivYield; sum market cap. Skip tickers without data.
+        let pe_sum = 0, pe_n = 0, b_sum = 0, b_n = 0, dy_sum = 0, dy_n = 0, mc_sum = 0;
+        for (const t of tickers) {
+            const f = _fundamentals[t];
+            if (!f) continue;
+            if (f.peRatio && isFinite(f.peRatio)) { pe_sum += f.peRatio; pe_n++; }
+            if (f.beta && isFinite(f.beta))       { b_sum  += f.beta;    b_n++;  }
+            if (f.divYield != null && isFinite(f.divYield)) { dy_sum += f.divYield; dy_n++; }
+            if (f.marketCap && isFinite(f.marketCap)) mc_sum += f.marketCap;
+        }
+        return {
+            peRatio: pe_n ? pe_sum / pe_n : null,
+            beta:    b_n  ? b_sum / b_n  : null,
+            divYield:dy_n ? dy_sum / dy_n: null,
+            marketCap: mc_sum || null,
+        };
+    }
+
+    function _fundamentalsForSelected() {
+        if (_selected === 'MAG7') return _aggregateFundamentals(MAG7);
+        if (_selected === 'S&PE') return _aggregateFundamentals(['SPY', 'QQQ', ...MAG7]);
+        if (_selected === 'SPX')  return _fundamentals['SPY'] || null;  // SPY proxy
+        return _fundamentals[_selected] || null;
+    }
+
+    function _fmtMCap(mc) {
+        if (!mc || !isFinite(mc)) return '—';
+        if (mc >= 1e12) return `$${(mc / 1e12).toFixed(2)}T`;
+        if (mc >= 1e9)  return `$${(mc / 1e9).toFixed(1)}B`;
+        if (mc >= 1e6)  return `$${(mc / 1e6).toFixed(0)}M`;
+        return `$${mc.toFixed(0)}`;
+    }
+
     // ── Formatting ────────────────────────────────────────────────────────
     function _fmtMoney(v) {
         const a = Math.abs(v);
@@ -182,6 +235,22 @@
         _ctx.font = '13px "Inter", system-ui, sans-serif';
         _ctx.textAlign = 'left';
         _ctx.fillText(_fmtDateHeader(), 12, 22);
+
+        // Fundamentals badge (right-aligned on header row)
+        const fund = _fundamentalsForSelected();
+        if (fund) {
+            const parts = [];
+            if (fund.peRatio != null) parts.push(`P/E ${fund.peRatio.toFixed(1)}`);
+            if (fund.beta != null)    parts.push(`β ${fund.beta.toFixed(2)}`);
+            if (fund.divYield != null) parts.push(`DivY ${fund.divYield.toFixed(2)}%`);
+            if (fund.marketCap)        parts.push(`MCap ${_fmtMCap(fund.marketCap)}`);
+            if (parts.length) {
+                _ctx.fillStyle = 'rgba(180,190,220,0.7)';
+                _ctx.font = '10px "JetBrains Mono", monospace';
+                _ctx.textAlign = 'right';
+                _ctx.fillText(parts.join('   '), plotR, 22);
+            }
+        }
 
         if (!data.length) {
             _ctx.fillStyle = 'rgba(180,190,220,0.35)';
@@ -457,6 +526,7 @@
             _ctx = _canvas.getContext('2d');
 
             _hydrateFromREST();
+            _fetchFundamentals();
             if (window.AltarisEvents) {
                 const handler = (data) => {
                     if (data && Array.isArray(data.tickers)) {
