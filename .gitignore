@@ -48,3 +48,31 @@ war mechinee
 logs/level2/*.csv
 logs/*.jsonl
 logs/level2/
+logs/*.json
+logs/*.json.bak
+logs/*.json.pre_*
+logs/server.log*
+logs/regression_report_*.md
+logs/regression_summary.json
+
+# Runtime state (atomic-rename snapshots from connectors)
+state/
+
+# Investigation snapshots / debug JSONL dumps
+investigation/snapshots/
+investigation/bar_signals/
+investigation/big_prints/
+investigation/candle_bp/
+investigation/floors_evolution/
+investigation/raw_bar_context/
+investigation/reports/
+
+# Raw market data captures
+*_L2.csv
+
+# Prototypes / legacy
+Atrax*Prototype.html
+web/index_legacy.html
+
+# Phase 20A reference repo (Nguyen 2025) — cloned for audit + lifted modules
+external/

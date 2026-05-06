@@ -96,12 +96,21 @@ CHART_EQUITY_FIELDS = {
     5: 'volume', 6: 'sequence', 7: 'chart_time', 8: 'chart_day',
 }
 
+# TIMESALE_* fields are identical across equity/options/futures (per Schwab docs):
+#   0: key (symbol), 1: trade_time (ms epoch), 2: last_price, 3: last_size, 4: last_sequence
+TIMESALE_FIELDS = {
+    0: 'symbol', 1: 'trade_time', 2: 'last_price', 3: 'last_size', 4: 'last_sequence',
+}
+
 FIELD_MAPS = {
     'LEVELONE_FUTURES': FUTURES_FIELDS,
     'LEVELONE_EQUITIES': EQUITY_FIELDS,
     'LEVELONE_OPTIONS': OPTIONS_FIELDS,
     'CHART_FUTURES': CHART_FUTURES_FIELDS,
     'CHART_EQUITY': CHART_EQUITY_FIELDS,
+    'TIMESALE_OPTIONS': TIMESALE_FIELDS,
+    'TIMESALE_EQUITY': TIMESALE_FIELDS,
+    'TIMESALE_FUTURES': TIMESALE_FIELDS,
 }
 
 
@@ -118,21 +127,39 @@ class SchwabStreamer:
     - ACCT_ACTIVITY (order fills)
     """
 
-    def __init__(self, auth):
+    def __init__(self, auth, n_connections=1):
         """
         Args:
             auth: Authenticated SchwabAuth instance
+            n_connections: Number of concurrent WebSocket connections to
+                           maintain. Each connection has its own 3,000-symbol
+                           LEVELONE_OPTIONS quota from Schwab. Multiple
+                           connections from the same OAuth token are accepted
+                           by Schwab as long as their LOGINs are staggered
+                           (we delay each by idx*4s to avoid the auth race).
+                           All connections run as concurrent asyncio tasks
+                           inside the SAME event loop / thread, so gevent
+                           monkey-patching doesn't collide. Default 1 keeps
+                           backward compatibility with single-WS callers.
         """
         self.auth = auth
-        self._ws = None
+        self._n = max(1, int(n_connections))
         self._thread = None
         self._loop = None
         self._running = False
         self._request_id = 0
         self._callbacks = defaultdict(list)
-        self._subscriptions = {}  # service -> {keys, fields}
 
-        # Latest data store (thread-safe reads via GIL)
+        # Per-connection state (lists indexed by conn_idx 0..N-1).
+        # Each WebSocket has its own subscription dict so reconnect of
+        # any one connection re-subscribes only its own symbols, and the
+        # 3,000-symbol per-WebSocket Schwab cap is honored independently.
+        self._wss = [None] * self._n
+        self._subs_per_conn = [dict() for _ in range(self._n)]
+
+        # Latest data store (thread-safe reads via GIL).
+        # Shared across connections — _process_message merges by symbol so
+        # a quote update on either WS lands in the same `latest` dict.
         self.latest = defaultdict(dict)  # service -> {symbol: data}
         self.book = defaultdict(dict)    # 'NYSE_BOOK'|'NASDAQ_BOOK' -> {symbol: book_data}
 
@@ -146,6 +173,22 @@ class SchwabStreamer:
         # Reconnect settings
         self._max_reconnect_delay = 30
         self._reconnect_attempts = 0
+
+    # Legacy single-conn shims for any external accessors.
+    @property
+    def _ws(self):
+        """Backward-compat: return the first connection's WebSocket."""
+        return self._wss[0] if self._wss else None
+
+    @_ws.setter
+    def _ws(self, value):
+        if self._wss:
+            self._wss[0] = value
+
+    @property
+    def _subscriptions(self):
+        """Backward-compat: return the first connection's subscription dict."""
+        return self._subs_per_conn[0] if self._subs_per_conn else {}
 
     # ─── PUBLIC API ─────────────────────────────────────
 
@@ -183,76 +226,84 @@ class SchwabStreamer:
         """
         self._callbacks[service].append(callback)
 
-    def subscribe_futures(self, symbols, fields=None):
-        """Subscribe to Level 1 futures quotes."""
+    def subscribe_futures(self, symbols, fields=None, conn_idx=0):
+        """Subscribe to Level 1 futures quotes on connection `conn_idx`."""
         if fields is None:
             fields = '0,1,2,3,4,5,8,9,10,11,12,13,14,18,19,20,22,23,24,31'
-        self._subscribe('LEVELONE_FUTURES', symbols, fields)
+        self._subscribe('LEVELONE_FUTURES', symbols, fields, conn_idx)
 
-    def subscribe_equities(self, symbols, fields=None):
-        """Subscribe to Level 1 equity quotes."""
+    def subscribe_equities(self, symbols, fields=None, conn_idx=0):
+        """Subscribe to Level 1 equity quotes on connection `conn_idx`."""
         if fields is None:
             # Fields 37-41: bid_time, ask_time, ask_mic, bid_mic, last_mic
             # — NBBO venue tracking for MM withdrawal detection at tick speed
             fields = '0,1,2,3,4,5,8,9,10,11,12,17,18,25,32,33,37,38,39,40,41,42'
-        self._subscribe('LEVELONE_EQUITIES', symbols, fields)
+        self._subscribe('LEVELONE_EQUITIES', symbols, fields, conn_idx)
 
-    def subscribe_options(self, symbols, fields=None):
-        """Subscribe to Level 1 options with full greeks + enriched fields."""
+    def subscribe_options(self, symbols, fields=None, conn_idx=0):
+        """Subscribe to Level 1 options on connection `conn_idx`.
+
+        Each connection has its own 3,000-symbol Schwab cap, so distribute
+        large option universes across multiple connections via conn_idx.
+        """
         if fields is None:
-            # Full field set: bid, ask, last, high, low, close, volume, OI, IV,
-            # intrinsic_value, open, bid/ask/last_size, net_change, strike,
-            # contract_type, underlying, time_value, dte, delta, gamma, theta,
-            # vega, rho, security_status, theoretical_value, underlying_price,
-            # exp_type, mark, quote_time, trade_time, exchange, exchange_name,
-            # mark_change, mark_pct_change, indicative_ask, indicative_bid,
-            # exercise_type
-            fields = '0,1,2,3,4,5,6,7,8,9,10,11,15,16,17,18,19,20,21,22,25,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,45,46,52,53,55'
-        self._subscribe('LEVELONE_OPTIONS', symbols, fields)
+            # 2026-05-04: bumped to FULL Schwab field set (0-55 inclusive).
+            # Critical missing fields previously: 42 (last_trading_day),
+            # 43 (settlement_type — A/P for AM/PM), 44 (net_pct_change),
+            # 47 (implied_yield), 48 (is_penny_pilot), 49 (option_root —
+            # explicit root extraction), 50/51 (52wk hi/lo), 54 (indicative_quote_time).
+            # `settlement_type` (43) is the AUTHORITATIVE AM/PM indicator —
+            # see flow_accumulator._classify_setup_mode for usage.
+            fields = ','.join(str(i) for i in range(0, 56))
+        self._subscribe('LEVELONE_OPTIONS', symbols, fields, conn_idx)
 
-    def subscribe_nyse_book(self, symbols):
-        """Subscribe to NYSE Level 2 book."""
-        self._subscribe('NYSE_BOOK', symbols, '0,1,2,3')
+    def subscribe_nyse_book(self, symbols, conn_idx=0):
+        """Subscribe to NYSE Level 2 book on connection `conn_idx`."""
+        self._subscribe('NYSE_BOOK', symbols, '0,1,2,3', conn_idx)
 
-    def subscribe_nasdaq_book(self, symbols):
-        """Subscribe to NASDAQ Level 2 book."""
-        self._subscribe('NASDAQ_BOOK', symbols, '0,1,2,3')
+    def subscribe_nasdaq_book(self, symbols, conn_idx=0):
+        """Subscribe to NASDAQ Level 2 book on connection `conn_idx`."""
+        self._subscribe('NASDAQ_BOOK', symbols, '0,1,2,3', conn_idx)
 
-    def subscribe_options_book(self, symbols):
-        """Subscribe to OPTIONS Level 2 book."""
-        self._subscribe('OPTIONS_BOOK', symbols, '0,1,2,3')
+    def subscribe_options_book(self, symbols, conn_idx=0):
+        """Subscribe to OPTIONS Level 2 book on connection `conn_idx`.
 
-    def subscribe_chart_futures(self, symbols):
-        """Subscribe to real-time futures chart candles."""
-        self._subscribe('CHART_FUTURES', symbols, '0,1,2,3,4,5,6')
+        Pin to the same conn_idx as the underlying LEVELONE_OPTIONS sub
+        for the same symbols — keeps quote + book on one WS for consistency.
+        """
+        self._subscribe('OPTIONS_BOOK', symbols, '0,1,2,3', conn_idx)
 
-    def subscribe_chart_equity(self, symbols):
-        """Subscribe to real-time equity chart candles."""
-        self._subscribe('CHART_EQUITY', symbols, '0,1,2,3,4,5,6,7,8')
+    def subscribe_timesale_options(self, symbols, conn_idx=0):
+        """Subscribe to trade-by-trade option prints (TIMESALE_OPTIONS)."""
+        self._subscribe('TIMESALE_OPTIONS', symbols, '0,1,2,3,4', conn_idx)
 
-    def subscribe_account_activity(self):
+    def subscribe_timesale_equity(self, symbols, conn_idx=0):
+        """Subscribe to trade-by-trade equity prints (TIMESALE_EQUITY)."""
+        self._subscribe('TIMESALE_EQUITY', symbols, '0,1,2,3,4', conn_idx)
+
+    def subscribe_timesale_futures(self, symbols, conn_idx=0):
+        """Subscribe to trade-by-trade futures prints (TIMESALE_FUTURES)."""
+        self._subscribe('TIMESALE_FUTURES', symbols, '0,1,2,3,4', conn_idx)
+
+    def subscribe_chart_futures(self, symbols, conn_idx=0):
+        """Subscribe to real-time futures chart candles on connection `conn_idx`."""
+        self._subscribe('CHART_FUTURES', symbols, '0,1,2,3,4,5,6', conn_idx)
+
+    def subscribe_chart_equity(self, symbols, conn_idx=0):
+        """Subscribe to real-time equity chart candles on connection `conn_idx`."""
+        self._subscribe('CHART_EQUITY', symbols, '0,1,2,3,4,5,6,7,8', conn_idx)
+
+    def subscribe_account_activity(self, conn_idx=0):
         """Subscribe to account activity (order fills, etc.)."""
-        self._subscribe('ACCT_ACTIVITY', ['Account Activity'], '0,1,2,3')
+        self._subscribe('ACCT_ACTIVITY', ['Account Activity'], '0,1,2,3', conn_idx)
 
-    def subscribe_screener_option(self, sort='VOLUME', frequency='0'):
-        """Subscribe to real-time options screener stream.
-        Args:
-            sort: Sort criterion (VOLUME, TRADES, PERCENT_CHANGE_UP, PERCENT_CHANGE_DOWN, AVERAGE_PERCENT_VOLUME)
-            frequency: '0' (all), '1', '5', '10', '30', '60' minute windows
-        """
-        # Key format per Schwab API: PREFIX_SORTFIELD_FREQUENCY
-        # e.g., OPTION_ALL_VOLUME_0
-        self._subscribe('SCREENER_OPTION', [f'OPTION_ALL_{sort}_{frequency}'], '0,1,2,3,4')
+    def subscribe_screener_option(self, sort='VOLUME', frequency='0', conn_idx=0):
+        """Subscribe to real-time options screener stream."""
+        self._subscribe('SCREENER_OPTION', [f'OPTION_ALL_{sort}_{frequency}'], '0,1,2,3,4', conn_idx)
 
-    def subscribe_screener_equity(self, exchange='NYSE', sort='VOLUME', frequency='0'):
-        """Subscribe to real-time equity screener stream.
-        Args:
-            exchange: 'NYSE', 'NASDAQ', or 'OTCBB'
-            sort: Sort criterion (VOLUME, TRADES, PERCENT_CHANGE_UP, PERCENT_CHANGE_DOWN, AVERAGE_PERCENT_VOLUME)
-            frequency: '0' (all), '1', '5', '10', '30', '60' minute windows
-        Keys format: e.g., NYSE_VOLUME_0, NASDAQ_PERCENT_CHANGE_UP_5
-        """
-        self._subscribe('SCREENER_EQUITY', [f'{exchange}_{sort}_{frequency}'], '0,1,2,3,4')
+    def subscribe_screener_equity(self, exchange='NYSE', sort='VOLUME', frequency='0', conn_idx=0):
+        """Subscribe to real-time equity screener stream."""
+        self._subscribe('SCREENER_EQUITY', [f'{exchange}_{sort}_{frequency}'], '0,1,2,3,4', conn_idx)
 
     def get_book(self, symbol, exchange='NASDAQ_BOOK'):
         """Get latest Level 2 book snapshot for a symbol."""
@@ -300,13 +351,21 @@ class SchwabStreamer:
             raise Exception(f"Failed to fetch user preferences: {e}")
 
     def _run_loop(self):
-        """Main event loop for the WebSocket connection (runs in background thread)."""
+        """Main event loop — runs N concurrent WebSocket connections inside ONE asyncio loop.
+
+        Critical for gevent compat: server.py monkey-patches threading, so
+        spawning a SECOND threading.Thread with its OWN asyncio loop collides.
+        Solution: ONE thread, ONE loop, but inside that loop run N concurrent
+        WebSocket coroutines via asyncio.gather. Each coroutine maintains its
+        own WebSocket session with its own Schwab session ID and its own
+        3,000-symbol LEVELONE_OPTIONS quota.
+        """
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
 
         while self._running:
             try:
-                self._loop.run_until_complete(self._connect_and_stream())
+                self._loop.run_until_complete(self._run_all_connections())
             except Exception as e:
                 if self._running:
                     self._reconnect_attempts += 1
@@ -320,54 +379,114 @@ class SchwabStreamer:
                     except Exception:
                         pass
 
-    async def _connect_and_stream(self):
-        """Connect to WebSocket and process messages."""
-        print(f"[STREAM] Connecting to {self._streamer_url}...")
+    async def _run_all_connections(self):
+        """Spawn _connect_one(idx) for each WebSocket and wait for all.
 
-        async with websockets.connect(
-            self._streamer_url,
-            max_size=2**20,  # 1MB max message size
-            ping_interval=30,
-            ping_timeout=10,
-            close_timeout=5,
-        ) as ws:
-            self._ws = ws
-            self._reconnect_attempts = 0
+        Each _connect_one is now an infinite while-loop that self-heals on
+        WS close — connections recover INDEPENDENTLY. We use
+        return_exceptions=True so a fatal error in one connection doesn't
+        cancel the others (each is responsible for its own reconnect logic).
+        """
+        return await asyncio.gather(
+            *[self._connect_one(idx, login_delay=idx * 4)
+              for idx in range(self._n)],
+            return_exceptions=True,
+        )
 
-            # Login
-            login_success = await self._login()
-            if not login_success:
-                raise Exception("Login failed")
+    async def _connect_one(self, idx, login_delay=0):
+        """Maintain ONE WebSocket connection at index `idx` — SELF-HEALING.
 
-            print(f"[STREAM] ✅ Connected and logged in")
+        Wraps connect/login/message-loop in `while self._running` so a
+        WebSocket close on this connection ONLY affects this connection;
+        other connections in the asyncio.gather group keep running. Without
+        this loop, a single WS close would cause _connect_one to return
+        normally, asyncio.gather would keep waiting for the other coroutine
+        forever, and the dead connection would never recover.
 
-            # Re-subscribe to any existing subscriptions (for reconnects)
-            for service, sub in self._subscriptions.items():
-                await self._send_subscribe(service, sub['keys'], sub['fields'])
+        Per-connection reconnect counter so back-off on conn 0 doesn't
+        affect conn 1.
 
-            # Message loop
-            last_heartbeat = time.time()
-            async for message in ws:
+        login_delay staggers concurrent LOGINs to avoid Schwab's auth race
+        (two LOGINs <~1s apart on the same token → code=3 'token invalid').
+        Applied only on the FIRST connect; reconnects don't re-stagger
+        because by then the other connection is established.
+        """
+        per_conn_reconnect_attempts = 0
+        first_connect = True
+
+        while self._running:
+            try:
+                if first_connect and login_delay > 0:
+                    print(f"[STREAM-{idx}] waiting {login_delay}s before LOGIN (auth-race avoidance)...")
+                    await asyncio.sleep(login_delay)
+                first_connect = False
+
+                print(f"[STREAM-{idx}] Connecting to {self._streamer_url}...")
+                async with websockets.connect(
+                    self._streamer_url,
+                    max_size=16 * 2**20,
+                    ping_interval=30,
+                    ping_timeout=10,
+                    close_timeout=5,
+                ) as ws:
+                    self._wss[idx] = ws
+                    per_conn_reconnect_attempts = 0  # reset on successful connect
+
+                    # Login on this WS
+                    login_success = await self._login(idx)
+                    if not login_success:
+                        raise Exception(f"Login failed on connection {idx}")
+                    print(f"[STREAM-{idx}] ✅ Connected and logged in")
+
+                    # Re-subscribe per-connection state (for reconnects)
+                    for service, sub in self._subs_per_conn[idx].items():
+                        await self._send_subscribe(idx, service, sub['keys'], sub['fields'])
+
+                    # Message loop
+                    last_heartbeat = time.time()
+                    async for message in ws:
+                        try:
+                            data = json.loads(message)
+                            self._process_message(data, conn_idx=idx)
+                            if 'notify' in data or 'data' in data or 'response' in data:
+                                last_heartbeat = time.time()
+                            if time.time() - last_heartbeat > 90:
+                                print(f"[STREAM-{idx}] ⚠️  No messages in 90s, reconnecting...")
+                                break
+                        except json.JSONDecodeError:
+                            print(f"[STREAM-{idx}] ⚠️  Invalid JSON: {message[:100]}")
+                        except Exception as e:
+                            print(f"[STREAM-{idx}] ⚠️  Message processing error: {e}")
+                # `async with` exit — WS closed cleanly OR loop broke.
+                # Fall through to outer while + reconnect.
+                self._wss[idx] = None
+                if self._running:
+                    print(f"[STREAM-{idx}] WS closed — will reconnect")
+
+            except Exception as e:
+                self._wss[idx] = None
+                if not self._running:
+                    return  # graceful shutdown
+                per_conn_reconnect_attempts += 1
+                delay = min(2 ** per_conn_reconnect_attempts, self._max_reconnect_delay)
+                print(f"[STREAM-{idx}] ❌ Connection error: {e}")
+                print(f"[STREAM-{idx}] Reconnecting in {delay}s (attempt {per_conn_reconnect_attempts})...")
+                # Token refresh — same access_token across both conns,
+                # but if it expired this brings it current
                 try:
-                    data = json.loads(message)
-                    self._process_message(data)
+                    self.auth._refresh()
+                except Exception:
+                    pass
+                await asyncio.sleep(delay)
 
-                    # Track heartbeats — any valid message keeps connection alive
-                    if 'notify' in data or 'data' in data or 'response' in data:
-                        last_heartbeat = time.time()
+    # Backward-compat alias — older code may call this directly
+    async def _connect_and_stream(self):
+        """Single-connection legacy path (calls _connect_one(0))."""
+        return await self._connect_one(0, login_delay=0)
 
-                    # Check heartbeat timeout
-                    if time.time() - last_heartbeat > 90:
-                        print("[STREAM] ⚠️  No messages in 90s, reconnecting...")
-                        break
-
-                except json.JSONDecodeError:
-                    print(f"[STREAM] ⚠️  Invalid JSON: {message[:100]}")
-                except Exception as e:
-                    print(f"[STREAM] ⚠️  Message processing error: {e}")
-
-    async def _login(self):
-        """Send LOGIN command to the streamer."""
+    async def _login(self, conn_idx=0):
+        """Send LOGIN command on the WebSocket at index `conn_idx`."""
+        ws = self._wss[conn_idx]
         login_req = {
             "requests": [{
                 "requestid": str(self._next_id()),
@@ -383,11 +502,11 @@ class SchwabStreamer:
             }]
         }
 
-        await self._ws.send(json.dumps(login_req))
+        await ws.send(json.dumps(login_req))
 
         # Wait for login response
         try:
-            resp_raw = await asyncio.wait_for(self._ws.recv(), timeout=10)
+            resp_raw = await asyncio.wait_for(ws.recv(), timeout=10)
             resp = json.loads(resp_raw)
 
             if 'response' in resp:
@@ -396,20 +515,22 @@ class SchwabStreamer:
                     code = content.get('code', -1)
                     msg = content.get('msg', '')
                     if code == 0:
-                        print(f"[STREAM] ✅ LOGIN successful: {msg}")
+                        print(f"[STREAM-{conn_idx}] ✅ LOGIN successful: {msg}")
                         return True
                     else:
-                        print(f"[STREAM] ❌ LOGIN failed: code={code}, msg={msg}")
+                        print(f"[STREAM-{conn_idx}] ❌ LOGIN failed: code={code}, msg={msg}")
                         return False
         except asyncio.TimeoutError:
-            print("[STREAM] ❌ LOGIN timeout")
+            print(f"[STREAM-{conn_idx}] ❌ LOGIN timeout")
             return False
 
         return False
 
     async def _disconnect(self):
-        """Send LOGOUT and close WebSocket."""
-        if self._ws:
+        """Send LOGOUT and close ALL WebSockets."""
+        for idx, ws in enumerate(self._wss):
+            if not ws:
+                continue
             try:
                 logout_req = {
                     "requests": [{
@@ -420,72 +541,109 @@ class SchwabStreamer:
                         "SchwabClientCorrelId": self._correl_id,
                     }]
                 }
-                await self._ws.send(json.dumps(logout_req))
-                await self._ws.close()
+                await ws.send(json.dumps(logout_req))
+                await ws.close()
             except Exception:
                 pass
+            self._wss[idx] = None
 
     # ─── INTERNAL: SUBSCRIPTIONS ────────────────────────
 
-    def _subscribe(self, service, symbols, fields):
-        """Subscribe to symbols on a service.
+    def _subscribe(self, service, symbols, fields, conn_idx=0):
+        """Subscribe to symbols on a service via the WebSocket at `conn_idx`.
 
-        First call for a service sends SUBS (establishes subscription).
-        Subsequent calls send ADD with only NEW symbols (preserves prior
-        subscriptions). Schwab's SUBS command REPLACES the active symbol
-        set; ADD appends to it. Using SUBS for every call would silently
-        evict earlier subscriptions.
+        First call for a (conn_idx, service) pair sends SUBS (establishes
+        subscription). Subsequent calls send ADD with only NEW symbols so
+        Schwab's SUBS-replace semantics don't evict earlier subscriptions.
+        Per-connection subscription state is tracked in
+        `_subs_per_conn[conn_idx][service]` so each WebSocket re-subscribes
+        only its own symbols on reconnect.
         """
         if isinstance(symbols, str):
             symbols = [symbols]
+        if conn_idx < 0 or conn_idx >= self._n:
+            print(f"[STREAM] ⚠️  invalid conn_idx={conn_idx} (n_connections={self._n})")
+            return
 
         # Split into existing (already subscribed) vs new (need to add)
-        prior = self._subscriptions.get(service, {'keys_set': set(), 'fields': fields})
+        subs = self._subs_per_conn[conn_idx]
+        prior = subs.get(service, {'keys_set': set(), 'fields': fields})
         prior_keys = prior.get('keys_set', set())
         new_keys = [s for s in symbols if s not in prior_keys]
         if not new_keys:
-            return  # Nothing to do — already subscribed
+            return  # Nothing to do — already subscribed on this connection
 
         # Update local subscription state
         updated_keys = prior_keys | set(symbols)
-        self._subscriptions[service] = {
+        subs[service] = {
             'keys_set': updated_keys,
             'keys': ','.join(updated_keys),
             'fields': fields,
         }
 
-        if self._ws and self._loop and self._loop.is_running():
+        ws = self._wss[conn_idx] if conn_idx < len(self._wss) else None
+        if ws and self._loop and self._loop.is_running():
             command = 'SUBS' if not prior_keys else 'ADD'
             asyncio.run_coroutine_threadsafe(
-                self._send_subscribe(service, ','.join(new_keys), fields, command),
+                self._send_subscribe(conn_idx, service, ','.join(new_keys), fields, command),
                 self._loop
             )
 
-    async def _send_subscribe(self, service, keys, fields, command='SUBS'):
-        """Send a SUBS (initial) or ADD (append) command to the WebSocket."""
-        req = {
-            "requests": [{
-                "requestid": str(self._next_id()),
-                "service": service,
-                "command": command,
-                "SchwabClientCustomerId": self._customer_id,
-                "SchwabClientCorrelId": self._correl_id,
-                "parameters": {
-                    "keys": keys,
-                    "fields": fields,
-                }
-            }]
-        }
-        try:
-            await self._ws.send(json.dumps(req))
-            print(f"[STREAM] 📡 {command} → {service}: {len(keys.split(','))} keys")
-        except Exception as e:
-            print(f"[STREAM] ⚠️  {command} failed for {service}: {e}")
+    async def _send_subscribe(self, conn_idx, service, keys, fields, command='SUBS'):
+        """Send a SUBS or ADD command on the WebSocket at `conn_idx`.
+
+        Chunks payload to stay under Schwab's 65,535-byte WS frame limit.
+        First chunk uses the caller-supplied command; subsequent chunks use
+        ADD so they extend the active subscription instead of replacing it.
+        """
+        # 2,000 keys per chunk ≈ 24 KB payload — safe margin under 65,535.
+        # Empirically, 6,000 LEVELONE_OPTIONS keys = 71,521 bytes (1009 close).
+        CHUNK_SIZE = 2000
+
+        key_list = keys.split(',') if isinstance(keys, str) and keys else list(keys or [])
+        if not key_list:
+            return
+
+        ws = self._wss[conn_idx] if conn_idx < len(self._wss) else None
+        if not ws:
+            print(f"[STREAM-{conn_idx}] ⚠️  no WS for conn_idx={conn_idx} — dropping {service} SUBS")
+            return
+
+        chunks = [key_list[i:i + CHUNK_SIZE] for i in range(0, len(key_list), CHUNK_SIZE)]
+
+        for i, chunk in enumerate(chunks):
+            cmd = command if i == 0 else 'ADD'
+            req = {
+                "requests": [{
+                    "requestid": str(self._next_id()),
+                    "service": service,
+                    "command": cmd,
+                    "SchwabClientCustomerId": self._customer_id,
+                    "SchwabClientCorrelId": self._correl_id,
+                    "parameters": {
+                        "keys": ','.join(chunk),
+                        "fields": fields,
+                    }
+                }]
+            }
+            try:
+                await ws.send(json.dumps(req))
+                suffix = f" (chunk {i + 1}/{len(chunks)})" if len(chunks) > 1 else ""
+                print(f"[STREAM-{conn_idx}] 📡 {cmd} → {service}: {len(chunk)} keys{suffix}")
+            except Exception as e:
+                print(f"[STREAM-{conn_idx}] ⚠️  {cmd} failed for {service}: {e}")
+                return
 
     # ─── INTERNAL: MESSAGE PROCESSING ───────────────────
 
-    def _process_message(self, data):
-        """Route incoming WebSocket messages."""
+    def _process_message(self, data, conn_idx=0):
+        """Route incoming WebSocket messages.
+
+        conn_idx is the connection that delivered the message — used only
+        for logging; data handlers (set via .on()) are shared across all
+        connections so the upstream consumer doesn't need to know which
+        WS produced the event.
+        """
         # Heartbeat
         if 'notify' in data:
             return  # Silently handle heartbeats
@@ -499,9 +657,9 @@ class SchwabStreamer:
                 code = content.get('code', -1)
                 msg = content.get('msg', '')
                 if code == 0:
-                    print(f"[STREAM] ✅ {service} {command}: {msg}")
+                    print(f"[STREAM-{conn_idx}] ✅ {service} {command}: {msg}")
                 else:
-                    print(f"[STREAM] ⚠️  {service} {command} code={code}: {msg}")
+                    print(f"[STREAM-{conn_idx}] ⚠️  {service} {command} code={code}: {msg}")
 
         # Data updates
         if 'data' in data:

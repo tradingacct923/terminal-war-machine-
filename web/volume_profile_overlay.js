@@ -1847,6 +1847,15 @@ window.VolumeProfileOverlay = {
         }
     },
     setActiveProfiles(modes) { _activeProfiles = modes; _pollProfiles(); _syncPanelFromState(); },
+    // Add a mode to the active set (union, not replacement) and trigger a fetch
+    // so it lands in the cache on the next poll. Used by VP Intel's TF switcher
+    // to pull rolling_4h / weekly / 2day on demand without displacing the chart
+    // overlay's existing session + prior_day pair.
+    ensureProfileActive(mode) {
+        if (!_activeProfiles.includes(mode)) _activeProfiles.push(mode);
+        _fetchProfile(mode);
+    },
+    setStepSize(step) { _stepSize = step || ''; _pollProfiles(); },
     toggleVisibility() { _overlayVisible = !_overlayVisible; return _overlayVisible; },
     isVisible() { return _overlayVisible; },
     setCustomRange(from_ts, to_ts) { _customRange = { from_ts, to_ts }; if (_activeProfiles.includes('custom')) _fetchProfile('custom'); },

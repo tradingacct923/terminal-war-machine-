@@ -198,6 +198,104 @@
                 }
             });
 
+            // ── intel:sweep_alert: Multi-strike sweep detector push (Phase 1) ──
+            // Source: connectors/sweep_detector.py — emits when 3+ adjacent
+            // option strikes traded within 500ms, all aggressor-side same dir.
+            // Consumed by web/sweep_pane.js via 'socket:intel:sweep_alert'.
+            window._sio.on('intel:sweep_alert', (data) => {
+                if (window.AltarisEvents) {
+                    window.AltarisEvents.emit('socket:intel:sweep_alert', data);
+                }
+            });
+
+            // ── intel:pin_update: Pin Convergence cache push (Phase 2) ──
+            // Source: connectors/pin_convergence.compute_pin_state via
+            // schwab_bridge._intel_compute_loop. 15s last hour / 60s otherwise.
+            // Consumed by web/pin_pane.js via 'socket:intel:pin_update'.
+            window._sio.on('intel:pin_update', (data) => {
+                if (window.AltarisEvents) {
+                    window.AltarisEvents.emit('socket:intel:pin_update', data);
+                }
+            });
+
+            // ── intel:hedge_forecast: Hedge Forecaster push (Phase 3) ──
+            // Source: connectors/hedge_forecaster.compute_forecast via
+            // schwab_bridge._intel_compute_loop. 5s cadence during RTH.
+            // Consumed by web/hedge_forecast_pane.js via 'socket:intel:hedge_forecast'.
+            window._sio.on('intel:hedge_forecast', (data) => {
+                if (window.AltarisEvents) {
+                    window.AltarisEvents.emit('socket:intel:hedge_forecast', data);
+                }
+            });
+
+            // ── intel:spx_qqq_divergence: SPX-vs-QQQ regime comparator (Phase 4) ──
+            // Source: connectors/spx_qqq_divergence.compute_state via
+            // schwab_bridge._intel_compute_loop. 10s cadence during RTH.
+            // Consumed by web/spx_qqq_divergence_pane.js via
+            // 'socket:intel:spx_qqq_divergence'.
+            window._sio.on('intel:spx_qqq_divergence', (data) => {
+                if (window.AltarisEvents) {
+                    window.AltarisEvents.emit('socket:intel:spx_qqq_divergence', data);
+                }
+            });
+
+            // ── intel:vix_term: VIX regime / cross-asset vol dashboard (Phase 5) ──
+            // Source: connectors/vix_term_structure.compute_state via
+            // schwab_bridge._intel_compute_loop. 10s cadence during RTH.
+            // Consumed by web/vix_term_pane.js via 'socket:intel:vix_term'.
+            window._sio.on('intel:vix_term', (data) => {
+                if (window.AltarisEvents) {
+                    window.AltarisEvents.emit('socket:intel:vix_term', data);
+                }
+            });
+
+            // ── intel:wing_update: 0DTE Wing Tracker push (Phase 6) ──
+            // Source: connectors/wing_tracker.compute_state via
+            // schwab_bridge._intel_compute_loop. 5s cadence during RTH.
+            // Wing prints arrive in real-time via _on_tradier_timesale; this
+            // event delivers the periodic regime + aggregate snapshot.
+            // Consumed by web/wing_tracker_pane.js via 'socket:intel:wing_update'.
+            window._sio.on('intel:wing_update', (data) => {
+                if (window.AltarisEvents) {
+                    window.AltarisEvents.emit('socket:intel:wing_update', data);
+                }
+            });
+
+            // ── intel:gamma_skyline: per-strike dealer Γ$ visualization (Phase 7) ──
+            // Source: connectors/gamma_skyline.compute_state via
+            // schwab_bridge._intel_compute_loop. 5s cadence during RTH.
+            // Pure visualization push; consumed by web/gamma_skyline_pane.js
+            // via 'socket:intel:gamma_skyline'.
+            window._sio.on('intel:gamma_skyline', (data) => {
+                if (window.AltarisEvents) {
+                    window.AltarisEvents.emit('socket:intel:gamma_skyline', data);
+                }
+            });
+
+            // ── intel:dealer_warehouse: per-strike commitment quality (Phase 8) ──
+            // Source: connectors/dealer_warehouse.compute_state via
+            // schwab_bridge._intel_compute_loop. 10s cadence during RTH.
+            // Reads mm_attribution._capture (Schwab OPTIONS_BOOK posted/caught).
+            // Pin Convergence consumes this via dealer_warehouse.get_warehouse_strength
+            // to upgrade its `warehouse_strength` from oi_proxy → MEASURED.
+            // Consumed by web/dealer_warehouse_pane.js via 'socket:intel:dealer_warehouse'.
+            window._sio.on('intel:dealer_warehouse', (data) => {
+                if (window.AltarisEvents) {
+                    window.AltarisEvents.emit('socket:intel:dealer_warehouse', data);
+                }
+            });
+
+            // ── intel:events: earnings + macro event calendar (Phase 10B) ──
+            // Source: connectors/event_calendar.compute_state via
+            // schwab_bridge._intel_compute_loop. 60min cadence; events change rarely.
+            // Reads data/event_calendar.json (operator-maintained).
+            // Consumed by web/events_pane.js via 'socket:intel:events'.
+            window._sio.on('intel:events', (data) => {
+                if (window.AltarisEvents) {
+                    window.AltarisEvents.emit('socket:intel:events', data);
+                }
+            });
+
             // ── book_microstructure: QQQ NASDAQ L2 venue quality + QA imbalance ──
             // Emitted at 2Hz. Contains per-level venue taxonomy (HFT vs institutional),
             // quality-adjusted imbalance (filters phantom HFT depth), and BBO quality scores.
@@ -206,8 +304,6 @@
                 if (window.AltarisEvents) {
                     window.AltarisEvents.emit('data:book:microstructure', data);
                 }
-                // Update book microstructure HUD immediately
-                if (typeof BookMsHUD !== 'undefined') BookMsHUD.update(data);
                 // Cross-market divergence pane
                 if (typeof CrossDivergencePane !== 'undefined') CrossDivergencePane.onBookMs(data);
             });
@@ -216,13 +312,6 @@
             // Throttle to 50ms — tape rows batch better than 1-by-1
             window._sio.on('equity_tape', _throttleMs((data) => {
                 if (typeof EquityTapePane !== 'undefined') EquityTapePane.onTick(data);
-            }, 50));
-
-            // ── option_mark_update: Live options mark/IV/Greeks per contract ──
-            // Throttle to 50ms — Greeks don't change faster than this meaningfully
-            window._sio.on('option_mark_update', _throttleMs((data) => {
-                if (typeof OptionsFlowPane !== 'undefined') OptionsFlowPane.onOptionMark(data);
-                if (typeof VolSurfacePane !== 'undefined') VolSurfacePane.onOptionMark(data);
             }, 50));
 
             // ── dealer_session_flow: Dealer hedge session stats ──
@@ -242,6 +331,21 @@
             window._sio.on('l2_update', (data) => {
                 if (window.AltarisEvents) {
                     window.AltarisEvents.emit('data:l2:update', data);
+                }
+            });
+
+            // ── mm_event_batch: MM Attribution structural events (50ms batched) ──
+            window._sio.on('mm_event_batch', (data) => {
+                if (window.AltarisEvents) {
+                    window.AltarisEvents.emit('data:mm:event', data);
+                }
+            });
+            // ── mm_contract_state: per-contract aggregate snapshot pushed
+            //    at ~4Hz while a client is `watch`ing the sym. Replaces the
+            //    old 1s REST poll from the MM Attribution pane.
+            window._sio.on('mm_contract_state', (data) => {
+                if (window.AltarisEvents) {
+                    window.AltarisEvents.emit('data:mm:state', data);
                 }
             });
         },

@@ -69,6 +69,13 @@ DIVERGE_WINDOW_SEC   = 300                 # 5-min look-back for divergence dete
 COOLDOWN_SEC         = 60                  # min seconds between same-type alerts per ticker
 MATRIX_TTL_SEC       = 300                 # State matrix cell decays to 'none' after 5 min idle
 
+# ── Outcome tracking ────────────────────────────────────────────────────────
+# For every directional alert we log spot(t+N) at N=5min/15min/30min so we can
+# compute realized hit rates empirically. Hit = sign(spot_move) matches the
+# alert's direction. Aggregated via get_hit_rates() and /api/alerts/outcomes.
+_OUTCOME_HORIZONS_SEC = (300, 900, 1800)
+_OUTCOME_GC_MAX_AGE_SEC = 3600             # drop pending outcomes older than 1hr
+
 
 def _stats(vals):
     """Return (mean, stddev) of a sequence."""
@@ -96,6 +103,25 @@ def _daily_alert_log_path(when: float = 0) -> str:
     return os.path.join(_LOG_DIR, f'alerts_{dt.strftime("%Y%m%d")}.jsonl')
 
 
+_OUTCOMES_LOG_PATH = os.path.join(_LOG_DIR, 'alert_outcomes.jsonl')
+
+# ── Per-ticker rolling history disk persistence (added 2026-05-06) ──
+# `_history[ticker].samples` holds the 10-min rolling window (~600 entries)
+# that detection methods compare against. After a process restart it's
+# empty and detectors warm-up-gate (`if len(samples) < 30`) blocks all
+# alerts for ~15s while fresh samples accumulate. Persisting `_history`
+# eliminates that warmup gap, and also restores `last_walls`,
+# `last_alert_ts` (cooldown), and the directional `last_*_side` fields so
+# the AI panel matrix paints immediately instead of cold-starting.
+_HISTORY_STATE_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   '..', 'state')
+_HISTORY_STATE_FILE = os.path.join(_HISTORY_STATE_DIR, 'alert_engine_history.json')
+_HISTORY_STATE_TMP  = _HISTORY_STATE_FILE + '.tmp'
+_HISTORY_PERSIST_SEC      = 30.0
+_HISTORY_RESTORE_MAX_AGE  = 600.0   # 10 min — older windows don't reflect current rolling stats
+_HISTORY_STATE_VERSION    = 1
+
+
 class AlertEngine:
     """Per-ticker rolling-window alert detection."""
 
@@ -105,6 +131,10 @@ class AlertEngine:
         # Rolling log of last N alerts (for diagnostic inspection)
         self._alert_log: deque = deque(maxlen=200)
         self._lock = threading.Lock()
+        # Outcome queue: each entry is {alert, spot0, horizons_remaining, filled}
+        # Spot at each horizon is stamped as the ticker's 1Hz observe() tick
+        # crosses the horizon. Completed outcomes flushed to JSONL.
+        self._pending_outcomes: list = []
 
     def observe(self, ticker: str, ts: float, s0: float, sa: float,
                 u0: float, ua: float, spot: float = 0.0) -> list[dict]:
@@ -136,6 +166,17 @@ class AlertEngine:
 
             # ── 5. KEY LEVEL (price breaks wall/flip) ─────────────────────
             alerts.extend(self._detect_key_level(ticker, ts, hist))
+
+            # ── 5b. WALL PROXIMITY (spot within 0.3% of put/call wall) ─────
+            alerts.extend(self._detect_wall_proximity(ticker, ts, hist, spot))
+
+            # ── Outcome tracking: stamp spot at each horizon for prior alerts,
+            # flush completed ones, register new alerts for future stamping.
+            # Spot is ticker-specific, so process only this ticker's queue.
+            if spot > 0:
+                self._process_pending_outcomes(ticker, ts, spot)
+                for a in alerts:
+                    self._register_outcome(a, spot)
 
         # Emit + log
         for a in alerts:
@@ -198,6 +239,98 @@ class AlertEngine:
         """How many samples has this ticker accumulated?"""
         h = self._history.get(ticker)
         return len(h.samples) if h else 0
+
+    def save_history_state(self) -> int:
+        """Atomic JSON snapshot of `_history` to disk.
+
+        Persists the 10-min rolling window per ticker plus directional state
+        fields so a process restart can resume detection without the 15-second
+        warmup gate or losing cooldown timestamps. Returns # tickers written.
+        """
+        with self._lock:
+            payload_tickers = {}
+            for tk, hist in self._history.items():
+                if not hist.samples:
+                    continue
+                payload_tickers[tk] = {
+                    'samples': list(hist.samples),
+                    'last_cross_side':        hist.last_cross_side,
+                    'last_diverge_side':      hist.last_diverge_side,
+                    'last_diverge_start_ts':  hist.last_diverge_start_ts,
+                    'last_alert_ts':          dict(hist.last_alert_ts),
+                    'last_key_level_side':    hist.last_key_level_side,
+                    'last_spike_side':        hist.last_spike_side,
+                    'last_walls':             dict(hist.last_walls),
+                    'last_walls_update_ts':   hist.last_walls_update_ts,
+                }
+        if not payload_tickers:
+            return 0
+        payload = {
+            'version':  _HISTORY_STATE_VERSION,
+            'saved_at': time.time(),
+            'tickers':  payload_tickers,
+        }
+        try:
+            os.makedirs(_HISTORY_STATE_DIR, exist_ok=True)
+            with open(_HISTORY_STATE_TMP, 'w') as f:
+                json.dump(payload, f, separators=(',', ':'))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(_HISTORY_STATE_TMP, _HISTORY_STATE_FILE)
+        except Exception as e:
+            log.warning(f"[ALERT-STATE] save failed: {e}")
+            return 0
+        return len(payload_tickers)
+
+    def load_history_state(self) -> int:
+        """Load `_history` from disk if a fresh snapshot exists.
+
+        Skips if file is older than `_HISTORY_RESTORE_MAX_AGE` (the rolling
+        stats wouldn't reflect current market conditions). Returns # tickers
+        restored.
+        """
+        if not os.path.exists(_HISTORY_STATE_FILE):
+            return 0
+        age = time.time() - os.path.getmtime(_HISTORY_STATE_FILE)
+        if age > _HISTORY_RESTORE_MAX_AGE:
+            log.info(f"[ALERT-STATE] file age {age:.0f}s > {_HISTORY_RESTORE_MAX_AGE:.0f}s, skipping")
+            return 0
+        try:
+            with open(_HISTORY_STATE_FILE) as f:
+                payload = json.load(f)
+        except Exception as e:
+            log.warning(f"[ALERT-STATE] load failed: {e}")
+            return 0
+        if payload.get('version') != _HISTORY_STATE_VERSION:
+            log.warning(f"[ALERT-STATE] version mismatch (file={payload.get('version')}, code={_HISTORY_STATE_VERSION}), skipping")
+            return 0
+        tickers_data = payload.get('tickers') or {}
+        if not isinstance(tickers_data, dict) or not tickers_data:
+            return 0
+        restored = 0
+        with self._lock:
+            for tk, snap in tickers_data.items():
+                if not isinstance(snap, dict):
+                    continue
+                hist = self._history.setdefault(tk, _TickerHistory())
+                samples = snap.get('samples') or []
+                hist.samples.clear()
+                for s in samples:
+                    if isinstance(s, (list, tuple)) and len(s) >= 6:
+                        hist.samples.append(tuple(s[:6]))
+                hist.last_cross_side       = int(snap.get('last_cross_side') or 0)
+                hist.last_diverge_side     = int(snap.get('last_diverge_side') or 0)
+                hist.last_diverge_start_ts = float(snap.get('last_diverge_start_ts') or 0)
+                hist.last_alert_ts         = dict(snap.get('last_alert_ts') or {})
+                hist.last_key_level_side   = int(snap.get('last_key_level_side') or 0)
+                hist.last_spike_side       = int(snap.get('last_spike_side') or 0)
+                hist.last_walls            = dict(snap.get('last_walls') or {})
+                hist.last_walls_update_ts  = float(snap.get('last_walls_update_ts') or 0)
+                restored += 1
+        saved_age = time.time() - float(payload.get('saved_at') or 0)
+        log.info(f"[ALERT-STATE] restored {restored} tickers' history "
+                 f"(snapshot was {saved_age:.0f}s old, file age {age:.0f}s)")
+        return restored
 
     def _detect_cross(self, ticker, ts, hist) -> list[dict]:
         """0DTE curve crosses all-exp curve."""
@@ -383,8 +516,10 @@ class AlertEngine:
         if recent_30s < BULLISH_VOLUME_MIN_MAGNITUDE:
             return out
 
-        # Direction check: signed flow over same window must be positive
-        flow_all_chg = recent[-1][2] - recent[-30][2]
+        # Direction check: signed flow over same window must be positive.
+        # Volume window is recent[30]..recent[60] (30 intervals via vols[-30:]),
+        # so flow must span the SAME 30 intervals: recent[-31] to recent[-1].
+        flow_all_chg = recent[-1][2] - recent[-31][2]
         if flow_all_chg <= 0:
             return out
 
@@ -471,6 +606,98 @@ class AlertEngine:
             })
         return out
 
+    def _detect_wall_proximity(self, ticker, ts, hist, spot) -> list[dict]:
+        """Spot within 0.3% of put/call wall — 'confluence trigger' signal.
+
+        Companion to _detect_key_level: cross fires only on the break, this
+        fires while price is *approaching* and sitting near a wall. 0DTHero's
+        content repeatedly emphasizes "flow signal + wall proximity = trade",
+        so this cell should flash BEFORE the break so a user can set up.
+
+        Direction:
+          near put_wall  → bullish  (floor defending)
+          near call_wall → bearish  (ceiling capping)
+
+        2026-05-04 GAMMA-REGIME GATE added:
+          Empirical hit rate over 7d / 861 alerts = 11.5% (88.5% inverted!).
+          Theory: walls function as S/R only in LONG-gamma regime (spot above
+          gamma_flip) where dealers DAMPEN moves toward the wall. In SHORT-gamma
+          (below flip), dealers AMPLIFY moves THROUGH walls, so the textbook
+          "near wall = reversal" inverts.
+          Fix: suppress wall_proximity when spot ≤ gamma_flip. Will re-measure
+          hit rate over the next 7d to confirm. If still <50%, then invert
+          direction outright.
+
+        Cooldown: 120s per wall (passive-state signal, not a trigger).
+        Inhibited if a cross just fired for the same wall within 60s.
+        """
+        out = []
+        if spot <= 0:
+            return out
+        walls = hist.last_walls or {}
+        if not walls:
+            return out
+
+        # ── GAMMA-REGIME GATE (added 2026-05-04) ──────────────────────────
+        # In short-gamma regime (spot ≤ gamma_flip), walls fail as S/R because
+        # dealer hedging amplifies trends through them. Suppress all
+        # wall_proximity alerts in that regime.
+        gamma_flip = walls.get('flip') or walls.get('gamma_flip') or 0
+        if gamma_flip > 0 and spot <= gamma_flip:
+            return out  # short-gamma — walls don't behave as S/R here
+
+        PROXIMITY_PCT  = 0.003   # 0.3% band around the wall
+        PROX_COOLDOWN  = 120     # one proximity alert per wall per 2 min
+
+        for level_name in ('put_wall', 'call_wall'):
+            level = walls.get(level_name) or 0
+            if level <= 0:
+                continue
+            dist_pct = abs(spot - level) / level
+            if dist_pct > PROXIMITY_PCT:
+                continue
+
+            # Geometry gate: fire only when the wall is still functioning as the
+            # support/resistance it's named. If price has already broken through,
+            # the wall is the OPPOSITE side (put_wall below spot → resistance)
+            # and the bullish/bearish label would be inverted. Measured in the
+            # legacy 375-outcome sample: 63/68 "bullish put_wall" fires had spot
+            # BELOW the put wall — 3.2% hit rate, confirming geometry bug.
+            if level_name == 'put_wall' and spot < level:
+                continue  # broken below put → wall is now overhead resistance
+            if level_name == 'call_wall' and spot > level:
+                continue  # broken above call → wall is now underfoot support
+
+            # Suppress proximity if the cross detector just fired for this wall.
+            cross_key = f'key_level_{level_name}'
+            cross_ts  = hist.last_alert_ts.get(cross_key, 0)
+            if ts - cross_ts < 60:
+                continue
+
+            prox_key = f'wall_proximity_{level_name}'
+            last_ts  = hist.last_alert_ts.get(prox_key, 0)
+            if ts - last_ts < PROX_COOLDOWN:
+                continue
+
+            side = +1 if level_name == 'put_wall' else -1
+            direction = 'bullish' if side > 0 else 'bearish'
+            wall_label = 'put wall' if level_name == 'put_wall' else 'call wall'
+
+            hist.last_alert_ts[prox_key] = ts
+            hist.last_key_level_side = side
+            out.append({
+                'type':        'wall_proximity',
+                'ticker':      ticker,
+                'direction':   direction,
+                'ts':          ts,
+                'level':       round(level, 2),
+                'level_name':  level_name,
+                'magnitude_m': round(dist_pct * 100, 3),   # distance in %
+                'sigma':       round(dist_pct * 100, 3),
+                'label':       f"{ticker} near {wall_label} @ {level:.2f} ({dist_pct * 100:.2f}%)",
+            })
+        return out
+
     def update_walls(self, ticker: str, walls: dict) -> None:
         """Called by schwab_bridge whenever per-ticker zone_update is recomputed.
 
@@ -495,9 +722,11 @@ class AlertEngine:
                 if stable:
                     return
             hist.last_walls = {
-                'put_wall':  walls.get('put_wall')  or 0.0,
-                'call_wall': walls.get('call_wall') or 0.0,
-                'flip':      walls.get('flip')      or 0.0,
+                'put_wall':        walls.get('put_wall')        or 0.0,
+                'call_wall':       walls.get('call_wall')       or 0.0,
+                'flip':            walls.get('flip')            or 0.0,
+                'gamma_put_wall':  walls.get('gamma_put_wall')  or 0.0,
+                'gamma_call_wall': walls.get('gamma_call_wall') or 0.0,
             }
             hist.last_walls_update_ts = now
 
@@ -541,6 +770,164 @@ class AlertEngine:
                 for t, h in self._history.items()
             }
 
+    def _register_outcome(self, alert: dict, spot0: float) -> None:
+        """Queue an alert for future spot-move stamping. Only directional
+        alerts (bullish/bearish) are tracked."""
+        direction = alert.get('direction')
+        if direction not in ('bullish', 'bearish'):
+            return
+        if not spot0 or spot0 <= 0:
+            return
+        # Capture wall-distance at alert time so we can slice hit rates by
+        # "at-wall vs not-at-wall" later. Two wall definitions tagged:
+        #   OI wall    = strike with max open interest (historical positioning)
+        #   gamma wall = strike with max dollar-gamma (live dealer hedging load)
+        # The 0DTHero Feb-3-2025 chart defined the wall via gamma, not OI.
+        # Raw distances only — threshold choice is an analysis decision.
+        ticker = alert.get('ticker')
+        hist = self._history.get(ticker)
+        wall_tags = {
+            'nearest_oi_wall_pct':     None,
+            'nearest_oi_wall_name':    None,
+            'nearest_gamma_wall_pct':  None,
+            'nearest_gamma_wall_name': None,
+        }
+        if hist and hist.last_walls:
+            def _nearest(names):
+                best = None
+                for name in names:
+                    w = hist.last_walls.get(name) or 0.0
+                    if w <= 0:
+                        continue
+                    dist_pct = abs(spot0 - w) / spot0 * 100.0
+                    if best is None or dist_pct < best[0]:
+                        best = (dist_pct, name)
+                return best
+            oi_best    = _nearest(('put_wall', 'call_wall', 'flip'))
+            gamma_best = _nearest(('gamma_put_wall', 'gamma_call_wall'))
+            if oi_best is not None:
+                wall_tags['nearest_oi_wall_pct']  = round(oi_best[0], 4)
+                wall_tags['nearest_oi_wall_name'] = oi_best[1]
+            if gamma_best is not None:
+                wall_tags['nearest_gamma_wall_pct']  = round(gamma_best[0], 4)
+                wall_tags['nearest_gamma_wall_name'] = gamma_best[1]
+        self._pending_outcomes.append({
+            'alert': alert,
+            'spot0': spot0,
+            **wall_tags,
+            'horizons': {h: None for h in _OUTCOME_HORIZONS_SEC},
+        })
+
+    def _process_pending_outcomes(self, ticker: str, now: float, spot: float) -> None:
+        """For each pending outcome on this ticker, fill any horizon whose
+        elapsed time has been crossed. Flush fully filled outcomes to JSONL
+        and GC anything older than _OUTCOME_GC_MAX_AGE_SEC."""
+        if not self._pending_outcomes:
+            return
+        keep = []
+        for p in self._pending_outcomes:
+            a = p['alert']
+            if a.get('ticker') != ticker:
+                keep.append(p)
+                continue
+            age = now - a.get('ts', now)
+            if age > _OUTCOME_GC_MAX_AGE_SEC:
+                # Stale — drop even if not all horizons filled
+                continue
+            for h in _OUTCOME_HORIZONS_SEC:
+                if p['horizons'][h] is None and age >= h:
+                    p['horizons'][h] = spot
+            if all(v is not None for v in p['horizons'].values()):
+                self._write_outcome(p)
+            else:
+                keep.append(p)
+        self._pending_outcomes = keep
+
+    def _write_outcome(self, p: dict) -> None:
+        """Serialize a completed outcome to alert_outcomes.jsonl."""
+        a = p['alert']
+        spot0 = p['spot0']
+        direction = a.get('direction')
+        dir_sign = 1 if direction == 'bullish' else -1
+        row = {
+            'ts': a.get('ts'),
+            'ticker': a.get('ticker'),
+            'type': a.get('type'),
+            'direction': direction,
+            'magnitude_m': a.get('magnitude_m'),
+            'bucket': a.get('bucket'),
+            'sigma': a.get('sigma'),
+            'spot0': spot0,
+            'nearest_oi_wall_pct':     p.get('nearest_oi_wall_pct'),
+            'nearest_oi_wall_name':    p.get('nearest_oi_wall_name'),
+            'nearest_gamma_wall_pct':  p.get('nearest_gamma_wall_pct'),
+            'nearest_gamma_wall_name': p.get('nearest_gamma_wall_name'),
+        }
+        for h, spot_h in p['horizons'].items():
+            delta_pct = ((spot_h - spot0) / spot0) * 100 if spot0 else 0.0
+            row[f'spot_{h}s'] = spot_h
+            row[f'delta_{h}s_pct'] = round(delta_pct, 4)
+            row[f'hit_{h}s'] = int(dir_sign * delta_pct > 0)
+        try:
+            os.makedirs(_LOG_DIR, exist_ok=True)
+            with open(_OUTCOMES_LOG_PATH, 'a') as f:
+                f.write(json.dumps(row) + '\n')
+        except Exception as e:
+            log.debug(f"[OUTCOME] persist failed: {e}")
+
+    def get_hit_rates(self, last_n_days: int = 7) -> dict:
+        """Aggregate JSONL outcomes into per-(ticker, type, bucket) hit rates
+        per horizon. Returns shape:
+            {ticker: {type: {bucket: {horizon_sec: {n, hit_rate, avg_move_pct, expectancy}}}}}
+        """
+        if not os.path.exists(_OUTCOMES_LOG_PATH):
+            return {}
+        cutoff = time.time() - last_n_days * 86400
+        agg: dict = {}
+        try:
+            with open(_OUTCOMES_LOG_PATH, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    if row.get('ts', 0) < cutoff:
+                        continue
+                    t = row.get('ticker') or '?'
+                    ty = row.get('type') or '?'
+                    bk = row.get('bucket') or '-'
+                    node = agg.setdefault(t, {}).setdefault(ty, {}).setdefault(bk, {})
+                    for h in _OUTCOME_HORIZONS_SEC:
+                        hit_key = f'hit_{h}s'
+                        delta_key = f'delta_{h}s_pct'
+                        if hit_key not in row:
+                            continue
+                        b = node.setdefault(h, {'n': 0, 'hits': 0, 'sum_move': 0.0, 'sum_signed': 0.0})
+                        b['n'] += 1
+                        b['hits'] += int(row[hit_key])
+                        delta = float(row.get(delta_key, 0.0))
+                        b['sum_move'] += abs(delta)
+                        dir_sign = 1 if row.get('direction') == 'bullish' else -1
+                        b['sum_signed'] += dir_sign * delta
+        except Exception as e:
+            log.debug(f"[OUTCOME] read failed: {e}")
+            return {}
+        # Finalize: compute rates from accumulators
+        for t, tymap in agg.items():
+            for ty, bkmap in tymap.items():
+                for bk, hmap in bkmap.items():
+                    for h, b in hmap.items():
+                        n = b['n']
+                        b['hit_rate'] = round(b['hits'] / n, 3) if n else 0.0
+                        b['avg_move_pct'] = round(b['sum_move'] / n, 3) if n else 0.0
+                        b['expectancy_pct'] = round(b['sum_signed'] / n, 3) if n else 0.0
+                        del b['sum_move']
+                        del b['sum_signed']
+        return agg
+
     def _emit(self, alert: dict) -> None:
         # Persist to daily JSONL file before emitting, so alerts survive a
         # server restart and the UI can replay today's flow on reconnect.
@@ -577,4 +964,43 @@ def init_engine(socketio=None) -> AlertEngine:
                 log.info(f"[ALERT] Restored {n} alerts from today's disk log")
         except Exception as e:
             log.debug(f"[ALERT] load_from_disk failed on init: {e}")
+        # Restore rolling-window history so detectors skip the 15s warmup gate
+        # and `last_alert_ts` cooldowns survive restarts. Then start the
+        # background persist daemon (idempotent).
+        try:
+            n = _engine.load_history_state()
+            if n > 0:
+                log.info(f"[ALERT-STATE] Seeded {n} tickers' rolling history from disk")
+        except Exception as e:
+            log.warning(f"[ALERT-STATE] load on init failed: {e}")
+        _start_history_persistence()
     return _engine
+
+
+# ── History-state persistence daemon ────────────────────────────────
+_history_persist_started = False
+
+
+def _history_persist_loop() -> None:
+    while True:
+        try:
+            time.sleep(_HISTORY_PERSIST_SEC)
+            eng = _engine
+            if eng is not None:
+                eng.save_history_state()
+        except Exception as e:
+            log.warning(f"[ALERT-STATE] persist loop error: {e}")
+            time.sleep(_HISTORY_PERSIST_SEC)
+
+
+def _start_history_persistence() -> bool:
+    """Idempotent — spawn the daemon at most once."""
+    global _history_persist_started
+    if _history_persist_started:
+        return False
+    _history_persist_started = True
+    t = threading.Thread(target=_history_persist_loop, daemon=True,
+                         name='alert-state-persist')
+    t.start()
+    log.info(f"[ALERT-STATE] persist daemon started ({_HISTORY_PERSIST_SEC:.0f}s cadence)")
+    return True

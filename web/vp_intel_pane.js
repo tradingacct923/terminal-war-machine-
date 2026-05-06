@@ -45,12 +45,43 @@ const _cfg = {
     showDevTrail: true,    // developing POC migration trail (fading dots)
     showStateGlyph:true,   // DEF/CONSUMED/FRESH state glyph per level
     hvnLvnFallback:true,   // use KDE rank as implicit HVN/LVN when none detected
+    showWallBands: true,   // call_wall / put_wall horizontal band tint + γ-flip dashed line
+    showConfluence: true,  // MAGNET diamond when session/PD/weekly POCs align
+    confluenceTicks: 3,    // alignment tolerance in ticks
+    showZScore: false,     // cross-sectional z-score coloring (overrides aggression sat)
+    showMiniLadder: false, // right-edge 5+5 DOM heatmap strip
+    miniLadderWidth: 80,
+    showLegend: false,     // ? popup cheat-sheet
+    lockToMid: false,      // keep current NQ mid centered during zoom
 };
 
 let _canvas = null, _ctx = null, _slotEl = null;
 let _raf = 0, _destroyed = false;
 let _priceTop = 0, _priceBottom = 0;
 let _settingsPanel = null;
+let _toolbar = null;
+// TF/step state drives which profile VP Intel reads from the overlay cache.
+// Overlay is shared with chart-layer VP; ensureProfileActive adds to (not
+// replaces) the active set so enabling "weekly" here doesn't evict session.
+let _mode = 'session', _step = '';
+// User zoom/pan — independent of chart. When non-null, the pane stops
+// following ChartCore and locks to this window. Data (levels, POC, etc.)
+// is unaffected; we only change the y-axis mapping via _priceToY.
+let _userPriceTop = null, _userPriceBottom = null;
+let _isPanning = false, _panStartY = 0, _panStartTop = 0, _panStartBot = 0;
+// Dealer-positioning context pulled from /api/walls + zone_update events.
+// Shapes the canvas (wall bands, γ-flip line) so VP Intel becomes decision-ready.
+let _wallData = null;
+let _wallUnsub = null;
+// Auto-fit guard — fire once when data is sparse on screen.
+let _didAutoFit = false;
+// Hover tooltip state
+let _tooltipEl = null, _lastHoverLevel = null, _lastHoverTs = 0;
+let _lastLevels = null, _levelYs = null;
+// Legend popup element
+let _legendEl = null;
+// Live cross-sectional z-score scale (Welford, recomputed per render)
+let _zStd = 0;
 
 function _rgba(rgb, a) { return `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${a})`; }
 
@@ -60,6 +91,12 @@ function _priceToY(price, h) {
 }
 
 function _syncPriceRange() {
+    // User zoom/pan takes precedence — lock to custom window.
+    if (_userPriceTop != null && _userPriceBottom != null && _userPriceTop > _userPriceBottom) {
+        _priceTop = _userPriceTop;
+        _priceBottom = _userPriceBottom;
+        return true;
+    }
     if (typeof ChartCore !== 'undefined') {
         const inst = ChartCore.getInstances();
         if (inst.length && inst[0].candleSeries && _canvas) {
@@ -73,7 +110,7 @@ function _syncPriceRange() {
     }
     if (typeof VolumeProfileOverlay !== 'undefined') {
         const p = VolumeProfileOverlay.getProfiles();
-        const sd = p['session']?.data;
+        const sd = p[_mode]?.data;
         if (sd?.levels?.length > 0) {
             const px = sd.levels.map(l => l.price);
             _priceTop = Math.max(...px) + 5; _priceBottom = Math.min(...px) - 5;
@@ -81,6 +118,57 @@ function _syncPriceRange() {
         }
     }
     return false;
+}
+
+function _subscribeWallData() {
+    // Live push from schwab_bridge GEX engine.
+    // FIX 2026-05-04: AltarisEvents.on() returns undefined — store handler ref
+    // and build an off()-bound unsub closure so destroy() actually detaches.
+    // Prior bug: _wallUnsub was always undefined, every remount stacked another
+    // live listener that mutated _wallData forever.
+    if (typeof window.AltarisEvents !== 'undefined' && window.AltarisEvents.on) {
+        const _wallHandler = (d) => {
+            if (_destroyed || !d) return;
+            _wallData = {
+                call_wall:  d.call_wall ?? d.underlying_call_wall ?? null,
+                put_wall:   d.put_wall  ?? d.underlying_put_wall  ?? null,
+                gamma_flip: d.gamma_flip ?? d.underlying_gamma_flip ?? null,
+            };
+            _lastRenderSig = '';
+        };
+        window.AltarisEvents.on('data:zone:update', _wallHandler);
+        _wallUnsub = () => {
+            try { window.AltarisEvents.off('data:zone:update', _wallHandler); } catch (_) {}
+        };
+    }
+    // REST seed so bands/line paint before first WS tick arrives.
+    if (typeof window.authFetch === 'function') {
+        window.authFetch('/api/walls?symbol=NQ')
+            .then(r => r.json())
+            .then(d => {
+                if (_destroyed || !d || d.error) return;
+                _wallData = {
+                    call_wall:  d.call_wall ?? d.underlying_call_wall ?? null,
+                    put_wall:   d.put_wall  ?? d.underlying_put_wall  ?? null,
+                    gamma_flip: d.gamma_flip ?? d.underlying_gamma_flip ?? null,
+                };
+                _lastRenderSig = '';
+            })
+            .catch(() => {});
+    }
+}
+
+function _fitToData() {
+    if (typeof VolumeProfileOverlay === 'undefined') return false;
+    const sd = VolumeProfileOverlay.getProfiles()?.[_mode]?.data;
+    if (!sd?.levels?.length) return false;
+    const px = sd.levels.map(l => l.price);
+    const hi = Math.max(...px), lo = Math.min(...px);
+    const pad = Math.max(0.10 * (hi - lo), 1);
+    _userPriceTop = hi + pad;
+    _userPriceBottom = lo - pad;
+    _lastRenderSig = '';
+    return true;
 }
 
 function _render() {
@@ -112,7 +200,7 @@ function _render() {
     if (typeof VolumeProfileOverlay === 'undefined') { _ctx.restore(); return; }
     const profiles = VolumeProfileOverlay.getProfiles();
     const domData = VolumeProfileOverlay.getDOM();
-    const sd = profiles['session']?.data;
+    const sd = profiles[_mode]?.data;
     if (!sd?.levels?.length) {
         _ctx.fillStyle = 'rgba(140,160,200,0.2)';
         _ctx.font = '10px "JetBrains Mono", monospace';
@@ -125,7 +213,10 @@ function _render() {
     const maxVol = Math.max(...levels.map(l => l.total));
     const poc = sd.poc, vah = sd.vah, val = sd.val;
     const M = 4;
-    const BAR_W = w * _cfg.barWidthPct;
+    // Right edge reserves room for the mini-ladder strip when enabled.
+    // All right-anchored labels/grid use rightEdge instead of w.
+    const rightEdge = _cfg.showMiniLadder ? (w - _cfg.miniLadderWidth) : w;
+    const BAR_W = rightEdge * _cfg.barWidthPct;
 
     // Compute actual pixels per tick from price range
     const tick = levels.length >= 2 ? Math.abs(levels[1].price - levels[0].price) : 0.25;
@@ -208,17 +299,17 @@ function _render() {
         const bandH = Math.max(Math.abs(yLo - yHi), 4);
         const zColor = z.maxAbs >= 50 ? [40,255,180] : z.maxAbs >= 30 ? [40,220,160] : [140,200,220];
         _ctx.fillStyle = _rgba(zColor, 0.06);
-        _ctx.fillRect(0, top, w, bandH);
+        _ctx.fillRect(0, top, rightEdge, bandH);
         _ctx.strokeStyle = _rgba(zColor, 0.25);
         _ctx.lineWidth = 0.5;
-        _ctx.strokeRect(0, top, w, bandH);
+        _ctx.strokeRect(0, top, rightEdge, bandH);
         // Zone price-range label (e.g. "26461–26486")
         if (_cfg.showZoneLabel && bandH >= 10) {
             const rangeTxt = `${z.lo.toFixed(2)}–${z.hi.toFixed(2)}`;
             _ctx.save();
             _ctx.font = 'bold 7px "JetBrains Mono", monospace';
             const rtm = _ctx.measureText(rangeTxt);
-            const rx = w - rtm.width - 42;
+            const rx = rightEdge - rtm.width - 42;
             const ry = top + bandH / 2;
             _ctx.fillStyle = 'rgba(0,0,0,0.68)';
             _ctx.fillRect(rx - 2, ry - 5, rtm.width + 5, 10);
@@ -229,8 +320,80 @@ function _render() {
         }
     }
 
+    // ── Dealer walls + γ-flip (rendered after zones, before bars) ──
+    if (_cfg.showWallBands && _wallData) {
+        const _zt = tick || 0.25;
+        const _drawBand = (px, rgb, label) => {
+            if (px == null) return;
+            const yMid = _priceToY(px, h);
+            if (yMid == null) return;
+            const bandHalf = _zt * 1.5;
+            const yHi = _priceToY(px + bandHalf, h);
+            const yLo = _priceToY(px - bandHalf, h);
+            if (yHi == null || yLo == null) return;
+            const top = Math.min(yHi, yLo);
+            const band = Math.max(Math.abs(yLo - yHi), 3);
+            _ctx.fillStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0.08)`;
+            _ctx.fillRect(0, top, rightEdge, band);
+            _ctx.strokeStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0.45)`;
+            _ctx.lineWidth = 0.6;
+            _ctx.beginPath(); _ctx.moveTo(0, yMid); _ctx.lineTo(rightEdge, yMid); _ctx.stroke();
+            _ctx.save();
+            _ctx.font = 'bold 7px "JetBrains Mono", monospace';
+            const lbl = `${label} ${px.toFixed(2)}`;
+            const ltm = _ctx.measureText(lbl);
+            _ctx.fillStyle = 'rgba(0,0,0,0.7)';
+            _ctx.fillRect(2, yMid - 5, ltm.width + 5, 10);
+            _ctx.fillStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0.95)`;
+            _ctx.textAlign = 'left'; _ctx.textBaseline = 'middle';
+            _ctx.fillText(lbl, 5, yMid);
+            _ctx.restore();
+        };
+        _drawBand(_wallData.call_wall, [255, 80, 90],  'CW');   // red call wall
+        _drawBand(_wallData.put_wall,  [80, 220, 130], 'PW');   // green put wall
+        // γ-flip — cyan dashed horizontal
+        if (_wallData.gamma_flip != null) {
+            const gy = _priceToY(_wallData.gamma_flip, h);
+            if (gy != null && gy >= 0 && gy <= h) {
+                _ctx.save();
+                _ctx.strokeStyle = 'rgba(80,210,255,0.8)';
+                _ctx.lineWidth = 1;
+                _ctx.setLineDash([5, 4]);
+                _ctx.beginPath(); _ctx.moveTo(0, gy); _ctx.lineTo(rightEdge, gy); _ctx.stroke();
+                _ctx.setLineDash([]);
+                _ctx.font = 'bold 7px "JetBrains Mono", monospace';
+                const gTxt = `γ FLIP ${_wallData.gamma_flip.toFixed(2)}`;
+                const gtm = _ctx.measureText(gTxt);
+                _ctx.fillStyle = 'rgba(0,0,0,0.72)';
+                _ctx.fillRect(2, gy - 5, gtm.width + 5, 10);
+                _ctx.fillStyle = 'rgba(140,230,255,0.95)';
+                _ctx.textAlign = 'left'; _ctx.textBaseline = 'middle';
+                _ctx.fillText(gTxt, 5, gy);
+                _ctx.restore();
+            }
+        }
+    }
+
+    // ── Z-score scale (Welford single-pass over delta) ──
+    if (_cfg.showZScore) {
+        let mean = 0, m2 = 0, n = 0;
+        for (const lv of levels) {
+            const d = (lv.buy || 0) - (lv.sell || 0);
+            n++;
+            const delta = d - mean;
+            mean += delta / n;
+            m2 += delta * (d - mean);
+        }
+        _zStd = n > 1 ? Math.sqrt(m2 / (n - 1)) : 0;
+    } else {
+        _zStd = 0;
+    }
+
     let _lastAbsLabelY = -Infinity;
     let _lastNumY = -Infinity;
+    // y-index for O(log n) hover hit-test (filled inside bar loop).
+    const _yBuf = new Float32Array(levels.length);
+    let _yBufN = 0;
 
     // ── Render each price level as one unified bar ──
     for (const lv of levels) {
@@ -253,9 +416,17 @@ function _render() {
         const isLVN = !!lv.lvn;
         const inVA = (val != null && vah != null && lv.price >= val && lv.price <= vah);
 
+        // Track y for hover hit-test.
+        _yBuf[_yBufN++] = y;
+
         // Aggression: balanced = slightly muted, one-sided = full vivid
         const aggression = lv.total > 0 ? Math.abs(delta) / lv.total : 0;
-        const satMult = _cfg.showAggression ? (0.6 + aggression * 0.4) : 0.8;
+        let satMult = _cfg.showAggression ? (0.6 + aggression * 0.4) : 0.8;
+        if (_cfg.showZScore && _zStd > 0) {
+            // Cross-sectional z — saturate by statistical significance instead of raw magnitude.
+            const z = Math.min(Math.abs(delta) / _zStd, 3);
+            satMult = 0.4 + 0.6 * (z / 3);
+        }
 
         // Absorption border rank
         const absP = _cfg.showAbsBorder ? absRank(lv.abs_ratio || 0) : 0;
@@ -481,6 +652,10 @@ function _render() {
         }
     }
 
+    // Stash for hit-test (binary search needs monotonic y — price-sorted ascending ⇒ y descending).
+    _lastLevels = levels;
+    _levelYs = _yBuf;  // already length == levels.length; _yBufN used below if needed
+
     // ── Naked POCs (horizontal dashed lines with age badge) ──
     if (_cfg.showNakedPoc && typeof VolumeProfileOverlay !== 'undefined' && typeof VolumeProfileOverlay.getNakedPocs === 'function') {
         const naked = VolumeProfileOverlay.getNakedPocs() || [];
@@ -492,7 +667,7 @@ function _render() {
             _ctx.strokeStyle = 'rgba(200,160,255,0.55)';
             _ctx.lineWidth = 0.75;
             _ctx.setLineDash([3, 3]);
-            _ctx.beginPath(); _ctx.moveTo(0, ny); _ctx.lineTo(w, ny); _ctx.stroke();
+            _ctx.beginPath(); _ctx.moveTo(0, ny); _ctx.lineTo(rightEdge, ny); _ctx.stroke();
             _ctx.setLineDash([]);
             // Age badge
             const ageTxt = `nPOC ${np.price.toFixed(2)}${np.age_days != null ? ` · ${np.age_days}d` : ''}`;
@@ -515,9 +690,9 @@ function _render() {
         if (path.length >= 2) {
             const n = path.length;
             // Anchor trail to right side of pane; trail width = 25% of pane
-            const trailW = Math.min(w * 0.25, 120);
-            const trailX0 = w - trailW - 6;
-            const trailX1 = w - 6;
+            const trailW = Math.min(rightEdge * 0.25, 120);
+            const trailX0 = rightEdge - trailW - 6;
+            const trailX1 = rightEdge - 6;
             _ctx.save();
             // Connecting line beneath dots
             _ctx.strokeStyle = 'rgba(232,184,48,0.25)';
@@ -558,17 +733,17 @@ function _render() {
         if (pocY != null && pocY >= 0 && pocY <= h) {
             _ctx.strokeStyle = _cfg.pocColor;
             _ctx.lineWidth = 2;
-            _ctx.beginPath(); _ctx.moveTo(0, pocY); _ctx.lineTo(w, pocY); _ctx.stroke();
+            _ctx.beginPath(); _ctx.moveTo(0, pocY); _ctx.lineTo(rightEdge, pocY); _ctx.stroke();
             // Label with background
             _ctx.font = 'bold 9px "JetBrains Mono", monospace';
             const _pocLabel = `POC ${poc.toFixed(2)}`;
             const _pocTm = _ctx.measureText(_pocLabel);
             _ctx.fillStyle = 'rgba(0,0,0,0.8)';
-            _ctx.fillRect(w - _pocTm.width - 8, pocY - 7, _pocTm.width + 6, 14);
+            _ctx.fillRect(rightEdge - _pocTm.width - 8, pocY - 7, _pocTm.width + 6, 14);
             _ctx.fillStyle = _cfg.pocColor;
             _ctx.textAlign = 'right';
             _ctx.textBaseline = 'middle';
-            _ctx.fillText(_pocLabel, w - 4, pocY);
+            _ctx.fillText(_pocLabel, rightEdge - 4, pocY);
         }
     }
 
@@ -580,12 +755,55 @@ function _render() {
         _ctx.strokeStyle = _cfg.vaColor;
         _ctx.lineWidth = 0.75;
         _ctx.setLineDash([4, 3]);
-        _ctx.beginPath(); _ctx.moveTo(0, ly); _ctx.lineTo(w, ly); _ctx.stroke();
+        _ctx.beginPath(); _ctx.moveTo(0, ly); _ctx.lineTo(rightEdge, ly); _ctx.stroke();
         _ctx.setLineDash([]);
         _ctx.font = '7px "JetBrains Mono", monospace';
         _ctx.fillStyle = _cfg.vaColor;
         _ctx.textAlign = 'right';
-        _ctx.fillText(`${label} ${price.toFixed(2)}`, w - 2, label === 'VAH' ? ly - 4 : ly + 9);
+        _ctx.fillText(`${label} ${price.toFixed(2)}`, rightEdge - 2, label === 'VAH' ? ly - 4 : ly + 9);
+    }
+
+    // ── Multi-TF POC confluence — MAGNET when session/PD/weekly align ──
+    // Guard: require distinct total_vol between profiles. When backend has
+    // insufficient history (fresh server start), PD/weekly fall back to
+    // session candles → identical total_vol → spurious confluence. Skip those.
+    if (_cfg.showConfluence) {
+        const pocs = [];
+        const sessVol = sd.total_vol || 0;
+        const _distinct = (pv) => sessVol <= 0 || (pv != null && Math.abs(pv - sessVol) / sessVol > 0.05);
+        if (poc != null) pocs.push(poc);
+        const pdData = profiles['prior_day']?.data;
+        if (pdData?.poc != null && _distinct(pdData.total_vol)) pocs.push(pdData.poc);
+        const wkData = profiles['weekly']?.data;
+        if (wkData?.poc != null && _distinct(wkData.total_vol)) pocs.push(wkData.poc);
+        if (pocs.length >= 2) {
+            const hi = Math.max(...pocs), lo = Math.min(...pocs);
+            if (hi - lo <= _cfg.confluenceTicks * (tick || 0.25)) {
+                const mid = (hi + lo) / 2;
+                const my = _priceToY(mid, h);
+                if (my != null && my >= 0 && my <= h) {
+                    _ctx.save();
+                    const mx = w * 0.35;
+                    _ctx.fillStyle = 'rgba(200,140,255,0.85)';
+                    _ctx.beginPath();
+                    _ctx.moveTo(mx, my - 5);
+                    _ctx.lineTo(mx + 5, my);
+                    _ctx.lineTo(mx, my + 5);
+                    _ctx.lineTo(mx - 5, my);
+                    _ctx.closePath();
+                    _ctx.fill();
+                    _ctx.font = 'bold 8px "JetBrains Mono", monospace';
+                    const mTxt = `MAGNET ${pocs.length}×`;
+                    const mtm = _ctx.measureText(mTxt);
+                    _ctx.fillStyle = 'rgba(0,0,0,0.7)';
+                    _ctx.fillRect(mx + 8, my - 6, mtm.width + 5, 12);
+                    _ctx.fillStyle = 'rgba(220,180,255,0.95)';
+                    _ctx.textAlign = 'left'; _ctx.textBaseline = 'middle';
+                    _ctx.fillText(mTxt, mx + 10, my);
+                    _ctx.restore();
+                }
+            }
+        }
     }
 
     // ── Prior-day POC / VAH / VAL — dimmed dotted lines, dedup vs session ──
@@ -601,16 +819,16 @@ function _render() {
             _ctx.strokeStyle = color;
             _ctx.lineWidth = 0.75;
             _ctx.setLineDash([1, 3]);
-            _ctx.beginPath(); _ctx.moveTo(0, py); _ctx.lineTo(w, py); _ctx.stroke();
+            _ctx.beginPath(); _ctx.moveTo(0, py); _ctx.lineTo(rightEdge, py); _ctx.stroke();
             _ctx.setLineDash([]);
             _ctx.font = 'bold 7px "JetBrains Mono", monospace';
             const txt = `PD ${lbl} ${pdPrice.toFixed(2)}`;
             const ptm = _ctx.measureText(txt);
             _ctx.fillStyle = 'rgba(0,0,0,0.72)';
-            _ctx.fillRect(w - ptm.width - 60, py - 6, ptm.width + 6, 11);
+            _ctx.fillRect(rightEdge - ptm.width - 60, py - 6, ptm.width + 6, 11);
             _ctx.fillStyle = color;
             _ctx.textAlign = 'left'; _ctx.textBaseline = 'middle';
-            _ctx.fillText(txt, w - ptm.width - 57, py);
+            _ctx.fillText(txt, rightEdge - ptm.width - 57, py);
             _ctx.restore();
         };
         _renderPD(pd.poc, poc, 'POC', 'rgba(232,184,48,0.55)');
@@ -650,11 +868,64 @@ function _render() {
         if (y == null || y < 10 || y > h - 25) continue;
         // Price label
         _ctx.fillStyle = 'rgba(130,145,175,0.5)';
-        _ctx.fillText(p.toFixed(0), w - 3, y);
+        _ctx.fillText(p.toFixed(0), rightEdge - 3, y);
         // Subtle grid line
         _ctx.strokeStyle = 'rgba(255,255,255,0.035)';
         _ctx.lineWidth = 0.5;
-        _ctx.beginPath(); _ctx.moveTo(0, y); _ctx.lineTo(w - 35, y); _ctx.stroke();
+        _ctx.beginPath(); _ctx.moveTo(0, y); _ctx.lineTo(rightEdge - 35, y); _ctx.stroke();
+    }
+
+    // ── Right-edge mini-ladder: 5 bids + 5 asks around mid ──
+    if (_cfg.showMiniLadder && domData.dom) {
+        const mid = window._latestHeatmapData?.mid_price;
+        const bids = domData.dom.bids || {}, asks = domData.dom.asks || {};
+        const pairs = [];
+        for (const [p, sz] of Object.entries(bids)) {
+            const px = parseFloat(p);
+            if (!isFinite(px) || !sz) continue;
+            if (mid == null || px <= mid) pairs.push({ price: px, size: sz, side: 'B' });
+        }
+        for (const [p, sz] of Object.entries(asks)) {
+            const px = parseFloat(p);
+            if (!isFinite(px) || !sz) continue;
+            if (mid == null || px >= mid) pairs.push({ price: px, size: sz, side: 'A' });
+        }
+        // Nearest 5 either side of mid, else top-sized.
+        if (mid != null) pairs.sort((a, b) => Math.abs(a.price - mid) - Math.abs(b.price - mid));
+        else pairs.sort((a, b) => b.size - a.size);
+        const take = pairs.slice(0, 10);
+        const maxSz = Math.max(1, ...take.map(p => p.size));
+        const lx = rightEdge, lw = _cfg.miniLadderWidth;
+        // Strip background
+        _ctx.fillStyle = 'rgba(14,18,28,0.75)';
+        _ctx.fillRect(lx, 0, lw, h);
+        _ctx.strokeStyle = 'rgba(80,90,120,0.2)';
+        _ctx.lineWidth = 0.5;
+        _ctx.beginPath(); _ctx.moveTo(lx + 0.5, 0); _ctx.lineTo(lx + 0.5, h); _ctx.stroke();
+        _ctx.font = 'bold 8px "JetBrains Mono", monospace';
+        _ctx.textBaseline = 'middle';
+        for (const row of take) {
+            const ry = _priceToY(row.price, h);
+            if (ry == null || ry < 0 || ry > h) continue;
+            const ratio = row.size / maxSz;
+            const bw = Math.max(2, ratio * (lw - 30));
+            const col = row.side === 'B' ? _cfg.bidColor : _cfg.askColor;
+            _ctx.fillStyle = `rgba(${col[0]},${col[1]},${col[2]},${0.25 + ratio * 0.55})`;
+            _ctx.fillRect(lx + 2, ry - 4, bw, 8);
+            _ctx.fillStyle = `rgba(220,230,245,0.92)`;
+            _ctx.textAlign = 'right';
+            _ctx.fillText(String(row.size), lx + lw - 3, ry);
+        }
+        if (mid != null) {
+            const my = _priceToY(mid, h);
+            if (my != null && my >= 0 && my <= h) {
+                _ctx.strokeStyle = 'rgba(255,220,60,0.6)';
+                _ctx.lineWidth = 0.75;
+                _ctx.setLineDash([2, 2]);
+                _ctx.beginPath(); _ctx.moveTo(lx, my); _ctx.lineTo(lx + lw, my); _ctx.stroke();
+                _ctx.setLineDash([]);
+            }
+        }
     }
 
     // ── Bid/Ask total bar ──
@@ -678,23 +949,6 @@ function _render() {
         _ctx.textAlign = 'right';
         _ctx.fillText(`${ratio.toFixed(2)}x`, w - M, btY + 5);
     }
-
-    // ── Header + Settings button ──
-    _ctx.font = '9px "JetBrains Mono", monospace';
-    _ctx.textAlign = 'left';
-    _ctx.fillStyle = 'rgba(140,160,200,0.4)';
-    _ctx.fillText('VP INTEL', M, 10);
-
-    // Settings button — visible clickable area
-    _ctx.fillStyle = 'rgba(80,100,140,0.3)';
-    _ctx.fillRect(w - 30, 2, 26, 14);
-    _ctx.strokeStyle = 'rgba(120,140,180,0.3)';
-    _ctx.lineWidth = 0.5;
-    _ctx.strokeRect(w - 30, 2, 26, 14);
-    _ctx.fillStyle = 'rgba(180,190,210,0.6)';
-    _ctx.font = '8px "JetBrains Mono", monospace';
-    _ctx.textAlign = 'center';
-    _ctx.fillText('\u2699 SET', w - 17, 11);
 
     _ctx.restore();
 }
@@ -735,6 +989,12 @@ function _buildSettings() {
         <div><label><input type="checkbox" id="vpi-t-devtrail" checked> Dev POC Trail</label></div>
         <div><label><input type="checkbox" id="vpi-t-state" checked> State Glyphs (▲DEF ▽CONSUMED ◆FRESH)</label></div>
         <div><label><input type="checkbox" id="vpi-t-fallback" checked> HVN/LVN KDE Fallback</label></div>
+        <hr style="border:0;border-top:1px solid rgba(80,90,120,0.2);margin:4px 0">
+        <div><label><input type="checkbox" id="vpi-t-walls" checked> Wall Bands + γ-Flip</label></div>
+        <div><label><input type="checkbox" id="vpi-t-conf" checked> MAGNET Confluence</label></div>
+        <div><label><input type="checkbox" id="vpi-t-zscore"> Z-Score Coloring</label></div>
+        <div><label><input type="checkbox" id="vpi-t-ladder"> Mini-Ladder (right edge)</label></div>
+        <div><label><input type="checkbox" id="vpi-t-lock"> Lock to Mid Price</label></div>
     `;
     _slotEl.style.position = 'relative';
     _slotEl.appendChild(_settingsPanel);
@@ -785,19 +1045,345 @@ function _buildSettings() {
     _wire('vpi-t-devtrail', 'change', (e) => { _cfg.showDevTrail = e.target.checked; });
     _wire('vpi-t-state', 'change', (e) => { _cfg.showStateGlyph = e.target.checked; });
     _wire('vpi-t-fallback', 'change', (e) => { _cfg.hvnLvnFallback = e.target.checked; });
+    _wire('vpi-t-walls', 'change', (e) => { _cfg.showWallBands = e.target.checked; _lastRenderSig = ''; });
+    _wire('vpi-t-conf', 'change', (e) => { _cfg.showConfluence = e.target.checked; _lastRenderSig = ''; });
+    _wire('vpi-t-zscore', 'change', (e) => { _cfg.showZScore = e.target.checked; _lastRenderSig = ''; });
+    _wire('vpi-t-ladder', 'change', (e) => { _cfg.showMiniLadder = e.target.checked; _lastRenderSig = ''; });
+    _wire('vpi-t-lock', 'change', (e) => {
+        _cfg.lockToMid = e.target.checked;
+        const btn = _toolbar?.querySelector('[data-lockBtn], [data-lock-btn]');
+        const lockBtn = Array.from(_toolbar?.querySelectorAll('button') || []).find(b => b.title === 'Lock window to mid price');
+        if (lockBtn) {
+            lockBtn.textContent = _cfg.lockToMid ? '\uD83D\uDD12' : '\uD83D\uDD13';
+            lockBtn.style.background = _cfg.lockToMid ? 'rgba(80,140,220,0.45)' : 'rgba(40,50,70,0.45)';
+        }
+        _lastRenderSig = '';
+    });
 }
 
-// ── Click handler for settings gear ──
-function _onCanvasClick(e) {
-    if (!_canvas) return;
-    const rect = _canvas.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-    if (x > rect.width - 32 && y < 18) {
-        if (!_slotEl) return;
+// ── DOM toolbar: VP INTEL label + TF switcher + step chooser + gear ──
+const _TF_BTNS = [
+    ['session',    'SESS'],
+    ['prior_day',  'PD'],
+    ['rolling_4h', '4H'],
+    ['rolling_1h', '1H'],
+    ['2day',       '2D'],
+    ['weekly',     'WK'],
+];
+const _STEP_BTNS = [
+    ['',    'FLAT'],
+    ['15m', '15m'],
+    ['30m', '30m'],
+    ['1h',  '1H'],
+];
+
+function _buildToolbar() {
+    if (_toolbar || !_slotEl) return;
+    _slotEl.style.position = 'relative';
+    _toolbar = document.createElement('div');
+    _toolbar.className = 'vpi-toolbar';
+    _toolbar.style.cssText = 'position:absolute;top:2px;left:2px;right:2px;height:16px;display:flex;align-items:center;gap:4px;padding:0 4px;font-family:"JetBrains Mono",monospace;font-size:8px;letter-spacing:.5px;color:rgba(180,190,210,0.7);background:rgba(6,9,14,0.55);border:1px solid rgba(80,90,120,0.18);border-radius:3px;z-index:5;user-select:none;pointer-events:auto;';
+
+    const label = document.createElement('span');
+    label.textContent = 'VP INTEL';
+    label.style.cssText = 'color:rgba(140,160,200,0.55);font-weight:600;';
+    _toolbar.appendChild(label);
+
+    const tfGroup = document.createElement('div');
+    tfGroup.style.cssText = 'display:flex;gap:1px;margin-left:6px;';
+    for (const [mode, lbl] of _TF_BTNS) {
+        const b = document.createElement('button');
+        b.textContent = lbl;
+        b.dataset.mode = mode;
+        b.style.cssText = `background:${mode===_mode?'rgba(80,140,220,0.35)':'rgba(40,50,70,0.45)'};color:${mode===_mode?'#cfe4ff':'rgba(180,190,210,0.65)'};border:1px solid ${mode===_mode?'rgba(120,170,230,0.55)':'rgba(80,90,120,0.25)'};border-radius:2px;padding:1px 4px;font:inherit;cursor:pointer;line-height:1;`;
+        b.addEventListener('click', () => _setMode(mode));
+        tfGroup.appendChild(b);
+    }
+    _toolbar.appendChild(tfGroup);
+
+    const sep = document.createElement('span');
+    sep.textContent = '|';
+    sep.style.cssText = 'color:rgba(80,90,120,0.5);margin:0 2px;';
+    _toolbar.appendChild(sep);
+
+    const stepGroup = document.createElement('div');
+    stepGroup.style.cssText = 'display:flex;gap:1px;';
+    for (const [s, lbl] of _STEP_BTNS) {
+        const b = document.createElement('button');
+        b.textContent = lbl;
+        b.dataset.step = s;
+        b.style.cssText = `background:${s===_step?'rgba(80,140,220,0.35)':'rgba(40,50,70,0.45)'};color:${s===_step?'#cfe4ff':'rgba(180,190,210,0.65)'};border:1px solid ${s===_step?'rgba(120,170,230,0.55)':'rgba(80,90,120,0.25)'};border-radius:2px;padding:1px 4px;font:inherit;cursor:pointer;line-height:1;`;
+        b.addEventListener('click', () => _setStep(s));
+        stepGroup.appendChild(b);
+    }
+    _toolbar.appendChild(stepGroup);
+
+    const spacer = document.createElement('div');
+    spacer.style.cssText = 'flex:1;';
+    _toolbar.appendChild(spacer);
+
+    const fitBtn = document.createElement('button');
+    fitBtn.textContent = '\u2922'; // ⤢ FIT
+    fitBtn.title = 'Fit view to data';
+    fitBtn.style.cssText = 'background:rgba(40,50,70,0.45);color:rgba(180,190,210,0.75);border:1px solid rgba(80,90,120,0.25);border-radius:2px;padding:1px 6px;font:inherit;font-size:10px;cursor:pointer;line-height:1;';
+    fitBtn.addEventListener('click', () => { _didAutoFit = true; _fitToData(); });
+    _toolbar.appendChild(fitBtn);
+
+    const lockBtn = document.createElement('button');
+    lockBtn.textContent = '\uD83D\uDD13'; // 🔓 unlocked by default
+    lockBtn.title = 'Lock window to mid price';
+    lockBtn.dataset.lockBtn = '1';
+    lockBtn.style.cssText = 'background:rgba(40,50,70,0.45);color:rgba(180,190,210,0.75);border:1px solid rgba(80,90,120,0.25);border-radius:2px;padding:1px 6px;font:inherit;font-size:10px;cursor:pointer;line-height:1;';
+    lockBtn.addEventListener('click', () => {
+        _cfg.lockToMid = !_cfg.lockToMid;
+        lockBtn.textContent = _cfg.lockToMid ? '\uD83D\uDD12' : '\uD83D\uDD13';
+        lockBtn.style.background = _cfg.lockToMid ? 'rgba(80,140,220,0.45)' : 'rgba(40,50,70,0.45)';
+        _lastRenderSig = '';
+    });
+    _toolbar.appendChild(lockBtn);
+
+    const helpBtn = document.createElement('button');
+    helpBtn.textContent = '?';
+    helpBtn.title = 'Legend';
+    helpBtn.style.cssText = 'background:rgba(40,50,70,0.45);color:rgba(180,190,210,0.75);border:1px solid rgba(80,90,120,0.25);border-radius:2px;padding:1px 6px;font:inherit;font-size:10px;cursor:pointer;line-height:1;';
+    helpBtn.addEventListener('click', () => {
+        _buildLegend();
+        if (_legendEl) _legendEl.style.display = _legendEl.style.display === 'none' || !_legendEl.style.display ? 'block' : 'none';
+    });
+    _toolbar.appendChild(helpBtn);
+
+    const resetBtn = document.createElement('button');
+    resetBtn.textContent = '\u21BA';
+    resetBtn.title = 'Reset zoom/pan (or double-click pane)';
+    resetBtn.style.cssText = 'background:rgba(40,50,70,0.45);color:rgba(180,190,210,0.75);border:1px solid rgba(80,90,120,0.25);border-radius:2px;padding:1px 6px;font:inherit;font-size:10px;cursor:pointer;line-height:1;';
+    resetBtn.addEventListener('click', _resetZoom);
+    _toolbar.appendChild(resetBtn);
+
+    const gear = document.createElement('button');
+    gear.textContent = '\u2699';
+    gear.title = 'Settings';
+    gear.style.cssText = 'background:rgba(40,50,70,0.45);color:rgba(180,190,210,0.75);border:1px solid rgba(80,90,120,0.25);border-radius:2px;padding:1px 6px;font:inherit;font-size:10px;cursor:pointer;line-height:1;';
+    gear.addEventListener('click', () => {
         _buildSettings();
         if (_settingsPanel) _settingsPanel.style.display = _settingsPanel.style.display === 'none' ? '' : 'none';
+    });
+    _toolbar.appendChild(gear);
+
+    _slotEl.appendChild(_toolbar);
+}
+
+function _refreshToolbarHighlight() {
+    if (!_toolbar) return;
+    for (const b of _toolbar.querySelectorAll('button[data-mode]')) {
+        const on = b.dataset.mode === _mode;
+        b.style.background = on ? 'rgba(80,140,220,0.35)' : 'rgba(40,50,70,0.45)';
+        b.style.color = on ? '#cfe4ff' : 'rgba(180,190,210,0.65)';
+        b.style.borderColor = on ? 'rgba(120,170,230,0.55)' : 'rgba(80,90,120,0.25)';
     }
+    for (const b of _toolbar.querySelectorAll('button[data-step]')) {
+        const on = b.dataset.step === _step;
+        b.style.background = on ? 'rgba(80,140,220,0.35)' : 'rgba(40,50,70,0.45)';
+        b.style.color = on ? '#cfe4ff' : 'rgba(180,190,210,0.65)';
+        b.style.borderColor = on ? 'rgba(120,170,230,0.55)' : 'rgba(80,90,120,0.25)';
+    }
+}
+
+function _setMode(mode) {
+    if (mode === _mode) return;
+    _mode = mode;
+    _refreshToolbarHighlight();
+    if (typeof VolumeProfileOverlay !== 'undefined' && VolumeProfileOverlay.ensureProfileActive) {
+        VolumeProfileOverlay.ensureProfileActive(mode);
+    }
+    _lastRenderSig = '';  // force re-render on next tick
+}
+
+function _setStep(step) {
+    if (step === _step) return;
+    _step = step;
+    _refreshToolbarHighlight();
+    if (typeof VolumeProfileOverlay !== 'undefined' && VolumeProfileOverlay.setStepSize) {
+        VolumeProfileOverlay.setStepSize(step);
+    }
+    _lastRenderSig = '';
+}
+
+function _resetZoom() {
+    _userPriceTop = null;
+    _userPriceBottom = null;
+    _didAutoFit = false;
+    _lastRenderSig = '';
+}
+
+function _buildLegend() {
+    if (_legendEl || !_slotEl) return;
+    _slotEl.style.position = 'relative';
+    _legendEl = document.createElement('div');
+    _legendEl.className = 'vpi-legend';
+    _legendEl.style.cssText = 'position:absolute;top:22px;right:4px;width:210px;background:rgba(8,12,22,0.97);border:1px solid rgba(80,90,120,0.35);border-radius:5px;padding:7px 9px;font-family:"JetBrains Mono",monospace;font-size:9px;color:rgba(200,210,225,0.85);z-index:20;display:none;line-height:1.45;';
+    _legendEl.innerHTML = `
+        <div style="display:flex;justify-content:space-between;margin-bottom:5px">
+            <b style="font-size:10px;color:rgba(200,210,230,0.95)">LEGEND</b>
+            <span style="cursor:pointer;opacity:0.5" data-close="1">\u2715</span>
+        </div>
+        <div><span style="color:#00e676">■</span> buy &nbsp; <span style="color:#ff1744">■</span> sell</div>
+        <div><span style="color:#00c8ff">■</span> bid depth &nbsp; <span style="color:#ff4081">■</span> ask depth</div>
+        <div><b>saturation</b> = aggression (or z-score)</div>
+        <div><b>border glow</b> = absorption (P80+)</div>
+        <div><b>fade direction</b> = exhaustion</div>
+        <div>━ <span style="color:#ffc107">POC</span> &nbsp; <span style="color:#2196f3">VAH/VAL</span></div>
+        <div>▲ DEF &nbsp; ▽ CONSUMED &nbsp; ◆ FRESH</div>
+        <div>◆ <span style="color:#c88cff">MAGNET</span> = multi-TF POC align</div>
+        <div>━━ <span style="color:#ff505a">CW</span> / <span style="color:#50dc82">PW</span> / <span style="color:#50d2ff">γFLIP</span></div>
+        <div>nPOC = naked POC (unvisited)</div>
+        <div>WALL = resting depth &gt;&gt; avg</div>
+    `;
+    const closer = _legendEl.querySelector('[data-close]');
+    if (closer) closer.addEventListener('click', () => { _legendEl.style.display = 'none'; });
+    _slotEl.appendChild(_legendEl);
+}
+
+function _enforceLock() {
+    if (!_cfg.lockToMid) return;
+    const mid = window._latestHeatmapData?.mid_price;
+    if (mid == null || !isFinite(mid)) return;
+    if (_userPriceTop == null || _userPriceBottom == null) return;
+    const range = _userPriceTop - _userPriceBottom;
+    if (range <= 0) return;
+    const edgePad = range * 0.10;
+    if (mid > _userPriceBottom + edgePad && mid < _userPriceTop - edgePad) return; // still centered enough
+    // Recenter while preserving range.
+    _userPriceTop = mid + range / 2;
+    _userPriceBottom = mid - range / 2;
+    _lastRenderSig = '';
+}
+
+// Price-at-cursor stays pinned during zoom — feels natural.
+function _onWheel(e) {
+    if (!_canvas || !_priceTop || !_priceBottom || _priceTop <= _priceBottom) return;
+    e.preventDefault();
+    // First wheel seeds the user window from whatever we're currently showing.
+    if (_userPriceTop == null) {
+        _userPriceTop = _priceTop;
+        _userPriceBottom = _priceBottom;
+    }
+    const rect = _canvas.getBoundingClientRect();
+    const y = e.clientY - rect.top;
+    const h = rect.height;
+    if (h <= 0) return;
+    const anchor = _userPriceBottom + (1 - y / h) * (_userPriceTop - _userPriceBottom);
+    const factor = (e.deltaY > 0) ? 1.15 : (1 / 1.15);  // wheel-down = zoom out
+    const newTop = anchor + (_userPriceTop - anchor) * factor;
+    const newBot = anchor - (anchor - _userPriceBottom) * factor;
+    // Guard against tick-scale collapse / absurd zoom-out
+    if (newTop - newBot < 0.5) return;
+    if (newTop - newBot > 100000) return;
+    _userPriceTop = newTop;
+    _userPriceBottom = newBot;
+    _lastRenderSig = '';
+}
+
+function _onMouseDown(e) {
+    if (e.button !== 0) return;
+    // Don't hijack clicks on toolbar (buttons, gear, etc.)
+    if (e.target && e.target.closest && e.target.closest('.vpi-toolbar')) return;
+    _isPanning = true;
+    _panStartY = e.clientY;
+    if (_userPriceTop == null) {
+        _userPriceTop = _priceTop;
+        _userPriceBottom = _priceBottom;
+    }
+    _panStartTop = _userPriceTop;
+    _panStartBot = _userPriceBottom;
+    if (_canvas) _canvas.style.cursor = 'grabbing';
+    e.preventDefault();
+}
+
+function _onMouseMove(e) {
+    if (!_isPanning || !_canvas) return;
+    const rect = _canvas.getBoundingClientRect();
+    if (rect.height <= 0) return;
+    const dy = e.clientY - _panStartY;
+    const priceRange = _panStartTop - _panStartBot;
+    // Drag DOWN → show higher prices (shift window up). dy positive = price delta positive.
+    const deltaPrice = (dy / rect.height) * priceRange;
+    _userPriceTop = _panStartTop + deltaPrice;
+    _userPriceBottom = _panStartBot + deltaPrice;
+    _lastRenderSig = '';
+}
+
+function _onMouseUp() {
+    if (!_isPanning) return;
+    _isPanning = false;
+    if (_canvas) _canvas.style.cursor = 'grab';
+}
+
+function _onDblClick(e) {
+    if (e.target && e.target.closest && e.target.closest('.vpi-toolbar')) return;
+    _resetZoom();
+}
+
+function _buildTooltip() {
+    if (_tooltipEl || !_slotEl) return;
+    _tooltipEl = document.createElement('div');
+    _tooltipEl.className = 'vpi-tooltip';
+    _tooltipEl.style.cssText = 'position:absolute;pointer-events:none;background:rgba(8,12,22,0.95);border:1px solid rgba(100,140,200,0.4);border-radius:4px;padding:4px 7px;font-family:"JetBrains Mono",monospace;font-size:9px;color:rgba(220,230,245,0.95);z-index:30;display:none;white-space:nowrap;line-height:1.5;box-shadow:0 2px 8px rgba(0,0,0,0.5);';
+    _slotEl.appendChild(_tooltipEl);
+}
+
+function _hitTestY(yPx) {
+    if (!_levelYs || !_lastLevels || _lastLevels.length === 0) return null;
+    let bestIdx = -1, bestDist = Infinity;
+    for (let i = 0; i < _lastLevels.length; i++) {
+        const dy = Math.abs(yPx - _levelYs[i]);
+        if (dy < bestDist) { bestDist = dy; bestIdx = i; }
+    }
+    if (bestIdx < 0 || bestDist > 10) return null;
+    return _lastLevels[bestIdx];
+}
+
+function _onHover(e) {
+    if (_isPanning || !_tooltipEl || !_canvas) return;
+    const now = performance.now();
+    if (now - _lastHoverTs < 16) return;  // ~60Hz
+    _lastHoverTs = now;
+    const rect = _canvas.getBoundingClientRect();
+    const y = e.clientY - rect.top;
+    const x = e.clientX - rect.left;
+    const lv = _hitTestY(y);
+    if (!lv) { _tooltipEl.style.display = 'none'; _lastHoverLevel = null; return; }
+    if (_lastHoverLevel && _lastHoverLevel.price === lv.price) {
+        // Just reposition.
+        const tx = Math.min(x + 12, rect.width - 170);
+        _tooltipEl.style.left = tx + 'px';
+        _tooltipEl.style.top = Math.max(0, y - 48) + 'px';
+        return;
+    }
+    _lastHoverLevel = lv;
+    const buy = Math.round(lv.buy || 0), sell = Math.round(lv.sell || 0);
+    const delta = buy - sell;
+    const total = Math.round(lv.total || 0);
+    const absR = lv.abs_ratio != null ? lv.abs_ratio.toFixed(1) : '—';
+    const exh = lv.exh != null ? lv.exh.toFixed(2) : '—';
+    const rc = lv.refill_class || '—';
+    const state = lv.state || '—';
+    const zTxt = (_cfg.showZScore && _zStd > 0) ? `z=${(delta / _zStd).toFixed(2)}σ` : '';
+    _tooltipEl.innerHTML = `
+        <div style="color:#ffc107;font-weight:600;margin-bottom:3px">${lv.price.toFixed(2)}</div>
+        <div>total <b>${total.toLocaleString()}</b> &nbsp; Δ <span style="color:${delta>=0?'#1fd17a':'#e03060'}">${delta>=0?'+':''}${delta}</span> ${zTxt}</div>
+        <div>buy <span style="color:#1fd17a">${buy}</span> &nbsp; sell <span style="color:#e03060">${sell}</span></div>
+        <div style="opacity:.8">abs ${absR} &nbsp; exh ${exh}</div>
+        <div style="opacity:.8">state ${state} &nbsp; refill ${rc}</div>
+    `;
+    _tooltipEl.style.display = 'block';
+    const tx = Math.min(x + 12, rect.width - 170);
+    _tooltipEl.style.left = tx + 'px';
+    _tooltipEl.style.top = Math.max(0, y - 48) + 'px';
+}
+
+function _onMouseLeave() {
+    if (_tooltipEl) _tooltipEl.style.display = 'none';
+    _lastHoverLevel = null;
 }
 
 // ── Render loop with dirty flag + visibility + throttle ──
@@ -815,13 +1401,32 @@ function _loop() {
     const rect = _canvas.getBoundingClientRect();
     const resized = rect.width !== _lastCanvasW || rect.height !== _lastCanvasH;
     _syncPriceRange();
-    let sig = `${_priceTop?.toFixed(2)}|${_priceBottom?.toFixed(2)}`;
+    // Auto-fit: when data covers <70% of current window, snap once.
+    if (!_didAutoFit && _userPriceTop == null) {
+        try {
+            const sd = (typeof VolumeProfileOverlay !== 'undefined')
+                ? VolumeProfileOverlay.getProfiles()?.[_mode]?.data : null;
+            if (sd?.levels?.length && _priceTop > _priceBottom) {
+                const px = sd.levels.map(l => l.price);
+                const cov = (Math.max(...px) - Math.min(...px)) / (_priceTop - _priceBottom);
+                if (cov > 0 && cov < 0.70) { _fitToData(); _didAutoFit = true; }
+            }
+        } catch (_) {}
+    }
+    _enforceLock();
+    let sig = `${_priceTop?.toFixed(2)}|${_priceBottom?.toFixed(2)}|${_mode}|${_step}|${_cfg.showWallBands?1:0}|${_cfg.showZScore?1:0}|${_cfg.showConfluence?1:0}|${_cfg.showMiniLadder?1:0}|${_cfg.lockToMid?1:0}`;
+    if (_wallData) sig += `|${_wallData.call_wall}|${_wallData.put_wall}|${_wallData.gamma_flip}`;
     try {
         if (typeof VolumeProfileOverlay !== 'undefined') {
-            const p = VolumeProfileOverlay.getProfiles()?.session?.data;
+            const p = VolumeProfileOverlay.getProfiles()?.[_mode]?.data;
             if (p) sig += `|${p.poc}|${p.vah}|${p.val}|${p.levels?.length}|${p.total_vol}`;
+            const wp = VolumeProfileOverlay.getProfiles()?.['weekly']?.data;
+            if (wp && _cfg.showConfluence) sig += `|${wp.poc}`;
         }
     } catch (_) {}
+    if (_cfg.lockToMid && window._latestHeatmapData?.mid_price != null) {
+        sig += `|${window._latestHeatmapData.mid_price}`;
+    }
     if (!resized && sig === _lastRenderSig) return;
     _lastRenderSig = sig;
     _lastRenderTime = now;
@@ -835,13 +1440,33 @@ window.VPIntelPane = {
         _slotEl = slotEl;
         _canvas = document.createElement('canvas');
         _canvas.setAttribute('data-vpintel', '1');
-        _canvas.style.cssText = 'width:100%;height:100%;display:block;cursor:default;';
+        _canvas.style.cssText = 'width:100%;height:100%;display:block;cursor:grab;';
         slotEl.innerHTML = '';
         slotEl.appendChild(_canvas);
         _ctx = _canvas.getContext('2d');
         if (!_ctx) return;
-        _canvas.addEventListener('click', _onCanvasClick);
-        if (typeof VolumeProfileOverlay !== 'undefined') VolumeProfileOverlay.setIntelPaneActive(true);
+        _buildToolbar();
+        _buildTooltip();
+        // Zoom/pan wiring — wheel stays on canvas; mousemove/up go on window
+        // so a drag that leaves the canvas still tracks cleanly.
+        _canvas.addEventListener('wheel', _onWheel, { passive: false });
+        _canvas.addEventListener('mousedown', _onMouseDown);
+        _canvas.addEventListener('dblclick', _onDblClick);
+        _canvas.addEventListener('mousemove', _onHover);
+        _canvas.addEventListener('mouseleave', _onMouseLeave);
+        window.addEventListener('mousemove', _onMouseMove);
+        window.addEventListener('mouseup', _onMouseUp);
+        _subscribeWallData();
+        if (typeof VolumeProfileOverlay !== 'undefined') {
+            VolumeProfileOverlay.setIntelPaneActive(true);
+            // Make sure the initial mode is in the overlay's active set so it polls.
+            if (VolumeProfileOverlay.ensureProfileActive) {
+                VolumeProfileOverlay.ensureProfileActive(_mode);
+                // Weekly is required for MAGNET confluence glyph.
+                VolumeProfileOverlay.ensureProfileActive('weekly');
+                VolumeProfileOverlay.ensureProfileActive('prior_day');
+            }
+        }
         _raf = requestAnimationFrame(_loop);
     },
     destroy(slotEl) {
@@ -852,12 +1477,26 @@ window.VPIntelPane = {
         _destroyed = true;
         if (_raf) cancelAnimationFrame(_raf);
         _raf = 0;
+        window.removeEventListener('mousemove', _onMouseMove);
+        window.removeEventListener('mouseup', _onMouseUp);
         if (_canvas) {
-            _canvas.removeEventListener('click', _onCanvasClick);
+            _canvas.removeEventListener('wheel', _onWheel);
+            _canvas.removeEventListener('mousedown', _onMouseDown);
+            _canvas.removeEventListener('dblclick', _onDblClick);
+            _canvas.removeEventListener('mousemove', _onHover);
+            _canvas.removeEventListener('mouseleave', _onMouseLeave);
             _canvas = null;
         }
         _ctx = null;
+        _userPriceTop = null; _userPriceBottom = null; _isPanning = false;
+        _didAutoFit = false;
+        _wallData = null;
+        if (_wallUnsub) { try { _wallUnsub(); } catch (_) {} _wallUnsub = null; }
+        _lastLevels = null; _levelYs = null; _lastHoverLevel = null;
+        if (_toolbar) { _toolbar.remove(); _toolbar = null; }
         if (_settingsPanel) { _settingsPanel.remove(); _settingsPanel = null; }
+        if (_tooltipEl) { _tooltipEl.remove(); _tooltipEl = null; }
+        if (_legendEl) { _legendEl.remove(); _legendEl = null; }
         if (typeof VolumeProfileOverlay !== 'undefined') VolumeProfileOverlay.setIntelPaneActive(false);
     }
 };

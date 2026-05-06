@@ -269,7 +269,20 @@ def _build_exposures(ticker, expirations, spot):
     Fetches every expiration chain and builds per-strike/exp exposure dicts.
     Returns oi, dex, gex_per_exp, vex, tex, vannex, cex keyed by strike, plus
     oi_full (all strikes, no range filter) used for an accurate Max Pain calc.
+
+    2026-05-01 fix: added gevent.sleep(0) yields. /api/data was still hitting
+    10s response times on cache misses because this CPU+IO loop didn't yield
+    to the gevent event loop, starving the Tradier WS reader greenlet
+    (Recv-Q backlog growth observed: 0KB → 7MB across 5 conns over 16 min).
     """
+    # gevent yield helper — no-op fallback if gevent isn't loaded
+    try:
+        import gevent as _gevent
+        _yield = _gevent.sleep
+    except Exception:
+        def _yield(t=0):
+            pass
+
     # We only process the first MAX_EXPIRATIONS expirations to keep it fast
     _c = _cfg()
     exps_to_use = expirations[:int(_c.get("max_expirations", 3))]
@@ -292,6 +305,9 @@ def _build_exposures(ticker, expirations, spot):
     strike_max = center + _sr
 
     for exp in exps_to_use:
+        # Yield between expiry fetches so other greenlets get cycles between
+        # what may be slow REST calls
+        _yield(0)
         label = exp["label"]
         dte   = exp["dte"]
         t     = max(dte, 1) / 365.0
@@ -304,7 +320,13 @@ def _build_exposures(ticker, expirations, spot):
         all_strikes = sorted(set(calls) | set(puts))
         filtered    = [s for s in all_strikes if strike_min <= s <= strike_max]
 
-        for s in filtered:
+        for _strike_i, s in enumerate(filtered):
+            # Yield every 50 strikes inside the per-strike loop. BSM vanna/charm
+            # math is ~10µs per strike → 500µs per batch, well under the gevent
+            # scheduler tick. ~60 strikes per chain × 3 expirations → ~4 yields
+            # per /api/data compute.
+            if _strike_i and (_strike_i % 50 == 0):
+                _yield(0)
             c = calls.get(s, {})
             p = puts.get(s, {})
 
@@ -384,7 +406,10 @@ def _build_exposures(ticker, expirations, spot):
                    p_rho * p_oi * 100)
 
         # ── Full-chain OI (no strike filter) — used for Max Pain only ──────
-        for s in all_strikes:
+        # Yield every 100 strikes (this loop can be 500+ strikes for SPX).
+        for _all_i, s in enumerate(all_strikes):
+            if _all_i and (_all_i % 100 == 0):
+                _yield(0)
             c_all = calls.get(s, {})
             p_all = puts.get(s, {})
             c_oi_all = _safe(c_all.get("open_interest"))

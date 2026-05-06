@@ -163,6 +163,7 @@
                 const res = await fetch('/api/login', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
+                    credentials: 'include',
                     body: JSON.stringify({ email, password })
                 });
 
@@ -173,10 +174,12 @@
                     localStorage.setItem('greeks-user', email);
                     sessionStorage.setItem('greeks-login-time', Date.now().toString());
 
-                    // Smooth transition out
+                    // Smooth transition out — include ?token= as belt-and-suspenders in case
+                    // the HttpOnly cookie didn't stick (preview browsers, private modes, etc.).
+                    // server.py require_auth accepts ?token=. Without this, / → /login loop.
                     document.body.classList.add('fade-out');
                     setTimeout(() => {
-                        window.location.href = '/';
+                        window.location.href = '/?token=' + encodeURIComponent(data.token);
                     }, 600);
                 } else {
                     btn.classList.remove('loading');
@@ -191,12 +194,29 @@
             }
         });
 
-        // If already logged in (and not expired), redirect
-        const _tok = sessionStorage.getItem('greeks-auth');
-        const _lt = parseInt(sessionStorage.getItem('greeks-login-time') || '0', 10);
-        if (_tok && (Date.now() - _lt < 24 * 60 * 60 * 1000)) {
-            window.location.href = '/';
-        }
+        // If already logged in (and not expired), verify with server before redirecting.
+        // Why the verify: sessionStorage can outlive the server's HttpOnly cookie (cleared cookies,
+        // server restart rotating TOKEN_SECRET, expired token). Redirecting blindly creates a
+        // / -> /login -> / loop because server 302s back with invalid cookie.
+        (async () => {
+            const _tok = sessionStorage.getItem('greeks-auth');
+            const _lt = parseInt(sessionStorage.getItem('greeks-login-time') || '0', 10);
+            if (!_tok || (Date.now() - _lt >= 24 * 60 * 60 * 1000)) return;
+            try {
+                const r = await fetch('/api/walls', { headers: { 'X-Auth-Token': _tok }, credentials: 'include' });
+                if (r.ok) {
+                    // Carry token in query arg — if the HttpOnly cookie is missing the server
+                    // would otherwise 302 us back here → infinite loop.
+                    window.location.href = '/?token=' + encodeURIComponent(_tok);
+                    return;
+                }
+                // Token stale — scrub and let user sign in fresh
+                sessionStorage.removeItem('greeks-auth');
+                sessionStorage.removeItem('greeks-login-time');
+            } catch (_) {
+                // Network error — stay on login page
+            }
+        })();
     </script>
 </body>
 

@@ -1214,7 +1214,136 @@ VolumeBubbleRenderer.prototype.draw = function(target, priceConverter) {
             // _v2Debug.tapeFloor.floor = current adaptive contract minimum
             // _v2Debug.tapeFloor.ewmaMean = EWMA of recent print sizes
             tapeFloor: TapeEWMA.stats(),
+            // Big print signals from backend (block/sweep/aggression)
+            bigPrints: {
+                count: window._bigPrintMap ? Object.keys(window._bigPrintMap).length : 0,
+            },
         };
+
+
+        // ════════════════════════════════════════════════════════════════
+        // LAYER 9: BIG PRINT SIGNALS — block / sweep / aggression discs
+        //
+        // Source: window._bigPrintMap populated by Socket.IO 'big_print'
+        // event (l2_worker._emit_big_print). Each entry is one trade in
+        // the top-decile of rolling 5-min trade sizes, classified by book
+        // context.
+        //
+        // Premium disc style:
+        //   - Halo: larger dimmer disc behind (NO shadowBlur per CLAUDE.md)
+        //   - Radial gradient fill: lighter center → base color edge
+        //   - Solid 1.5px border in same color
+        //   - Bold white number inside (size scales with disc size)
+        //
+        // Colors (per-print classification):
+        //   🔵 BLUE      — block (institutional, book ≥ 2× size absorbed it)
+        //   🟠 ORANGE    — sweep (consumed ≥2× book or l2 sweep flag)
+        //   🟣 MAGENTA   — aggression (top-decile, neither block nor sweep)
+        // ════════════════════════════════════════════════════════════════
+        if (_drawBubbles && window._bigPrintMap && d.bars.length > 0) {
+            const _bpMap = window._bigPrintMap;
+            const _activeSym = _v2ActiveSymbol || 'NQ';
+            // Build per-bar lookup: bar_time → bar.x
+            const _barTimeToX = {};
+            for (let i = from; i < to; i++) {
+                const bar = d.bars[i];
+                if (!bar?.originalData) continue;
+                const t = bar.originalData.t || bar.originalData.time || 0;
+                if (t > 0) _barTimeToX[Math.floor(t * 1000 / 60000) * 60000] = bar.x;
+            }
+            const SIG_COLORS = {
+                'block':      { rgb: [30, 144, 255],  border: [22, 110, 200], halo: 0.18 },
+                'sweep':      { rgb: [255, 122, 0],   border: [200, 95, 0],   halo: 0.20 },
+                'aggression': { rgb: [255, 20, 147],  border: [200, 16, 117], halo: 0.16 },
+            };
+            // Sigma-scaled radius (size says how big the print was)
+            // P50 of recent ≈ 5lots → r=14, top extreme (5σ) → r=50
+            const _radiusForSize = (size, p90) => {
+                if (!p90 || p90 < 1) return 18;
+                const ratio = size / p90;
+                // ratio=1 (at P90) → 18px; ratio=2 → 28; ratio=4 → 38; ratio=8+ → 50
+                const r = 14 + Math.log2(Math.max(ratio, 1)) * 8;
+                return Math.min(Math.max(r, 14), 50);
+            };
+            const _drawPremiumDisc = (cx, cy, r, color, label) => {
+                if (cy < -r || cy > mediaSize.height + r) return;
+                if (cx < -r || cx > mediaSize.width + r) return;
+                const [rR, gG, bB] = color.rgb;
+                const [bdR, bdG, bdB] = color.border;
+                // Layer 0: halo (larger dim disc behind — no shadowBlur)
+                ctx.beginPath();
+                ctx.arc(cx, cy, r + 6, 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(${rR},${gG},${bB},${color.halo})`;
+                ctx.fill();
+                // Layer 1: radial gradient main disc
+                const grad = ctx.createRadialGradient(
+                    cx - r * 0.3, cy - r * 0.3, 0,
+                    cx, cy, r
+                );
+                const lighten = (v) => Math.min(255, v + 40);
+                grad.addColorStop(0, `rgba(${lighten(rR)},${lighten(gG)},${lighten(bB)},0.75)`);
+                grad.addColorStop(0.7, `rgba(${rR},${gG},${bB},0.65)`);
+                grad.addColorStop(1, `rgba(${bdR},${bdG},${bdB},0.65)`);
+                ctx.beginPath();
+                ctx.arc(cx, cy, r, 0, Math.PI * 2);
+                ctx.fillStyle = grad;
+                ctx.fill();
+                // Layer 2: crisp solid border
+                ctx.beginPath();
+                ctx.arc(cx, cy, r, 0, Math.PI * 2);
+                ctx.strokeStyle = `rgba(${bdR},${bdG},${bdB},0.95)`;
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
+                // Layer 3: inner reflection (subtle white arc top-left)
+                if (r >= 14) {
+                    ctx.beginPath();
+                    ctx.arc(cx - r * 0.25, cy - r * 0.25, r * 0.4, Math.PI * 0.7, Math.PI * 1.3);
+                    ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+                    ctx.lineWidth = 1;
+                    ctx.stroke();
+                }
+                // Layer 4: bold white label
+                if (r >= 12 && label) {
+                    const fontSize = r < 20 ? 10 : r < 32 ? 12 : 14;
+                    ctx.font = `700 ${fontSize}px "Inter", "JetBrains Mono", "SF Mono", monospace`;
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    // Drop shadow
+                    ctx.fillStyle = 'rgba(0,0,0,0.65)';
+                    ctx.fillText(label, cx + 0.5, cy + 1);
+                    // Main text
+                    ctx.fillStyle = 'rgba(255,255,255,1)';
+                    ctx.fillText(label, cx, cy);
+                }
+            };
+            ctx.save();
+            // Render priority order: aggression (lowest) first, then block, sweep on top
+            const _priorityOrder = ['aggression', 'block', 'sweep'];
+            const _byClass = { aggression: [], block: [], sweep: [] };
+            for (const k in _bpMap) {
+                const ev = _bpMap[k];
+                if (!ev || ev.symbol !== _activeSym) continue;
+                if (!_byClass[ev.classification]) continue;
+                _byClass[ev.classification].push({ k, ev });
+            }
+            for (const cls of _priorityOrder) {
+                const list = _byClass[cls];
+                if (!list || list.length === 0) continue;
+                const color = SIG_COLORS[cls];
+                if (!color) continue;
+                for (const { ev } of list) {
+                    const minute = Math.floor(ev.ts / 60000) * 60000;
+                    const x = _barTimeToX[minute];
+                    if (x === undefined) continue;
+                    const y = priceConverter(ev.price);
+                    if (y === null || y === undefined || isNaN(y)) continue;
+                    const r = _radiusForSize(ev.size, ev.p90 || ev.size);
+                    const sizeLabel = ev.size >= 1000 ? (ev.size / 1000).toFixed(1) + 'k' : String(ev.size);
+                    _drawPremiumDisc(x, y, r, color, sizeLabel);
+                }
+            }
+            ctx.restore();
+        }
 
 
     }); } catch(e) { console.error('[V3-draw] error:', e); } // close useMediaCoordinateSpace

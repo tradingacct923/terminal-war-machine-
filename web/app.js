@@ -650,31 +650,12 @@ function _setupDataEvents() {
 
         const instances = ChartCore.getInstances();
         instances.forEach(inst => {
-            // 2026-05-06 BUG FIX: candle_history pushes are SMALLER than the
-            // REST-loaded full history (server pushes last 5000 bars over WS;
-            // REST has up to 8000+). Pre-fix used setData() which CLOBBERS all
-            // chart data — a Socket.IO reconnect or TF switch would wipe ~3000
-            // bars of history visible on the chart. Now we MERGE: if existing
-            // chart has more bars than incoming, only fold incoming into the
-            // existing series (replacing/extending the right-edge tail). If
-            // existing is empty/smaller, full setData (initial load).
-            let _existing = [];
-            try { _existing = inst.candleSeries.data() || []; } catch (_) {}
-            if (_existing.length >= ohlc.length && _existing.length > 0) {
-                // Merge: existing has more history. Use update() per-bar for
-                // the incoming subset (each will replace or append-tail in
-                // place, preserving the older bars in the chart).
-                ohlc.forEach(b => { try { inst.candleSeries.update(b); } catch (_) {} });
-                vol.forEach(b => {
-                    if (inst.volumeSeries) {
-                        try { inst.volumeSeries.update(b); } catch (_) {}
-                    }
-                });
-            } else {
-                // Initial load (or incoming has more bars than existing).
-                inst.candleSeries.setData(ohlc);
-                if (inst.volumeSeries) inst.volumeSeries.setData(vol);
-            }
+            // 2026-05-06: server now pushes 5000 bars (was 200) — full setData
+            // is the correct behavior. The merge() approach attempted earlier
+            // dropped bp from the bubble custom series because LWC update()
+            // doesn't preserve custom fields the same way setData() does.
+            inst.candleSeries.setData(ohlc);
+            if (inst.volumeSeries) inst.volumeSeries.setData(vol);
 
             if (inst.feature === 'chart' && inst.bubbleSeries) {
                 const bubbleData = candles.map(c => ({
@@ -687,13 +668,7 @@ function _setupDataEvents() {
                     wall_gone: c.wall_gone || null,
                     absorption: c.absorption || null, depth_deltas: c.depth_deltas || null
                 }));
-                let _existingBub = [];
-                try { _existingBub = inst.bubbleSeries.data() || []; } catch (_) {}
-                if (_existingBub.length >= bubbleData.length && _existingBub.length > 0) {
-                    bubbleData.forEach(b => { try { inst.bubbleSeries.update(b); } catch (_) {} });
-                } else {
-                    inst.bubbleSeries.setData(bubbleData);
-                }
+                inst.bubbleSeries.setData(bubbleData);
             }
 
             if (inst.feature === 'heatmap') {

@@ -69,6 +69,39 @@ class GreekSurface:
         self._strikes = set()
         self._dirty = False
 
+    def get_delta(self, strike, option_side):
+        """Return live Δ for one strike/side, from streaming cache.
+
+        Used by connectors/sweep_detector.py to compute notional Δ exposure
+        per sweep leg (DERIVED — sum(size × Δ × 100) over legs).
+
+        Returns None if the contract isn't in the streaming cache (e.g. far-OTM
+        strike not in the 1,412 LEVELONE_OPTIONS subscription). Caller handles
+        the None gracefully — sweep record carries delta_resolved/delta_total_legs
+        so frontend can show partial-Δ confidence.
+
+        Args:
+          strike:       float — option strike price
+          option_side:  'C' or 'P' (case-insensitive accepted)
+        """
+        try:
+            ct = (option_side or '').upper()
+            if ct in ('C', 'CALL'):
+                ct = 'C'
+            elif ct in ('P', 'PUT'):
+                ct = 'P'
+            else:
+                return None
+            entry = self._contracts.get((float(strike), ct))
+            if entry is None:
+                return None
+            d = entry.get('delta')
+            if d is None or d == 0:
+                return None
+            return float(d)
+        except Exception:
+            return None
+
     def update(self, data):
         """Called on every _on_options_quote tick.
 
@@ -150,6 +183,11 @@ class GreekSurface:
         vex = {}         # VEX (Vega Exposure) per strike (net)
         tex = {}         # TEX (Theta Exposure) per strike (net)
         gamma_by_strike = {}  # For speed computation
+        # Phase A (hedge-pressure): double-buffered per-strike snapshot.
+        # Populated inside the per-strike loop, swapped atomically onto
+        # self._surface after all computations. Readers in
+        # export_hedge_pressure() see a consistent snapshot without locking.
+        surface_next = {}
 
         for K in sorted_strikes:
             call = self._contracts.get((K, 'C'), {})
@@ -242,6 +280,21 @@ class GreekSurface:
             p_dollar_gex = p_gamma * p_oi * multiplier * (spot * spot / 100) if spot > 0 else 0
             dealer_gex_k = -c_dollar_gex + p_dollar_gex
             gamma_by_strike[K] = dealer_gex_k
+
+            # ── Phase A: per-strike hedge-pressure snapshot ──
+            # Store signed dealer exposures for export_hedge_pressure().
+            # dn_gamma is $-delta change per +1% spot move at this strike (= γ · OI · S²).
+            # Rehedge shares at this strike = −dn_gamma / spot (see export_hedge_pressure docstring).
+            # dn_vanna/dn_charm are dealer-signed Greek exposures in contract units × OI × 100.
+            surface_next[K] = {
+                'dn_gamma':  dealer_gex_k,
+                'dn_vanna':  vanna_k,
+                'dn_charm':  charm_k,
+                'oi_call':   c_oi,
+                'oi_put':    p_oi,
+                'iv_call':   c_iv,
+                'iv_put':    p_iv,
+            }
 
         # ═══════════════════════════════════════════════════
         #  SPEED (∂Γ/∂S) — Tikhonov-regularized finite difference
@@ -513,6 +566,14 @@ class GreekSurface:
         confluence_strikes.sort(key=lambda x: x['signals'], reverse=True)
 
         # ═══════════════════════════════════════════════════
+        #  Phase A: atomic swap of per-strike hedge-pressure snapshot
+        # ═══════════════════════════════════════════════════
+        # Single-reference assignment is atomic in CPython — readers in
+        # export_hedge_pressure() see a fully-populated dict or the prior
+        # one; never a half-written one. No lock needed on the reader path.
+        self._surface = surface_next
+
+        # ═══════════════════════════════════════════════════
         #  PACKAGE RESULTS
         # ═══════════════════════════════════════════════════
         self._aggregates = {
@@ -564,6 +625,139 @@ class GreekSurface:
         self._dirty = False
 
         return self._aggregates
+
+    def export_hedge_pressure(self, spot):
+        """Read-only snapshot. Returns per-strike hedge-flow metrics in SHARES.
+
+        Sign convention (matches ``wall_signals.expected_direction`` at line 458):
+          hp_* > 0  →  dealers must BUY  shares to rehedge (short-γ chase)
+          hp_* < 0  →  dealers must SELL shares to rehedge (long-γ fade)
+
+        Derivations (no guessed scalars):
+
+          dn_gamma  = γ · OI · 100 · (S² / 100) = γ · OI · S²   [dollar delta change per +1% spot move]
+          dn_vanna  = vanna · OI · 100                          [shares of δ change per 1 unit σ change]
+          dn_charm  = −(Δδ / Δt_days) · OI · 100                [shares of δ change per 1 day of decay]
+
+        Rehedge (dealer must trade −Δ(dealer_delta) to stay neutral):
+
+          hp_gamma_shares_1pct   = −dn_gamma / spot              [Δ$delta → shares via ÷ spot]
+          hp_vanna_shares_1volpt = −dn_vanna · 0.01              [1 vol-pt = Δσ of 0.01]
+          hp_charm_shares_1hr    = −dn_charm · (1.0 / 24.0)      [per-day → per-hour]
+
+        All values are signed and in SHARES. Totals are sums across visible strikes.
+
+        The per-strike ``oi_balance_strike_*`` fields (formerly mis-named
+        zero_*_strike) mark the first K at which the per-strike ``dn_*`` flips
+        sign — i.e. where call-OI × γ_c ≈ put-OI × γ_p at that single strike.
+        This is a LOCAL OI-balance marker, NOT the aggregate ``gamma_flip``.
+
+        Args:
+            spot: current underlying price (QQQ). Required to convert $-γ to shares.
+
+        Returns:
+            {
+              'strikes': [
+                {'K', 'dn_gamma', 'dn_vanna', 'dn_charm',
+                 'oi_call', 'oi_put',
+                 'hp_gamma_shares_1pct', 'hp_vanna_shares_1volpt',
+                 'hp_charm_shares_1hr'}, ...
+              ],
+              'oi_balance_strike_gamma': float | None,
+              'oi_balance_strike_vanna': float | None,
+              'oi_balance_strike_charm': float | None,
+              'totals': {'hp_gamma_shares_1pct', 'hp_vanna_shares_1volpt', 'hp_charm_shares_1hr'},
+              'spot': float, 'ts': float,
+            }
+        """
+        # Grab snapshot reference once — atomic read in CPython.
+        snap = self._surface
+        if not snap or spot is None or spot <= 0:
+            return {
+                'strikes': [],
+                'oi_balance_strike_gamma': None,
+                'oi_balance_strike_vanna': None,
+                'oi_balance_strike_charm': None,
+                'totals': {
+                    'hp_gamma_shares_1pct':   0.0,
+                    'hp_vanna_shares_1volpt': 0.0,
+                    'hp_charm_shares_1hr':    0.0,
+                },
+                'spot': float(spot) if spot else 0.0,
+                'ts': time.time(),
+            }
+
+        # Sort strikes ascending for structural OI-balance detection.
+        ks = sorted(snap.keys())
+
+        rows = []
+        tot_g = 0.0
+        tot_v = 0.0
+        tot_c = 0.0
+
+        for K in ks:
+            e = snap.get(K) or {}
+            dn_g = float(e.get('dn_gamma', 0.0) or 0.0)
+            dn_v = float(e.get('dn_vanna', 0.0) or 0.0)
+            dn_c = float(e.get('dn_charm', 0.0) or 0.0)
+
+            # Rehedge shares = −Δ(dealer_delta). See class docstring above for
+            # derivation. Sign-flip is the "−" prefix on each dn_* term.
+            hp_g = -dn_g / spot                   # shares per +1% spot move
+            hp_v = -dn_v * 0.01                   # shares per +1 vol-pt (Δσ=0.01)
+            hp_c = -dn_c * (1.0 / 24.0)           # shares per +1 hour of decay
+
+            tot_g += hp_g
+            tot_v += hp_v
+            tot_c += hp_c
+
+            rows.append({
+                'K':                      float(K),
+                'dn_gamma':               dn_g,
+                'dn_vanna':               dn_v,
+                'dn_charm':               dn_c,
+                'oi_call':                int(e.get('oi_call', 0) or 0),
+                'oi_put':                 int(e.get('oi_put', 0) or 0),
+                'hp_gamma_shares_1pct':   hp_g,
+                'hp_vanna_shares_1volpt': hp_v,
+                'hp_charm_shares_1hr':    hp_c,
+            })
+
+        # Structural zero-crossings: first K at which the sign of each dn_* flips.
+        # Linear-interpolate between bracketing strikes for the crossing level.
+        def _first_crossing(field):
+            prev = None
+            for r in rows:
+                v = r.get(field, 0.0)
+                if prev is not None:
+                    pv = prev[1]
+                    if pv != 0.0 and v != 0.0 and ((pv > 0) != (v > 0)):
+                        # sign flip between prev['K'] and r['K']
+                        dK = r['K'] - prev[0]
+                        if (v - pv) != 0:
+                            frac = -pv / (v - pv)
+                            return round(prev[0] + frac * dK, 4)
+                        return round((prev[0] + r['K']) / 2.0, 4)
+                prev = (r['K'], v)
+            return None
+
+        zero_g = _first_crossing('dn_gamma')
+        zero_v = _first_crossing('dn_vanna')
+        zero_c = _first_crossing('dn_charm')
+
+        return {
+            'strikes': rows,
+            'oi_balance_strike_gamma': zero_g,
+            'oi_balance_strike_vanna': zero_v,
+            'oi_balance_strike_charm': zero_c,
+            'totals': {
+                'hp_gamma_shares_1pct':   tot_g,
+                'hp_vanna_shares_1volpt': tot_v,
+                'hp_charm_shares_1hr':    tot_c,
+            },
+            'spot': float(spot),
+            'ts':   time.time(),
+        }
 
     def get_confluence_at_price(self, qqq_price, threshold_pct=0.003):
         """Check if a specific QQQ price sits on a confluence zone.

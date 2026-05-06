@@ -27,7 +27,39 @@ Integration:
 import time
 import math
 from collections import deque
-from connectors.hmm_regime import OnlineHMM
+from connectors.hmm_regime import (
+    OnlineHMM,
+    make_vix_term_hmm,
+    build_vix_term_features,
+    VIX_RV_WINDOW_OBS,
+)
+from connectors.kv_estimator import TICKER_ALPHA, ALPHA_DEFAULT, ALPHA_DECAY_C
+
+
+def _memory_regime_from_alpha(alpha: float) -> str:
+    """Yatawara (2026) memory regime classification.
+
+    α < 0.15: LONG_MEMORY  — shocks persist days; pin levels sticky; VIX-like
+    α 0.15-0.40: NORMAL    — standard equity behavior (QQQ ≈0.30)
+    α > 0.40: SHORT_MEMORY — mean-reverts fast; fade extremes
+    """
+    if alpha < 0.15:
+        return 'LONG_MEMORY'
+    if alpha > 0.40:
+        return 'SHORT_MEMORY'
+    return 'NORMAL'
+
+
+def _half_life_days_from_alpha(alpha: float) -> float:
+    """Solve g(j) = exp[-c·(j^α - 1)] = 0.5 for j.
+    j^α = 1 + ln(2)/c  →  j = (1 + ln(2)/c)^(1/α)
+    """
+    if alpha <= 0:
+        return float('inf')
+    try:
+        return (1.0 + math.log(2.0) / ALPHA_DECAY_C) ** (1.0 / alpha)
+    except (OverflowError, ValueError, ZeroDivisionError):
+        return float('inf')
 
 
 class VolSurface:
@@ -37,7 +69,15 @@ class VolSurface:
     Provides vol regime classification to EdgeDetector.
     """
 
-    def __init__(self):
+    def __init__(self, ticker='QQQ'):
+        # Phase 19.5: ticker-bound for memory regime classification.
+        # Default QQQ (current single-underlying deployment); pass ticker explicitly
+        # if instantiated for SPX/IWM/etc.
+        self._ticker = ticker
+        self._memory_alpha = TICKER_ALPHA.get(ticker, ALPHA_DEFAULT)
+        self._memory_regime = _memory_regime_from_alpha(self._memory_alpha)
+        self._memory_half_life_days = _half_life_days_from_alpha(self._memory_alpha)
+
         # ── IV history for ranking ──
         self._atm_iv_history = deque(maxlen=500)    # ~42 min at 5s intervals
         self._iv_skew_history = deque(maxlen=500)
@@ -71,8 +111,26 @@ class VolSurface:
         self._regime_votes = deque(maxlen=12)  # Last 12 updates (~60s) [legacy fallback]
 
         # ── HMM regime detector (replaces majority voting) ──
+        # Profile A: legacy IV-features [iv_rank, iv_skew, vol_premium, vpin]
         self._hmm = OnlineHMM(n_states=3, n_features=4, ema_halflife=100)
         self._vpin_value = 0.5  # updated externally by schwab_bridge
+
+        # ── Phase 20B: parallel VIX-term-structure HMM ──
+        # Profile B: Nguyen (2025) §4.2 features [log(VIX), VIX/VVIX,
+        # VIX/VIX1D, rv_VIX]. Separated from Profile A to avoid the
+        # circularity Nguyen warns about (regime conditioning a signal
+        # built from same features). Both HMMs run every observe() call;
+        # winner determined offline via outcome ledger.
+        self._hmm_vix = make_vix_term_hmm(ema_halflife=100)
+        self._vix_history = deque(maxlen=VIX_RV_WINDOW_OBS)
+        # External feeders set these (schwab_bridge writes in equity quote handler)
+        self._vix_value = None
+        self._vvix_value = None
+        self._vix1d_value = None
+        # Track most recent VIX-HMM state for state emission
+        self._vix_hmm_state = None
+        self._vix_hmm_probs = [1/3.0, 1/3.0, 1/3.0]
+        self._vix_hmm_warm = False
 
     def update(self, zone_data, realized_vol=0.0):
         """Called every zone emission cycle with Greek surface data.
@@ -143,6 +201,27 @@ class VolSurface:
         hmm_probs = hmm_result['state_probs']
         regime_confidence = max(hmm_probs) * 100
 
+        # ── Phase 20B: parallel VIX-term-structure HMM ──
+        # Only observe when all three inputs available; else carry forward
+        # the previous state (or stay at uniform prior on cold start).
+        vix_features = build_vix_term_features(
+            vix=self._vix_value,
+            vvix=self._vvix_value,
+            vix1d=self._vix1d_value,
+            vix_history=self._vix_history,
+        )
+        vix_regime = None
+        vix_state = None
+        if vix_features is not None:
+            vix_result = self._hmm_vix.observe(vix_features)
+            self._vix_hmm_state = int(vix_result['state'])
+            self._vix_hmm_probs = vix_result['state_probs']
+            self._vix_hmm_warm = self._hmm_vix.warm
+            # Map VIX-HMM state to label (uses same 3-state ordering: low/normal/stress)
+            VIX_HMM_LABELS = {0: 'CONTANGO', 1: 'TRANSITION', 2: 'BACKWARDATION'}
+            vix_regime = VIX_HMM_LABELS.get(self._vix_hmm_state, 'TRANSITION')
+            vix_state = self._vix_hmm_state
+
         # Legacy fallback: also track votes for comparison logging
         legacy_regime = self._classify_regime(
             iv_skew, term_structure, vol_premium, iv_rank,
@@ -179,6 +258,21 @@ class VolSurface:
             'hmm_prob_stressed': round(hmm_probs[2], 4),
             'hmm_state': hmm_result['state'],
             'legacy_regime': legacy_regime,
+            # Phase 19.5: Yatawara memory regime (per-ticker, static)
+            'memory_regime':         self._memory_regime,
+            'memory_alpha':          round(self._memory_alpha, 3),
+            'memory_half_life_days': round(self._memory_half_life_days, 1),
+            # Phase 20B: VIX-term-structure HMM (parallel; A/B vs IV-features HMM)
+            'vix_hmm_regime':           vix_regime,                            # 'CONTANGO'/'TRANSITION'/'BACKWARDATION' or None
+            'vix_hmm_state':            vix_state,                             # 0/1/2 or None
+            'vix_hmm_warm':             bool(self._vix_hmm_warm),
+            'vix_hmm_prob_contango':    round(self._vix_hmm_probs[0], 4),
+            'vix_hmm_prob_transition':  round(self._vix_hmm_probs[1], 4),
+            'vix_hmm_prob_backwardation': round(self._vix_hmm_probs[2], 4),
+            'vix_hmm_inputs_present':   bool(vix_features is not None),
+            'vix_value':                self._vix_value,
+            'vvix_value':               self._vvix_value,
+            'vix1d_value':              self._vix1d_value,
         }
 
         return self._state
@@ -252,6 +346,74 @@ class VolSurface:
     def set_vpin(self, vpin_value):
         """Update VPIN input for HMM. Called by schwab_bridge or l2_worker."""
         self._vpin_value = max(0.0, min(1.0, vpin_value))
+
+    def set_vix_family(self, vix=None, vvix=None, vix1d=None):
+        """Update VIX-family spot inputs for the parallel VIX-term HMM.
+
+        Phase 20B (2026-05-01): wired in schwab_bridge._on_equity_quote
+        every time $VIX, $VVIX, or $VIX1D ticks. None values are ignored
+        so callers can update one symbol at a time.
+        """
+        if vix is not None and vix > 0:
+            self._vix_value = float(vix)
+            # Append to rolling history (used for realised-vol-of-VIX feature)
+            self._vix_history.append(float(vix))
+        if vvix is not None and vvix > 0:
+            self._vvix_value = float(vvix)
+        if vix1d is not None and vix1d > 0:
+            self._vix1d_value = float(vix1d)
+
+    def append_hmm_ab_record(self, log_dir=None):
+        """Append one HMM-A/B comparison record to outcome ledger.
+
+        Phase 20B: per-emission record of (IV-HMM regime, VIX-HMM regime,
+        future-vol target). Future-vol target is filled offline by a
+        post-processor that joins this ledger with the next-day realised
+        VIX move.
+
+        File: logs/hmm_ab_outcomes_YYYYMMDD.jsonl
+        """
+        import json, os
+        from datetime import datetime as _dt
+        if log_dir is None:
+            log_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                'logs',
+            )
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+        except Exception:
+            return
+        today = _dt.now().strftime('%Y%m%d')
+        path = os.path.join(log_dir, f'hmm_ab_outcomes_{today}.jsonl')
+        rec = {
+            'ts': time.time(),
+            'iv_hmm_regime': self._state.get('regime'),
+            'iv_hmm_state':  self._state.get('hmm_state'),
+            'iv_hmm_probs':  [
+                self._state.get('hmm_prob_low_vol'),
+                self._state.get('hmm_prob_normal'),
+                self._state.get('hmm_prob_stressed'),
+            ],
+            'vix_hmm_regime': self._state.get('vix_hmm_regime'),
+            'vix_hmm_state':  self._state.get('vix_hmm_state'),
+            'vix_hmm_warm':   self._state.get('vix_hmm_warm', False),
+            'vix_hmm_probs':  [
+                self._state.get('vix_hmm_prob_contango'),
+                self._state.get('vix_hmm_prob_transition'),
+                self._state.get('vix_hmm_prob_backwardation'),
+            ],
+            'vix_inputs_present': self._state.get('vix_hmm_inputs_present', False),
+            'vix':   self._vix_value,
+            'vvix':  self._vvix_value,
+            'vix1d': self._vix1d_value,
+            'spot_iv': self._state.get('atm_iv'),
+        }
+        try:
+            with open(path, 'a') as f:
+                f.write(json.dumps(rec) + '\n')
+        except Exception:
+            pass
 
     def get_state(self):
         """Return current vol surface state dict."""

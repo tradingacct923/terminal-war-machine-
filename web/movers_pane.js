@@ -1,7 +1,9 @@
 /**
  * MoversPane — Index-scoped top gainers/losers from Schwab /movers.
  * Consumes /api/movers REST (5-min cache backend). Polls on interval.
- * Index selectors: $SPX, $DJI, $COMPX, $IUXX, INDEX_ALL.
+ * Index selectors: $SPX, $DJI, $COMPX, NYSE, INDEX_ALL.
+ * Note: Schwab /movers does NOT expose Russell 2000 ($RUT/$IUXX → 400).
+ *       Use NYSE (listed equities) as the small-cap proxy.
  * Sort: PERCENT_CHANGE_UP (gainers) / PERCENT_CHANGE_DOWN (losers) / VOLUME.
  */
 const MoversPane = (() => {
@@ -12,7 +14,7 @@ const MoversPane = (() => {
         ['$SPX',      'SPX'],
         ['$DJI',      'DJI'],
         ['$COMPX',    'NDX'],
-        ['$IUXX',     'RUT'],
+        ['NYSE',      'NYSE'],
         ['INDEX_ALL', 'ALL'],
     ];
 
@@ -220,3 +222,4 @@ const MoversPane = (() => {
 
     return { init, destroy };
 })();
+window.MoversPane = MoversPane;

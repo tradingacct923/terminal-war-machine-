@@ -4079,22 +4079,11 @@ if (!popoutParam) initEditMode();
       for (const b of bars) byTime.set(b.time, b);
       const clean = Array.from(byTime.values()).sort((a, b) => a.time - b.time);
       if (!this._series) { this._bufferedHistory = data; return; }
-      // 2026-05-06 BUG FIX: candle_history pushes can be SMALLER than what
-      // the chart already has (REST loaded full 8000-bar history; subsequent
-      // Socket.IO pushes after reconnect/subscribe send only the latest 5000).
-      // setData() CLOBBERS — wiped older bars vanished from chart, looked
-      // like history disappeared. Now: if existing chart has more bars than
-      // incoming, MERGE per-bar via update() to keep the older history;
-      // otherwise full setData (initial load).
-      let _existing = [];
-      try { _existing = this._series.data() || []; } catch (_) {}
-      if (_existing.length >= clean.length && _existing.length > 0) {
-        for (const b of clean) {
-          try { this._series.update(b); } catch (_) {}
-        }
-      } else {
-        this._series.setData(clean);
-      }
+      // 2026-05-06: server now pushes 5000 bars (was 200), so full setData
+      // is correct behavior. Earlier merge attempt via update() per-bar broke
+      // the bubble custom series — LWC update() doesn't preserve custom data
+      // fields like bp the same way setData() does.
+      this._series.setData(clean);
       // ⚠ EMPIRICAL: setData(clean) + fitContent() on the existing bubble
       // series does NOT reliably register the custom series in LWC's render
       // pipeline. The renderer.draw() never fires until you fully recreate

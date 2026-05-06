@@ -105,6 +105,20 @@ _single_name_refresh_started = False
 _qqq_full_chain_refresh_started = False    # Phase 22 (2026-05-05) — guards _qqq_full_chain_refresh_loop spawn
 _SINGLE_NAME_REFRESH_SEC = 30.0  # Phase 13: Schwab streaming covers ATM real-time, REST is now LEAPS/tail backfill only
 
+# ── single-name Greeks cache disk persistence (added 2026-05-06) ────
+# Reason: bridge re-init wipes the in-memory cache, blocking
+# `_compute_single_name_walls` (returns empty until re-fetched), which in
+# turn silences `single_name_walls`, `ndx_wgc`, AI-panel NDX cells, and
+# any downstream consumer until the 5-10 min Schwab REST warmup completes.
+# Disk persistence eliminates that cold-start window across restarts.
+_SINGLE_NAME_CACHE_DIR              = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'state')
+_SINGLE_NAME_CACHE_FILE             = os.path.join(_SINGLE_NAME_CACHE_DIR, 'single_name_greeks.json')
+_SINGLE_NAME_CACHE_TMP              = _SINGLE_NAME_CACHE_FILE + '.tmp'
+_SINGLE_NAME_CACHE_PERSIST_SEC      = 30.0
+_SINGLE_NAME_CACHE_RESTORE_MAX_AGE  = 600.0   # 10 min — Greeks acceptable for warmup seed; refresh loop overwrites within 30s anyway
+_SINGLE_NAME_CACHE_VERSION          = 1
+_single_name_cache_persist_started  = False
+
 # ── REST CHAIN ROTATION (cap-blocked tail backfill, added 2026-04-29) ────
 # Streaming gives 200ms-fresh data on 2,940 contracts (3,000 cap, 1,500 QQQ).
 # This rotation pulls the FULL chain via REST every 30s for QQQ/SPX/VIX/SPY
@@ -253,8 +267,48 @@ _latest_wgc: dict = {}    # last emitted WGC payload; consumed by REST hydrate
 
 
 def set_socketio(sio):
-    """Inject the Flask-SocketIO instance from server.py."""
+    """Inject the Flask-SocketIO instance from server.py.
+
+    2026-05-06: also wraps sio.emit with timing instrumentation. Every
+    emit() call records per-event-type latency. Logs distribution every
+    30s. Goal: identify which emit's JSON serialization is pinning gevent
+    long enough to cause HTTP truncation + WebSocket buffer pile-up.
+    """
     global _socketio
+    # Wrap emit() with timing aggregator.
+    _orig_emit = sio.emit
+    _emit_perf: dict = {}  # event_name -> list of latencies in ms
+    _emit_last_log = [time.time()]
+
+    def _timed_emit(event, *args, **kwargs):
+        _t0 = time.perf_counter()
+        try:
+            return _orig_emit(event, *args, **kwargs)
+        finally:
+            _dt_ms = (time.perf_counter() - _t0) * 1000.0
+            _emit_perf.setdefault(event, []).append(_dt_ms)
+            if (time.time() - _emit_last_log[0]) >= 30.0 and _emit_perf:
+                # Log per-event summary, sorted by total time spent
+                ranked = sorted(
+                    [(name, samples) for name, samples in _emit_perf.items()],
+                    key=lambda x: -sum(x[1])
+                )
+                wall_dt = max(time.time() - _emit_last_log[0], 1.0)
+                lines = []
+                total_emit_cpu_pct = 0.0
+                for name, samples in ranked[:10]:
+                    n = len(samples)
+                    total_ms = sum(samples)
+                    avg = total_ms / n
+                    p99 = sorted(samples)[int(n * 0.99)] if n > 1 else samples[0]
+                    cpu_pct = 100.0 * total_ms / 1000.0 / wall_dt
+                    total_emit_cpu_pct += cpu_pct
+                    lines.append(f"{name}={cpu_pct:.1f}%(n={n},avg={avg:.2f}ms,p99={p99:.2f}ms)")
+                log.info(f"[EMIT-PERF] total={total_emit_cpu_pct:.1f}% of one core | " + ", ".join(lines))
+                _emit_perf.clear()
+                _emit_last_log[0] = time.time()
+
+    sio.emit = _timed_emit
     _socketio = sio
 
 
@@ -346,6 +400,17 @@ def start_schwab_bridge():
         _dpc.start_persistence()
     except Exception as e:
         log.warning(f"[SCHWAB-BRIDGE] dealer_print_capture persistence init failed: {e}")
+
+    # ── Single-name Greeks cache disk seed (added 2026-05-06) ───────────
+    # Skips the 5-10 min Schwab REST warmup so single_name_walls / ndx_wgc /
+    # AI-panel NDX cells emit immediately on restart instead of staying dark.
+    try:
+        n_sn = _restore_single_name_cache()
+        if n_sn > 0:
+            log.info(f"[SCHWAB-BRIDGE] Seeded {n_sn} single-name Greeks entries from disk")
+        _start_single_name_cache_persistence()
+    except Exception as e:
+        log.warning(f"[SCHWAB-BRIDGE] single-name cache persistence init failed: {e}")
 
     _bridge_running = True
     t = threading.Thread(target=_run_bridge, daemon=True)
@@ -2244,6 +2309,8 @@ def _on_options_quote(data):
     Now captures enriched fields: security_status, quote_time, trade_time,
     mark_change, mark_pct_change, theoretical_value, indicative_bid/ask.
     """
+    # 2026-05-06 PERF INSTRUMENTATION
+    _perf_t0 = time.perf_counter()
     global _gex_dirty, _last_option_update_ts
     _last_option_update_ts = time.time()
 
@@ -2630,6 +2697,35 @@ def _on_options_quote(data):
         except Exception:
             pass
 
+    # 2026-05-06 PERF INSTRUMENTATION: aggregate per-call timings.
+    # Schwab options quote handler is the prime suspect for the remaining
+    # ~56% sustained CPU we couldn't explain after Tradier proved innocent
+    # (1% of one core). Logs distribution every 30s as p50/p95/p99/max +
+    # call rate + total CPU%.
+    _perf_dt_ms = (time.perf_counter() - _perf_t0) * 1000.0
+    global _options_quote_perf_samples, _options_quote_perf_last_log
+    if _options_quote_perf_last_log == 0.0:
+        _options_quote_perf_last_log = time.time()
+    _options_quote_perf_samples.append(_perf_dt_ms)
+    if (time.time() - _options_quote_perf_last_log) >= 30.0 and _options_quote_perf_samples:
+        s = sorted(_options_quote_perf_samples)
+        n = len(s)
+        p50 = s[n // 2]
+        p95 = s[int(n * 0.95)] if n > 1 else s[0]
+        p99 = s[int(n * 0.99)] if n > 1 else s[0]
+        mx = s[-1]
+        avg = sum(s) / n
+        wall_dt = max(time.time() - _options_quote_perf_last_log, 1.0)
+        rate = n / wall_dt
+        cpu_pct = 100.0 * sum(s) / 1000.0 / wall_dt
+        log.info(
+            f"[OPTIONS-QUOTE-PERF] n={n} ({rate:.0f}/s) | p50={p50:.3f}ms p95={p95:.3f}ms "
+            f"p99={p99:.3f}ms max={mx:.2f}ms | avg={avg:.3f}ms | CPU on this handler: "
+            f"{cpu_pct:.1f}% of one core"
+        )
+        _options_quote_perf_samples = []
+        _options_quote_perf_last_log = time.time()
+
 
 def _flush_option_mark_batch():
     """Emit queued option mark updates as one `option_mark_batch` frame.
@@ -2703,6 +2799,15 @@ def _lookup_bbo_at(sym_key: str, trade_time_ms: int):
 
 
 _tradier_timesale_stats = {'trades': 0, 'enriched': 0, 'bare': 0, 'qqq': 0}
+# 2026-05-06 PERF: per-call timing samples for _on_tradier_timesale.
+# Logged every 30s as p50/p95/p99/max + total CPU%. Identifies if the
+# per-print handler is the CPU bottleneck.
+_tradier_perf_samples: list = []
+_tradier_perf_last_log: float = 0.0
+# Same pattern for _on_options_quote (Schwab options L1 stream — prime
+# suspect for the residual CPU pin since Tradier handler proved innocent).
+_options_quote_perf_samples: list = []
+_options_quote_perf_last_log: float = 0.0
 # Equity-timesale counters (separate from option counters above). Populated
 # by _on_tradier_equity_timesale — fills the Schwab TIMESALE_EQUITY code=11
 # gap with TRUE per-print prints from Tradier WS instead of L1 size-delta
@@ -2734,6 +2839,10 @@ def _on_tradier_timesale(evt: dict):
     Schwab's cache key is the 21-char OSI with underlying-root space-padding
     ('AAPL  260425C00175000'), so we convert before the cache lookup.
     """
+    # 2026-05-06 PERF INSTRUMENTATION: measure per-call duration. With 52
+    # prints/sec and ~80% sustained 1-core CPU, the budget is ~15ms/print
+    # max before back-pressure builds. Aggregates dumped every 30s.
+    _perf_t0 = time.perf_counter()
     try:
         occ = evt.get('symbol') or ''
         if not occ:
@@ -3142,6 +3251,32 @@ def _on_tradier_timesale(evt: dict):
             pass
     except Exception as e:
         log.debug(f"[TRADIER] timesale handler error: {e}")
+    finally:
+        # 2026-05-06 PERF INSTRUMENTATION: aggregate per-call timings.
+        # Logs distribution every 30s. Identifies if the per-print handler
+        # is the CPU bottleneck — at 52 prints/sec, a 15ms median already
+        # consumes 78% of one core. Anything above that = back-pressure risk.
+        _perf_dt_ms = (time.perf_counter() - _perf_t0) * 1000.0
+        global _tradier_perf_samples, _tradier_perf_last_log
+        if _tradier_perf_last_log == 0.0:
+            _tradier_perf_last_log = time.time()
+        _tradier_perf_samples.append(_perf_dt_ms)
+        if (time.time() - _tradier_perf_last_log) >= 30.0 and _tradier_perf_samples:
+            s = sorted(_tradier_perf_samples)
+            n = len(s)
+            p50 = s[n // 2]
+            p95 = s[int(n * 0.95)] if n > 1 else s[0]
+            p99 = s[int(n * 0.99)] if n > 1 else s[0]
+            mx = s[-1]
+            avg = sum(s) / n
+            tot_s = sum(s) / 1000.0
+            cpu_pct = 100.0 * tot_s / max(time.time() - _tradier_perf_last_log, 1.0)
+            log.info(
+                f"[TRADIER-PERF] n={n} prints/30s | p50={p50:.2f}ms p95={p95:.2f}ms p99={p99:.2f}ms max={mx:.2f}ms | "
+                f"avg={avg:.2f}ms | total CPU on this handler: {cpu_pct:.1f}% of one core"
+            )
+            _tradier_perf_samples = []
+            _tradier_perf_last_log = time.time()
 
 
 # ── Tradier EQUITY timesale handler (fills Schwab TIMESALE_EQUITY code=11) ──
@@ -3398,6 +3533,94 @@ def _collect_single_name_atm_symbols(max_per_ticker: int = 40) -> list:
         cache_n = len(_single_name_greeks_cache)
     log.info(f"[SCHWAB-REST] Greeks cache size: {cache_n}")
     return out
+
+
+def _persist_single_name_cache() -> int:
+    """Snapshot _single_name_greeks_cache to disk via atomic rename.
+
+    Returns # entries written. Crash safety: write to .tmp + fsync + os.replace
+    so a reader always sees old or new version, never partial.
+    """
+    t0 = time.time()
+    with _single_name_greeks_lock:
+        snapshot = dict(_single_name_greeks_cache)
+    if not snapshot:
+        return 0
+    payload = {
+        'version':  _SINGLE_NAME_CACHE_VERSION,
+        'saved_at': t0,
+        'entries':  snapshot,
+    }
+    try:
+        os.makedirs(os.path.dirname(_SINGLE_NAME_CACHE_FILE), exist_ok=True)
+        import json as _json
+        with open(_SINGLE_NAME_CACHE_TMP, 'w') as f:
+            _json.dump(payload, f, separators=(',', ':'))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(_SINGLE_NAME_CACHE_TMP, _SINGLE_NAME_CACHE_FILE)
+    except Exception as e:
+        log.warning(f"[SN-CACHE-PERSIST] save failed: {e}")
+        return 0
+    return len(snapshot)
+
+
+def _restore_single_name_cache() -> int:
+    """Load _single_name_greeks_cache from disk if a fresh snapshot exists.
+
+    Returns # entries restored. Skips if file is older than the max-age guard
+    (Greeks beyond that window risk stale underlying_price corrupting walls).
+    """
+    if not os.path.exists(_SINGLE_NAME_CACHE_FILE):
+        log.info("[SN-CACHE-RESTORE] no state file — fresh start")
+        return 0
+    age = time.time() - os.path.getmtime(_SINGLE_NAME_CACHE_FILE)
+    if age > _SINGLE_NAME_CACHE_RESTORE_MAX_AGE:
+        log.info(f"[SN-CACHE-RESTORE] state file age {age:.0f}s > {_SINGLE_NAME_CACHE_RESTORE_MAX_AGE:.0f}s, skipping")
+        return 0
+    try:
+        import json as _json
+        with open(_SINGLE_NAME_CACHE_FILE) as f:
+            payload = _json.load(f)
+    except Exception as e:
+        log.warning(f"[SN-CACHE-RESTORE] failed to load: {e}")
+        return 0
+    if payload.get('version') != _SINGLE_NAME_CACHE_VERSION:
+        log.warning(f"[SN-CACHE-RESTORE] schema version mismatch (file={payload.get('version')}, code={_SINGLE_NAME_CACHE_VERSION}), skipping")
+        return 0
+    entries = payload.get('entries') or {}
+    if not isinstance(entries, dict) or not entries:
+        return 0
+    with _single_name_greeks_lock:
+        _single_name_greeks_cache.update(entries)
+    saved_age = time.time() - float(payload.get('saved_at') or 0)
+    log.info(f"[SN-CACHE-RESTORE] restored {len(entries)} Greeks entries "
+             f"(snapshot was {saved_age:.0f}s old, file age {age:.0f}s)")
+    return len(entries)
+
+
+def _single_name_cache_persist_loop() -> None:
+    """Daemon thread — snapshot _single_name_greeks_cache every persist interval."""
+    while True:
+        try:
+            time.sleep(_SINGLE_NAME_CACHE_PERSIST_SEC)
+            _persist_single_name_cache()
+        except Exception as e:
+            log.warning(f"[SN-CACHE-PERSIST] loop error: {e}")
+            time.sleep(_SINGLE_NAME_CACHE_PERSIST_SEC)
+
+
+def _start_single_name_cache_persistence() -> bool:
+    """Start the cache persistence daemon. Idempotent."""
+    global _single_name_cache_persist_started
+    if _single_name_cache_persist_started:
+        return False
+    _single_name_cache_persist_started = True
+    t = threading.Thread(target=_single_name_cache_persist_loop, daemon=True,
+                         name='sn-cache-persist')
+    t.start()
+    log.info(f"[SN-CACHE-PERSIST] daemon started ({_SINGLE_NAME_CACHE_PERSIST_SEC:.0f}s cadence)")
+    return True
 
 
 def _compute_single_name_walls() -> list:

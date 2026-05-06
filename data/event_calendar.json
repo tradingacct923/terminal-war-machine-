@@ -1,0 +1,11 @@
+{
+  "_comment": "Static event calendar — manual updates by operator. Module reloads every 60 min.",
+  "_schema": {
+    "ts":     "ISO 8601 with timezone OR 'YYYY-MM-DD HH:MM:SS ET' (will be parsed as America/New_York)",
+    "ticker": "AAPL/MSFT/GOOG/META/AMZN/TSLA/NVDA/AVGO for Mag-8; ALL/SPX/QQQ for macro events",
+    "type":   "earnings_pre_market | earnings_after_close | earnings_during | fomc_decision | cpi_release | nfp_release | jobs_data | other",
+    "impact": "high | medium | low",
+    "notes":  "free-form description (e.g. quarter, expected EPS, etc)"
+  },
+  "events": []
+}

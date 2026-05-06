@@ -1204,6 +1204,10 @@ def _candle_boundary(timestamp: float, seconds: int) -> float:
     return (int(timestamp) // seconds) * seconds
 
 
+_feed_candle_perf_samples: list = []
+_feed_candle_perf_last_log: float = 0.0
+
+
 def _feed_candle(symbol: str, price: float, volume: int, timestamp: float,
                  side: str = "n"):
     """Feed a trade tick into the candle engine for all timeframes.
@@ -1223,6 +1227,8 @@ def _feed_candle(symbol: str, price: float, volume: int, timestamp: float,
 
     Thread-safe: acquires _CANDLE_LOCK.
     """
+    # 2026-05-06 PERF INSTRUMENTATION
+    _perf_t0 = time.perf_counter()
     # Quantize price to symbol-specific tick size for bubble aggregation
     tick_size = TICK_SIZES.get(symbol, DEFAULT_TICK_SIZE)
     qp = str(round(round(price / tick_size) * tick_size, 2))
@@ -1463,6 +1469,34 @@ def _feed_candle(symbol: str, price: float, volume: int, timestamp: float,
                 _socketio.emit("candle_enriched", _emit_enrich, namespace="/")
             except Exception as e:
                 log.warning("candle_enriched emit failed: %s", e)
+
+    # 2026-05-06 PERF INSTRUMENTATION: per-call timing.
+    # _feed_candle runs PER NQ TRADE TICK and iterates 11 timeframes.
+    # If TopStepX is feeding at 200-1000 trades/sec, this is the dominant
+    # CPU consumer. Aggregates dumped every 30s.
+    _perf_dt_ms = (time.perf_counter() - _perf_t0) * 1000.0
+    global _feed_candle_perf_samples, _feed_candle_perf_last_log
+    if _feed_candle_perf_last_log == 0.0:
+        _feed_candle_perf_last_log = time.time()
+    _feed_candle_perf_samples.append(_perf_dt_ms)
+    if (time.time() - _feed_candle_perf_last_log) >= 30.0 and _feed_candle_perf_samples:
+        s = sorted(_feed_candle_perf_samples)
+        n = len(s)
+        p50 = s[n // 2]
+        p95 = s[int(n * 0.95)] if n > 1 else s[0]
+        p99 = s[int(n * 0.99)] if n > 1 else s[0]
+        mx = s[-1]
+        avg = sum(s) / n
+        wall_dt = max(time.time() - _feed_candle_perf_last_log, 1.0)
+        rate = n / wall_dt
+        cpu_pct = 100.0 * sum(s) / 1000.0 / wall_dt
+        log.info(
+            f"[FEED-CANDLE-PERF] n={n} ({rate:.0f}/s) | p50={p50:.3f}ms p95={p95:.3f}ms "
+            f"p99={p99:.3f}ms max={mx:.2f}ms | avg={avg:.3f}ms | CPU on this handler: "
+            f"{cpu_pct:.1f}% of one core"
+        )
+        _feed_candle_perf_samples = []
+        _feed_candle_perf_last_log = time.time()
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2088,9 +2122,119 @@ def _detect_bar_aggression(symbol, tf, candle, history):
     }
 
 
+def _detect_bar_classical_absorption(symbol, tf, candle, history):
+    """CLASSICAL ABSORPTION (delta-price divergence) — added 2026-05-06.
+
+    Captures the textbook order-flow absorption pattern:
+        STRONG ONE-SIDED FLOW + SMALL PRICE MOVE = someone is providing
+        the opposite side. Different from `_detect_bar_absorption` (B2+B4)
+        which requires balanced two-sided flow + visible book defense.
+
+    Formula (per rocketmantwentyone's framework):
+        A_t = |delta_t| − λ · |ΔP_t|
+    where λ normalizes by recent ATR so price moves are scale-comparable.
+
+    Signature:
+        Buyers (or sellers) hammered the offer (or bid) but price barely
+        moved → SOMEONE absorbed the flow with hidden/iceberg liquidity.
+        Trade implication: take the OPPOSITE side (buyers absorbed → SHORT,
+        sellers absorbed → LONG).
+
+    Fires once per bar. Strength = absorbed flow / max(price_move_ticks, 0.5)
+    """
+    bp = candle.get("bp")
+    if not bp:
+        return None
+
+    bar_delta = _bar_delta(candle)
+    bar_total = _bar_total_volume(candle)
+
+    # Floor: bar must have meaningful activity
+    if bar_total < _adaptive_bar_floor(symbol, fallback=50.0):
+        return None
+
+    # One-sided dominance: delta must be at least 60% of total
+    # (i.e., minor side ≤ 40%). Distinguishes climax/iceberg from
+    # balanced two-sided trading.
+    if bar_total > 0 and abs(bar_delta) / bar_total < 0.60:
+        return None
+
+    # Minimum directional flow magnitude — reject noise
+    if abs(bar_delta) < 50:
+        return None
+
+    # Price move check
+    o = candle.get("o", 0); c = candle.get("c", 0)
+    h = candle.get("h", 0); l = candle.get("l", 0)
+    if o <= 0 or c <= 0:
+        return None
+    price_move_ticks = abs(c - o) / 0.25   # NQ tick
+    bar_range_ticks = (h - l) / 0.25
+
+    # Volatility normalization: use rolling 10-bar median range as λ-proxy
+    # so what counts as "small move" adjusts to the current vol regime.
+    if history and len(history) >= 5:
+        recent = list(history)[-10:]
+        recent_ranges = [(b.get("h", 0) - b.get("l", 0)) / 0.25
+                         for b in recent if b.get("h", 0) > b.get("l", 0) > 0]
+        if recent_ranges:
+            recent_ranges.sort()
+            atr_proxy = recent_ranges[len(recent_ranges) // 2]   # median range in ticks
+        else:
+            atr_proxy = 4.0
+    else:
+        atr_proxy = 4.0
+    if atr_proxy < 1.0:
+        atr_proxy = 4.0
+
+    # "Small price move" = bar moved less than ~30% of typical recent range
+    # AND ≤ 3 ticks absolute. Both gates required.
+    if price_move_ticks > 3 or price_move_ticks > 0.3 * atr_proxy:
+        return None
+
+    # Optional further constraint: bar_range itself shouldn't be huge
+    # (we want price actually STUCK, not just o≈c with intra-bar wild move).
+    if bar_range_ticks > 1.5 * atr_proxy:
+        return None
+
+    # Score: absorbed flow per tick of price impact (high = strong absorption)
+    strength = abs(bar_delta) / max(price_move_ticks, 0.5)
+
+    # Side: which direction was absorbed?
+    #   bar_delta > 0 = buyers were absorbed → expect DOWN move (short signal)
+    #   bar_delta < 0 = sellers were absorbed → expect UP move (long signal)
+    if bar_delta > 0:
+        side = 'classical_buy_absorbed'   # buyers hammered, didn't move price
+        signal_dir = 'short'              # take the opposite side
+        principal_price = c               # closing price as reference
+    else:
+        side = 'classical_sell_absorbed'  # sellers hammered, didn't move price
+        signal_dir = 'long'
+        principal_price = c
+
+    return {
+        'side':              side,
+        'signal_dir':        signal_dir,
+        'price':             principal_price,
+        'volume':            bar_total,
+        'absorbed_delta':    bar_delta,
+        'price_move_ticks':  round(price_move_ticks, 2),
+        'bar_range_ticks':   round(bar_range_ticks, 2),
+        'atr_proxy_ticks':   round(atr_proxy, 2),
+        'strength':          round(strength, 1),
+        'one_sided_pct':     round(abs(bar_delta) / max(bar_total, 1), 3),
+    }
+
+
 def _emit_bar_signals(symbol, tf, candle, history):
-    """Run all 3 detectors on a closed bar; emit a single bar_signal event
+    """Run all 4 detectors on a closed bar; emit a single bar_signal event
     only when at least one signal fires. Most bars produce no event.
+
+    Detectors:
+      - absorption          (B2+B4 microstructure: balanced + book + refill)
+      - classical_absorption (delta-price divergence: one-sided flow stuck) ← 2026-05-06
+      - exhaustion          (delta divergence at swing extremes)
+      - aggression          (stacked imbalance + price follow-through)
     """
     if _socketio is None:
         return
@@ -2171,11 +2315,17 @@ def _emit_bar_signals(symbol, tf, candle, history):
     except Exception as e:
         agg_event = None
         log.warning(f"[BAR_SIGNAL] aggression detect err: {e}")
+    try:
+        cabs_event = _detect_bar_classical_absorption(symbol, tf, candle, history)
+    except Exception as e:
+        cabs_event = None
+        log.warning(f"[BAR_SIGNAL] classical_absorption detect err: {e}")
 
     log.info(
         f"[BAR_SIGNAL] {symbol} {tf} t={candle.get('t')} "
         f"abs={len(abs_events)} exh={'Y' if exh_event else 'N'} "
-        f"agg={'Y' if agg_event else 'N'} bar_vol={_bar_total_volume(candle)} "
+        f"agg={'Y' if agg_event else 'N'} cabs={'Y' if cabs_event else 'N'} "
+        f"bar_vol={_bar_total_volume(candle)} "
         f"levels={len(candle.get('bp', {}))}"
     )
 
@@ -2189,11 +2339,12 @@ def _emit_bar_signals(symbol, tf, candle, history):
             "symbol":     symbol,
             "tf":         tf,
             "phase":      "fired" if (abs_events or exh_event or agg_event) else "no_signal",
-            "absorption": abs_events,
-            "exhaustion": exh_event,
-            "aggression": agg_event,
-            "bar_total":  _bar_total_volume(candle),
-            "level_count": len(candle.get('bp', {})),
+            "absorption":           abs_events,
+            "classical_absorption": cabs_event,
+            "exhaustion":           exh_event,
+            "aggression":           agg_event,
+            "bar_total":            _bar_total_volume(candle),
+            "level_count":          len(candle.get('bp', {})),
             "thresholds_at_emit": {
                 "level_floor": _adaptive_level_floor(symbol),
                 "bar_floor":   _adaptive_bar_floor(symbol),
@@ -2202,17 +2353,18 @@ def _emit_bar_signals(symbol, tf, candle, history):
     except Exception:
         pass
 
-    if not abs_events and not exh_event and not agg_event:
+    if not abs_events and not exh_event and not agg_event and not cabs_event:
         return
 
     try:
         _socketio.emit('bar_signal', {
-            'symbol':     symbol,
-            'tf':         tf,
-            't':          candle.get("t", 0),
-            'absorption': abs_events,
-            'exhaustion': exh_event,
-            'aggression': agg_event,
+            'symbol':               symbol,
+            'tf':                   tf,
+            't':                    candle.get("t", 0),
+            'absorption':           abs_events,
+            'classical_absorption': cabs_event,    # NEW 2026-05-06
+            'exhaustion':           exh_event,
+            'aggression':           agg_event,
         }, namespace='/')
         log.info(f"[BAR_SIGNAL] EMITTED {symbol} {tf} t={candle.get('t')}")
     except Exception as e:

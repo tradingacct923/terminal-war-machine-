@@ -8,8 +8,26 @@ Replaces majority voting in vol_surface.py with a proper probabilistic model.
   State 1 → NORMAL / ELEVATED        (mid vol, moderate skew)
   State 2 → STRESSED                 (high vol, high skew, backwardation)
 
-Feature vector (4D, fed every 5s from zone_update):
+═══════════════════════════════════════════════════════════════════════════
+ TWO HMM PROFILES (Phase 20B, 2026-05-01)
+═══════════════════════════════════════════════════════════════════════════
+
+We support TWO feature profiles, run in parallel for A/B comparison:
+
+PROFILE_IV (legacy — features from QQQ option chain):
   [iv_rank, iv_skew, vol_premium, vpin]
+
+PROFILE_VIX_TERM (new — Nguyen 2025 §4.2 features, our adaptation):
+  [log(VIX), VIX/VVIX, VIX/VIX1D, realised_vol_VIX]
+
+PROFILE_VIX_TERM avoids "circularity" (Nguyen §4.1): the trading signal
+is built from QQQ option flow, but the regime feature is from a
+DIFFERENT instrument (VIX/VVIX/VIX1D). The two HMMs run on the same
+3-state model, with state 0/1/2 always labelled by ascending vol.
+
+PAPER SUBSTITUTION: paper uses VXX/VIX as f3 (term structure). We use
+VIX/VIX1D — same semantic (>1=contango/calm, <1=backwardation/stress)
+without the ETF roll/tracking-error noise.
 
 Uses online forward filtering (α recursion) for O(K²) per observation.
 Parameters updated via incremental sufficient statistics (soft EM).
@@ -20,6 +38,8 @@ References:
   Rabiner (1989): A tutorial on hidden Markov models and
     selected applications in speech recognition
   Baum-Welch via incremental EM: Cappé (2011)
+  Nguyen (2025): Regime-Adaptive Volatility Surface Arbitrage,
+    UC Berkeley working paper §4.2
 
 Min dwell time prevents rapid switching (configurable, default 3 obs = 15s).
 """
@@ -27,6 +47,7 @@ Min dwell time prevents rapid switching (configurable, default 3 obs = 15s).
 import math
 import numpy as np
 from collections import deque
+from typing import Optional
 
 
 class OnlineHMM:
@@ -254,3 +275,148 @@ class OnlineHMM:
     @property
     def warm(self):
         return self._obs_count >= 10
+
+    # ─── Phase 20B: prior override + introspection helpers ──────────────────
+    def set_priors(self, mu, var, var_floor=None):
+        """Override emission priors AFTER __init__ — used to spin up a
+        custom-feature HMM (e.g., VIX-term-structure profile) without
+        forking the class.
+
+        Args:
+            mu:        (K, D) array of state means
+            var:       (K, D) array of state variances (diagonal cov)
+            var_floor: optional (D,) array — minimum variance per feature
+        """
+        mu = np.asarray(mu, dtype=float)
+        var = np.asarray(var, dtype=float)
+        if mu.shape != (self.K, self.D):
+            raise ValueError(f"mu shape {mu.shape} ≠ ({self.K}, {self.D})")
+        if var.shape != (self.K, self.D):
+            raise ValueError(f"var shape {var.shape} ≠ ({self.K}, {self.D})")
+        self.mu = mu.copy()
+        self.var = var.copy()
+        self._ss_mu = mu.copy()
+        self._ss_var = var.copy()
+        if var_floor is not None:
+            vf = np.asarray(var_floor, dtype=float)
+            if vf.shape != (self.D,):
+                raise ValueError(f"var_floor shape {vf.shape} ≠ ({self.D},)")
+            self._var_floor = vf.copy()
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  PHASE 20B — VIX-TERM-STRUCTURE FEATURE BUILDER
+# ═════════════════════════════════════════════════════════════════════════
+# Adapted from Nguyen (2025) §4.2, with VXX → VIX1D substitution (we have
+# Schwab streaming for VIX1D; VXX would require a separate ETF feed and
+# carries roll/tracking-error noise).
+
+# CONFIGURED: window for realised-vol-of-VIX feature.
+# Paper uses 10 daily observations. We're at intraday 5s cadence so we
+# convert to a 5-minute window (60 observations at 5s) — captures the
+# same "rate of regime transitions" intuition at our timescale.
+VIX_RV_WINDOW_OBS = 60       # CONFIGURED — 5 min @ 5s cadence (paper §4.2 uses 10d daily)
+
+
+def build_vix_term_features(vix: Optional[float],
+                              vvix: Optional[float],
+                              vix1d: Optional[float],
+                              vix_history: Optional[deque] = None,
+                              ) -> Optional[np.ndarray]:
+    """Build the 4-feature vector for the VIX-term-structure HMM.
+
+    Args:
+        vix:         current $VIX spot (e.g., 18.5)
+        vvix:        current $VVIX spot (e.g., 95.0)
+        vix1d:       current $VIX1D spot (e.g., 14.0)
+        vix_history: deque of recent VIX observations (for realised-vol calc)
+
+    Returns:
+        (4,) np.array  [log_vix, vix_vvix_ratio, vix_vix1d_ratio, rv_vix]
+        or None if any input is missing/invalid.
+
+    Feature semantics (matches paper sign convention via VIX/VIX1D inversion):
+        f1 (log_vix):           higher = more stress
+        f2 (VIX/VVIX):          lower  = vol elevated relative to vol-of-vol
+                                          (mean-reversion likely)
+                                higher = market pricing tail risk into
+                                          VIX-options themselves (genuine stress)
+        f3 (VIX/VIX1D):         > 1 = contango / calm
+                                < 1 = backwardation / stress
+        f4 (realised_vol_vix):  std of VIX changes over last
+                                VIX_RV_WINDOW_OBS samples — high during
+                                regime transitions
+    """
+    if not vix or vix <= 0:
+        return None
+    if not vvix or vvix <= 0:
+        return None
+    if not vix1d or vix1d <= 0:
+        return None
+
+    f1 = math.log(vix)
+    f2 = vix / vvix
+    f3 = vix / vix1d   # >1 = contango (calm), <1 = backwardation (stress)
+
+    # f4 = rolling std of VIX value changes
+    if vix_history is not None and len(vix_history) >= 5:
+        arr = np.array(vix_history)
+        diffs = np.diff(arr)
+        if len(diffs) > 0:
+            f4 = float(np.std(diffs, ddof=1))
+        else:
+            f4 = 0.0
+    else:
+        f4 = 0.0
+
+    return np.array([f1, f2, f3, f4])
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  PHASE 20B — VIX-TERM HMM PRIORS  (recomputed 2026-05-01)
+# ═════════════════════════════════════════════════════════════════════════
+# MEASURED from real VIX/VVIX historical data (yfinance, 2018-01-01 → 2026-05-01,
+# n=2085 trading days), percentile-bucketed:
+#   ≤P30 (log(VIX)≤2.750, i.e. VIX≤15.6) → State 0 (low-vol)
+#   P30-P70                                 → State 1 (transition)
+#   ≥P70 (log(VIX)≥3.065, i.e. VIX≥21.4)  → State 2 (stress)
+#
+# Day counts: state 0 = 626 (30%), state 1 = 830 (40%), state 2 = 629 (30%)
+#
+# VIX1D index series only published from 2022 onward; pre-2022 days approximated
+# from VIX-shape contango rule (VIX1D ≈ VIX × 0.85 at low vol; ≈ VIX × 1.10 at
+# stress). Mixed-period approximation does NOT bias the CONTANGO/BACKWARDATION
+# semantic — high state 2 days still show ratio < 1.
+#
+# Recomputed by scripts/recompute_vix_hmm_priors.py (idempotent).
+# Diagnostic: logs/vix_hmm_priors_recompute.json
+
+# Means (K=3, D=4): [log_vix, vix_vvix_ratio, vix_vix1d_ratio, rv_vix]
+VIX_HMM_MU = np.array([
+    [   2.6067,    0.1526,    1.1657,    0.8249],   # State 0: Low-vol
+    [   2.8936,    0.1808,    1.0577,    1.4955],   # State 1: Transition
+    [   3.3058,    0.2457,    0.9769,    2.4992],   # State 2: Stress
+])
+
+# Variances per state (diagonal cov)
+VIX_HMM_VAR = np.array([
+    [   0.0082,    0.0003,    0.0054,    0.2867],   # State 0: tight (low-vol regime is consistent)
+    [   0.0082,    0.0006,    0.0030,    0.8372],   # State 1: similar level uncertainty, more rv spread
+    [   0.0490,    0.0023,    0.0092,    4.0235],   # State 2: ~6× wider (stress has fat tails)
+])
+
+# Variance floor per feature — preserves robustness during long calm spells when
+# state 0 dwells near a point mass and state 2 hasn't been visited recently.
+VIX_HMM_VAR_FLOOR = np.array([0.005, 0.0002, 0.002, 0.10])
+
+
+def make_vix_term_hmm(ema_halflife: int = 100) -> 'OnlineHMM':
+    """Factory: returns an OnlineHMM configured for VIX-term-structure features.
+
+    The returned HMM expects observations from build_vix_term_features().
+    Use observe(np_array) instead of observe(dict) since the dict pathway
+    is hard-coded to IV-rank features.
+    """
+    h = OnlineHMM(n_states=3, n_features=4, ema_halflife=ema_halflife)
+    h.set_priors(VIX_HMM_MU, VIX_HMM_VAR, VIX_HMM_VAR_FLOOR)
+    return h

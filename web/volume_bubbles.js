@@ -210,7 +210,9 @@ const BUBBLE_CONFIG = {
     SIGMA_ABSORPTION: 1.0,        // 1.0σ = absorption context level
     SIGMA_HIGH_DOM: 0.5,          // 0.5σ = min vol for high-dominance bypass
     HIGH_DOMINANCE: 0.90,         // 90%+ one-sided = directional aggression
-    ABSORPTION_RATIO: 0.35,       // minor side must be ≥35% of total for absorption
+    // 2026-05-05 removed `ABSORPTION_RATIO: 0.35` — orphaned by the σ-based
+    // refactor that switched _isAbsorption from ratio-test to Shannon entropy
+    // (≥ 0.65). The constant was dead config: defined but never referenced.
     MIN_BUBBLE_VOL: 1,            // absolute floor (skip truly empty levels)
 
     // ── Gradient Display (The Eyes) ──
@@ -241,8 +243,10 @@ const BUBBLE_CONFIG = {
     CUML_DELTA_GLOW_THRESHOLD: 0.6,   // bars wider than 60% of max get a glow
 
     // ── Sizing ──
-    MAX_RADIUS: 14,               // max bubble radius — was 24, too large over candles
-    MIN_RADIUS: 2,                // min bubble radius
+    // Updated for signal-only bubble renderer matching reference image:
+    // bubbles are the primary chart layer, so they need to dominate.
+    MAX_RADIUS: 50,               // extreme prints (top 0.1%) get full 50px disc
+    MIN_RADIUS: 6,                // sub-σ noise — small dot, no label
     DOT_RADIUS: 2.5,              // radius for macro-zoom dots
 
     // ── Colors ──
