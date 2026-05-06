@@ -159,7 +159,6 @@ let _l2FetchVersion = 0;         // bumped on each switch to discard stale respo
 let _l2FetchInFlight = false;    // guard against abort cascade from competing fetches
 let _l2TapeAll = [];   // accumulated trades, newest first
 let _useCanvasLadder = false;  // true when Canvas 2D ladder pane is active
-let _l2KineticCursor = 0;     // tracks which trades have already been fed to KineticText
 
 // ── Wall / Max Pain overlay state ──
 let _ocRefreshTimer = null; // options chain auto-refresh
@@ -252,7 +251,13 @@ function _setupDataEvents() {
             _cachedEnriched = data;
         }
         // absorption + depth_deltas are per-symbol, not per-tf — always cache
-        if (data.absorption) _cachedEnriched = { ...(_cachedEnriched || {}), absorption: data.absorption };
+        if (data.absorption) {
+            _cachedEnriched = { ...(_cachedEnriched || {}), absorption: data.absorption };
+            // Bridge backend FORTRESS/SOLID/HELD tiers → V3 bubble renderer
+            // (v2_integration.js:55 inits _v2AbsBuffer={} but never populates it)
+            // l2_worker.py:1087 attaches per-candle absorption snapshot
+            window._v2AbsBuffer = data.absorption || {};
+        }
         if (data.depth_deltas) _cachedEnriched = { ...(_cachedEnriched || {}), depth_deltas: data.depth_deltas };
     });
 
@@ -645,8 +650,31 @@ function _setupDataEvents() {
 
         const instances = ChartCore.getInstances();
         instances.forEach(inst => {
-            inst.candleSeries.setData(ohlc);
-            if (inst.volumeSeries) inst.volumeSeries.setData(vol);
+            // 2026-05-06 BUG FIX: candle_history pushes are SMALLER than the
+            // REST-loaded full history (server pushes last 5000 bars over WS;
+            // REST has up to 8000+). Pre-fix used setData() which CLOBBERS all
+            // chart data — a Socket.IO reconnect or TF switch would wipe ~3000
+            // bars of history visible on the chart. Now we MERGE: if existing
+            // chart has more bars than incoming, only fold incoming into the
+            // existing series (replacing/extending the right-edge tail). If
+            // existing is empty/smaller, full setData (initial load).
+            let _existing = [];
+            try { _existing = inst.candleSeries.data() || []; } catch (_) {}
+            if (_existing.length >= ohlc.length && _existing.length > 0) {
+                // Merge: existing has more history. Use update() per-bar for
+                // the incoming subset (each will replace or append-tail in
+                // place, preserving the older bars in the chart).
+                ohlc.forEach(b => { try { inst.candleSeries.update(b); } catch (_) {} });
+                vol.forEach(b => {
+                    if (inst.volumeSeries) {
+                        try { inst.volumeSeries.update(b); } catch (_) {}
+                    }
+                });
+            } else {
+                // Initial load (or incoming has more bars than existing).
+                inst.candleSeries.setData(ohlc);
+                if (inst.volumeSeries) inst.volumeSeries.setData(vol);
+            }
 
             if (inst.feature === 'chart' && inst.bubbleSeries) {
                 const bubbleData = candles.map(c => ({
@@ -659,7 +687,13 @@ function _setupDataEvents() {
                     wall_gone: c.wall_gone || null,
                     absorption: c.absorption || null, depth_deltas: c.depth_deltas || null
                 }));
-                inst.bubbleSeries.setData(bubbleData);
+                let _existingBub = [];
+                try { _existingBub = inst.bubbleSeries.data() || []; } catch (_) {}
+                if (_existingBub.length >= bubbleData.length && _existingBub.length > 0) {
+                    bubbleData.forEach(b => { try { inst.bubbleSeries.update(b); } catch (_) {} });
+                } else {
+                    inst.bubbleSeries.setData(bubbleData);
+                }
             }
 
             if (inst.feature === 'heatmap') {
@@ -713,8 +747,17 @@ function _setupDataEvents() {
 // IMPORTANT: ALL timestamps stored in _l2LastCandleTime, _l2SeamTime, etc.
 // MUST go through _utcToET. Raw UTC will cause silent comparison mismatches
 // (candle_update rejected because et < _l2LastCandleTime).
+//
+// DST-aware: delegates to window._getETOffsetSec (defined in index.html
+// bootstrap script). EDT = UTC-4 (Mar–Nov), EST = UTC-5 (Nov–Mar). The
+// previous hardcoded 4*3600 silently shifted bar times by 1hr for the
+// 5 winter months. Falls back to 14400 if the helper isn't loaded yet
+// (pre-DOM-ready or test harness).
 function _utcToET(utcEpoch) {
-    return utcEpoch - 4 * 3600; // EDT = UTC-4
+    const off = (typeof window._getETOffsetSec === 'function')
+        ? window._getETOffsetSec()
+        : 4 * 3600;
+    return utcEpoch - off;
 }
 
 const SIG_META = {
@@ -2258,18 +2301,6 @@ function _l2Render(data) {
     // Initial draw
     window._forceRenderHeatmap();
 
-    // ── KineticText trade shock integration ──
-    if (_useCanvasLadder && typeof KineticText !== 'undefined' && KineticText.programValid) {
-        const domData = (data.dom || {})[_l2ChartSymbol] || {};
-        // Only feed NEW trades (use cursor to avoid duplicate shocks)
-        const cursor = _l2KineticCursor || 0;
-        const newTradeCount = _l2TapeAll.length - cursor;
-        if (newTradeCount > 0) {
-            const newTrades = _l2TapeAll.slice(cursor);
-            KineticText.processTrades(newTrades, domData.bids || {}, domData.asks || {});
-            _l2KineticCursor = _l2TapeAll.length;
-        }
-    }
 }
 
 // ── L2 DOM/Trade fallback polling (only fires when WebSocket is down) ──
@@ -2669,36 +2700,14 @@ document.addEventListener('DOMContentLoaded', () => {
                     // (prevents 0-width chart creation which makes candles invisible)
                     requestAnimationFrame(() => _l2InitCandleChart(wrap, chartFK));
                 } else if (featureKey === 'ladder') {
-                    // Canvas 2D Depth Ladder + Kinetic Text WebGL overlay
+                    // Canvas 2D Depth Ladder
                     slotEl.innerHTML = `
                       <div class="l2-dom-ladder" style="position:relative; height:100%; overflow:hidden">
                         <canvas id="dom-ladder-canvas" style="width:100%; height:100%; display:block"></canvas>
-                        <canvas id="dom-pressure-canvas"></canvas>
-                        <canvas id="dom-kinetic-canvas"></canvas>
                       </div>`;
                     _useCanvasLadder = true;
                     _domNodesCreated = false; // reset HTML DOM nodes
                     _domMemory = {};          // reset delta memory
-
-                    // Auto-init KineticText WebGL on the overlay canvas
-                    requestAnimationFrame(() => {
-                        const pCanvas = document.getElementById('dom-pressure-canvas');
-                        if (pCanvas) {
-                            if (typeof window._initPressureField === 'function') {
-                                window._initPressureField();
-                                // Reset retry counter if it gave up earlier
-                                if (typeof PressureField !== 'undefined' && !PressureField._ready) {
-                                     PressureField._retryCount = 0;
-                                }
-                            } else if (typeof PressureField !== 'undefined') {
-                                PressureField.init(pCanvas);
-                            }
-                        }
-                        const kCanvas = document.getElementById('dom-kinetic-canvas');
-                        if (kCanvas && typeof KineticText !== 'undefined' && !KineticText.programValid) {
-                            KineticText.init(kCanvas);
-                        }
-                    });
                 } else if (featureKey === 'eqbook') {
                     slotEl.innerHTML = `
                       <div class="l2-tape" style="height:100%; display:flex; flex-direction:column">
@@ -2728,138 +2737,6 @@ document.addEventListener('DOMContentLoaded', () => {
                     } else {
                         slotEl.innerHTML = `<div style="color:var(--dim);padding:20px;">AlphaDashboard module not loaded.</div>`;
                     }
-                } else if (featureKey === 'pressure') {
-                    slotEl.innerHTML = `
-                      <div style="position:relative;width:100%;height:100%;background:#070a14">
-                        <canvas id="dom-pressure-canvas-${paneIdx}" style="width:100%;height:100%;display:block"></canvas>
-                      </div>`;
-                    requestAnimationFrame(() => {
-                        const pCanvas = document.getElementById('dom-pressure-canvas-' + paneIdx);
-                        if (pCanvas && typeof PressureField !== 'undefined') {
-                            PressureField.init(pCanvas);
-                            if (!PressureField._ready) {
-                                // WebGL2 not available — show fallback
-                                slotEl.querySelector('div').innerHTML = `
-                                  <div style="display:flex;align-items:center;justify-content:center;height:100%;color:rgba(140,160,200,.4);font-family:'JetBrains Mono',monospace;font-size:.7rem">
-                                    Pressure Field requires WebGL2 (open in Chrome with GPU)
-                                  </div>`;
-                                return;
-                            }
-                            // Standalone render loop — throttled to 20fps + pauses during chart scroll
-                            let _pfRAF;
-                            let _pfDirty = true;
-                            let _pfLastFrame = 0;
-                            let _pfScrollPaused = false;
-                            let _pfScrollTimer = 0;
-                            if (window.AltarisEvents) {
-                                const _pfScrollHandler = () => {
-                                    _pfScrollPaused = true;
-                                    clearTimeout(_pfScrollTimer);
-                                    _pfScrollTimer = setTimeout(() => { _pfScrollPaused = false; _pfDirty = true; }, 300);
-                                };
-                                window.AltarisEvents.on('chart:scroll', _pfScrollHandler);
-                                slotEl._pfScrollHandler = _pfScrollHandler;
-                            }
-                            const _pfLoop = (now) => {
-                                if (!document.body.contains(pCanvas)) return;
-                                // Skip entirely during scroll — fluid sim is decorative, not critical
-                                if (_pfScrollPaused) {
-                                    _pfRAF = requestAnimationFrame(_pfLoop);
-                                    return;
-                                }
-                                // Throttle to 20fps (50ms)
-                                if (now - _pfLastFrame >= 50) {
-                                    _pfLastFrame = now;
-                                    if (PressureField._ready && _pfDirty) {
-                                        _pfDirty = false;
-                                        PressureField.update(0.05);
-                                        PressureField.render();
-                                    }
-                                }
-                                _pfRAF = requestAnimationFrame(_pfLoop);
-                            };
-                            _pfRAF = requestAnimationFrame(_pfLoop);
-                            slotEl._pfMarkDirty = () => { _pfDirty = true; };
-                            slotEl._pfRAF = _pfRAF;
-
-                            // Wire L2 DOM data → obstacle texture
-                            const _pfL2Handler = (data) => {
-                                if (!PressureField._ready || !document.body.contains(pCanvas)) return;
-                                const symData = (data.dom || {})[_l2ChartSymbol] || {};
-                                const bids = symData.bids || {};
-                                const asks = symData.asks || {};
-                                const mid = symData.mid_price || 0;
-                                if (!mid) return;
-                                const tick = 0.25;
-                                const levels = 40;
-                                const visiblePrices = [];
-                                for (let i = -levels; i <= levels; i++) {
-                                    visiblePrices.push(mid + i * tick);
-                                }
-                                let maxDepth = 1;
-                                for (const k of Object.keys(bids)) { if (bids[k] > maxDepth) maxDepth = bids[k]; }
-                                for (const k of Object.keys(asks)) { if (asks[k] > maxDepth) maxDepth = asks[k]; }
-                                PressureField.updateObstacles(bids, asks, visiblePrices, maxDepth);
-                                _pfDirty = true; // mark for next render frame
-                            };
-                            window.AltarisEvents.on('data:l2:update', _pfL2Handler);
-                            slotEl._pfL2Handler = _pfL2Handler;
-
-                            // Wire trade ticks → force injection
-                            const _pfTradeHandler = (data) => {
-                                if (!PressureField._ready || !document.body.contains(pCanvas)) return;
-                                if (data.symbol !== _l2ChartSymbol) return;
-                                const priceStr = parseFloat(data.price).toFixed(2);
-                                const vol = data.vol || data.volume || data.size || 1;
-                                const side = (data.side === 'sell' || data.side === 's') ? 'ask' : 'bid';
-                                PressureField.injectForce(priceStr, vol, side);
-                                _pfDirty = true;
-                            };
-                            window.AltarisEvents.on('data:trades:update', _pfTradeHandler);
-                            slotEl._pfTradeHandler = _pfTradeHandler;
-                        }
-                    });
-                } else if (featureKey === 'kinetic') {
-                    slotEl.innerHTML = `
-                      <div style="position:relative;width:100%;height:100%;background:#070a14">
-                        <canvas id="dom-kinetic-canvas-${paneIdx}" style="width:100%;height:100%;display:block"></canvas>
-                      </div>`;
-                    requestAnimationFrame(() => {
-                        const kCanvas = document.getElementById('dom-kinetic-canvas-' + paneIdx);
-                        if (!kCanvas || typeof KineticText === 'undefined') return;
-                        if (!KineticText.programValid) {
-                            const ok = KineticText.init(kCanvas);
-                            if (!ok) {
-                                // WebGL2 not available — use Canvas2D trade ladder fallback
-                                const _kHeat = {}; // { priceKey: { ts, vol, side } }
-                                const _kTradeHandler = (data) => {
-                                    if (!document.body.contains(kCanvas)) return;
-                                    if (data.symbol !== _l2ChartSymbol) return;
-                                    const pk = parseFloat(data.price).toFixed(2);
-                                    const prev = _kHeat[pk] || { vol: 0 };
-                                    _kHeat[pk] = { ts: Date.now(), vol: prev.vol + (data.vol || data.volume || 1), side: data.side === 'sell' || data.side === 's' ? 'ask' : 'bid' };
-                                    _kDirty = true;
-                                };
-                                window.AltarisEvents.on('data:trades:update', _kTradeHandler);
-                                slotEl._kTradeHandler = _kTradeHandler;
-
-                                let _kRAF;
-                                let _kDirty = true;
-                                const _kLoop = () => {
-                                    if (!document.body.contains(kCanvas)) return;
-                                    if (_kDirty) {
-                                        _kDirty = false;
-                                        _drawKineticFallback(kCanvas, _kHeat);
-                                    }
-                                    _kRAF = requestAnimationFrame(_kLoop);
-                                };
-                                _kRAF = requestAnimationFrame(_kLoop);
-                                slotEl._kRAF = _kRAF;
-                            }
-                        }
-                    });
-                } else if (featureKey === 'bookms') {
-                    if (typeof BookMsHUD !== 'undefined') BookMsHUD.init(slotEl);
                 } else if (featureKey === 'eqtape') {
                     if (typeof EquityTapePane !== 'undefined') EquityTapePane.init(slotEl);
                 } else if (featureKey === 'dealer') {
@@ -2878,6 +2755,36 @@ document.addEventListener('DOMContentLoaded', () => {
                     if (typeof MoversPane !== 'undefined') MoversPane.init(slotEl);
                 } else if (featureKey === 'aipanel') {
                     if (typeof AIPanel !== 'undefined') AIPanel.init(slotEl);
+                } else if (featureKey === 'walls8') {
+                    if (typeof PerTickerWallsPane !== 'undefined') PerTickerWallsPane.init(slotEl);
+                } else if (featureKey === 'dprints') {
+                    if (typeof DealerPrintsPane !== 'undefined') DealerPrintsPane.init(slotEl);
+                } else if (featureKey === 'ccs') {
+                    if (typeof ConvictionPane !== 'undefined') ConvictionPane.init(slotEl);
+                } else if (featureKey === 'svi') {
+                    if (typeof SviPane !== 'undefined') SviPane.init(slotEl);
+                } else if (featureKey === 'sweep') {
+                    if (typeof SweepPane !== 'undefined') SweepPane.init(slotEl);
+                } else if (featureKey === 'pin') {
+                    if (typeof PinPane !== 'undefined') PinPane.init(slotEl);
+                } else if (featureKey === 'hedgefc') {
+                    if (typeof HedgeForecastPane !== 'undefined') HedgeForecastPane.init(slotEl);
+                } else if (featureKey === 'vixterm') {
+                    if (typeof VixTermPane !== 'undefined') VixTermPane.init(slotEl);
+                } else if (featureKey === 'wing') {
+                    if (typeof WingTrackerPane !== 'undefined') WingTrackerPane.init(slotEl);
+                } else if (featureKey === 'skyline') {
+                    if (typeof GammaSkylinePane !== 'undefined') GammaSkylinePane.init(slotEl);
+                } else if (featureKey === 'warehouse') {
+                    if (typeof DealerWarehousePane !== 'undefined') DealerWarehousePane.init(slotEl);
+                } else if (featureKey === 'events') {
+                    if (typeof EventsPane !== 'undefined') EventsPane.init(slotEl);
+                } else if (featureKey === 'spxqqq') {
+                    if (typeof SpxQqqDivergencePane !== 'undefined') SpxQqqDivergencePane.init(slotEl);
+                } else if (featureKey === 'mmatt') {
+                    if (typeof MmAttributionPane !== 'undefined') MmAttributionPane.init(slotEl);
+                } else if (featureKey === 'walls8') {
+                    if (typeof PerTickerWallsPane !== 'undefined') PerTickerWallsPane.init(slotEl);
                 } else if (featureKey === 'ocheat') {
                     // Options Chain GEX Heatmap (Canvas2D)
                     slotEl.innerHTML = `<div style="width:100%;height:100%;background:#070a14;position:relative">
@@ -2894,8 +2801,9 @@ document.addEventListener('DOMContentLoaded', () => {
                         _ocData[dte][key] = { strike: d.strike, side: d.side, gex: d.dollar_gex || 0, iv: d.iv, oi: d.oi || 0, vol: d.vol || 0 };
                         _ocDirty = true;
                     };
-                    // Wire option_mark_update
-                    if (window._sio) window._sio.on('option_mark_update', _ocHandler);
+                    // Wire to AltarisEvents bus — backend emits option_mark_batch,
+                    // index.html fans out to data:option:mark for each update.
+                    if (window.AltarisEvents) window.AltarisEvents.on('data:option:mark', _ocHandler);
                     slotEl._ocHandler = _ocHandler;
 
                     // Render loop
@@ -2941,21 +2849,9 @@ document.addEventListener('DOMContentLoaded', () => {
                         stale.forEach(inst => { try { ChartCore.destroy(inst.container); } catch(e) {} });
                     }
                 }
-                if (featureKey === 'pressure') {
-                    if (slotEl._pfRAF) cancelAnimationFrame(slotEl._pfRAF);
-                    if (slotEl._pfScrollHandler) window.AltarisEvents.off('chart:scroll', slotEl._pfScrollHandler);
-                    if (slotEl._pfL2Handler) window.AltarisEvents.off('data:l2:update', slotEl._pfL2Handler);
-                    if (slotEl._pfTradeHandler) window.AltarisEvents.off('data:trades:update', slotEl._pfTradeHandler);
-                    if (typeof PressureField !== 'undefined') PressureField.destroy();
-                }
                 if (featureKey === 'ocheat') {
                     if (slotEl._ocRAF) cancelAnimationFrame(slotEl._ocRAF);
-                    if (slotEl._ocHandler && window._sio) window._sio.off('option_mark_update', slotEl._ocHandler);
-                }
-                if (featureKey === 'kinetic') {
-                    if (typeof KineticText !== 'undefined' && KineticText.programValid) KineticText.destroy();
-                    if (slotEl._kRAF) cancelAnimationFrame(slotEl._kRAF);
-                    if (slotEl._kTradeHandler) window.AltarisEvents.off('data:trades:update', slotEl._kTradeHandler);
+                    if (slotEl._ocHandler && window.AltarisEvents) window.AltarisEvents.off('data:option:mark', slotEl._ocHandler);
                 }
                 if (featureKey === 'alpha') {
                     if (typeof window.AlphaDashboard !== 'undefined') {
@@ -2969,14 +2865,6 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (featureKey === 'ladder') {
                     _useCanvasLadder = false;
                     _domNodesCreated = false; // force HTML DOM to rebuild on next mount
-                    if (typeof KineticText !== 'undefined' && KineticText.programValid) {
-                        KineticText.destroy();
-                    }
-                    // Reset init flag so auto-init works on re-mount
-                    if (typeof KineticText !== 'undefined') {
-                        KineticText._initAttempted = false;
-                    }
-                    _l2KineticCursor = 0;
                 }
                 if (featureKey === 'eqbook') {
                     _tapeNodesCreated = false;
@@ -2985,7 +2873,6 @@ document.addEventListener('DOMContentLoaded', () => {
                     _deltaLabelEl = null;
                     _eqCtxCached = false;
                 }
-                if (featureKey === 'bookms' && typeof BookMsHUD !== 'undefined') BookMsHUD.destroy();
                 if (featureKey === 'eqtape' && typeof EquityTapePane !== 'undefined') EquityTapePane.destroy();
                 if (featureKey === 'dealer' && typeof DealerFlowPane !== 'undefined') DealerFlowPane.destroy();
                 if (featureKey === 'xdiv' && typeof CrossDivergencePane !== 'undefined') CrossDivergencePane.destroy();
@@ -2995,6 +2882,21 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (featureKey === 'flow' && typeof FlowPane !== 'undefined') FlowPane.destroy();
                 if (featureKey === 'movers' && typeof MoversPane !== 'undefined') MoversPane.destroy();
                 if (featureKey === 'aipanel' && typeof AIPanel !== 'undefined') AIPanel.destroy();
+                if (featureKey === 'walls8' && typeof PerTickerWallsPane !== 'undefined') PerTickerWallsPane.destroy();
+                if (featureKey === 'dprints' && typeof DealerPrintsPane !== 'undefined') DealerPrintsPane.destroy();
+                if (featureKey === 'ccs' && typeof ConvictionPane !== 'undefined') ConvictionPane.destroy();
+                if (featureKey === 'svi' && typeof SviPane !== 'undefined') SviPane.destroy();
+                if (featureKey === 'sweep' && typeof SweepPane !== 'undefined') SweepPane.destroy();
+                if (featureKey === 'pin' && typeof PinPane !== 'undefined') PinPane.destroy();
+                if (featureKey === 'hedgefc' && typeof HedgeForecastPane !== 'undefined') HedgeForecastPane.destroy();
+                if (featureKey === 'vixterm' && typeof VixTermPane !== 'undefined') VixTermPane.destroy();
+                if (featureKey === 'wing' && typeof WingTrackerPane !== 'undefined') WingTrackerPane.destroy();
+                if (featureKey === 'skyline' && typeof GammaSkylinePane !== 'undefined') GammaSkylinePane.destroy();
+                if (featureKey === 'warehouse' && typeof DealerWarehousePane !== 'undefined') DealerWarehousePane.destroy();
+                if (featureKey === 'events' && typeof EventsPane !== 'undefined') EventsPane.destroy();
+                if (featureKey === 'spxqqq' && typeof SpxQqqDivergencePane !== 'undefined') SpxQqqDivergencePane.destroy();
+                if (featureKey === 'mmatt' && typeof MmAttributionPane !== 'undefined') MmAttributionPane.destroy();
+                if (featureKey === 'walls8' && typeof PerTickerWallsPane !== 'undefined') PerTickerWallsPane.destroy();
             };
 
             AltarisLayout.triggerInitialMounts();

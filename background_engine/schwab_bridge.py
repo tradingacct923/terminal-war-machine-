@@ -5039,6 +5039,12 @@ def _intel_compute_loop():
              f"warehouse {_INTEL_WAREHOUSE_INTERVAL_S}s / "
              f"events {int(_INTEL_EVENTS_INTERVAL_S/60)}min")
 
+    # 2026-05-06: per-compute timing to identify which intel signal is the
+    # CPU spike source. Logs warning when ANY single compute exceeds 200ms,
+    # and a summary if total iteration time exceeds 500ms. Identifies the
+    # culprit without needing py-spy/sudo.
+    _intel_iter_count = 0
+
     while True:
         try:
             if not _is_rth_now():
@@ -5046,6 +5052,20 @@ def _intel_compute_loop():
                 continue
 
             now = time.time()
+            _intel_iter_count += 1
+            _iter_t0 = time.perf_counter()
+            _intel_compute_times: dict = {}
+
+            def _time_intel(label, fn, *args, **kwargs):
+                """Run fn, time it, record in _intel_compute_times. Returns fn result or None."""
+                _t0 = time.perf_counter()
+                try:
+                    return fn(*args, **kwargs)
+                finally:
+                    _dt_ms = (time.perf_counter() - _t0) * 1000.0
+                    _intel_compute_times[label] = _dt_ms
+                    if _dt_ms > 200.0:
+                        log.warning(f"[INTEL-PERF] {label} took {_dt_ms:.0f}ms (>200ms)")
 
             # ── Pin Convergence (Phase 2) ──────────────────────────────
             try:
@@ -5056,7 +5076,7 @@ def _intel_compute_loop():
                             else _INTEL_PIN_OFF_INTERVAL_S)
                 if (now - _intel_pin_last_compute_ts) >= interval:
                     _intel_pin_last_compute_ts = now
-                    state = _pc.compute_pin_state('QQQ')
+                    state = _time_intel('pin', _pc.compute_pin_state, 'QQQ')
                     if _socketio is not None and state and state.get('pin_estimate') is not None:
                         try:
                             _socketio.emit('intel:pin_update', state)
@@ -5079,7 +5099,7 @@ def _intel_compute_loop():
                 from connectors import hedge_forecaster as _hf
                 if (now - _intel_hedge_last_compute_ts) >= _INTEL_HEDGE_INTERVAL_S:
                     _intel_hedge_last_compute_ts = now
-                    fc = _hf.compute_forecast('QQQ')
+                    fc = _time_intel('hedge_fc', _hf.compute_forecast, 'QQQ')
                     if _socketio is not None and fc and not fc.get('reason'):
                         try:
                             # Strip predictive fields. Keep only observable.
@@ -5116,7 +5136,7 @@ def _intel_compute_loop():
                 from connectors import spx_qqq_divergence as _sqd
                 if (now - _intel_div_last_compute_ts) >= _INTEL_DIV_INTERVAL_S:
                     _intel_div_last_compute_ts = now
-                    div_state = _sqd.compute_state()
+                    div_state = _time_intel('spx_qqq_div', _sqd.compute_state)
                     # Always emit so frontend can render NO_DATA placeholder
                     # (gives operator visibility into when SPX feed lags vs QQQ)
                     if _socketio is not None and div_state:
@@ -5137,7 +5157,7 @@ def _intel_compute_loop():
                 from connectors import vix_term_structure as _vts
                 if (now - _intel_vix_last_compute_ts) >= _INTEL_VIX_INTERVAL_S:
                     _intel_vix_last_compute_ts = now
-                    vts_state = _vts.compute_state()
+                    vts_state = _time_intel('vix_term', _vts.compute_state)
                     if _socketio is not None and vts_state:
                         try:
                             _socketio.emit('intel:vix_term', vts_state)
@@ -5156,7 +5176,7 @@ def _intel_compute_loop():
                 from connectors import wing_tracker as _wt
                 if (now - _intel_wing_last_compute_ts) >= _INTEL_WING_INTERVAL_S:
                     _intel_wing_last_compute_ts = now
-                    wt_state = _wt.compute_state()
+                    wt_state = _time_intel('wing', _wt.compute_state)
                     if _socketio is not None and wt_state:
                         try:
                             _socketio.emit('intel:wing_update', wt_state)
@@ -5173,7 +5193,7 @@ def _intel_compute_loop():
                 from connectors import gamma_skyline as _gs
                 if (now - _intel_skyline_last_compute_ts) >= _INTEL_SKYLINE_INTERVAL_S:
                     _intel_skyline_last_compute_ts = now
-                    sky_state = _gs.compute_state()
+                    sky_state = _time_intel('gamma_skyline', _gs.compute_state)
                     if _socketio is not None and sky_state:
                         try:
                             _socketio.emit('intel:gamma_skyline', sky_state)
@@ -5191,7 +5211,7 @@ def _intel_compute_loop():
                 from connectors import dealer_warehouse as _dw
                 if (now - _intel_warehouse_last_compute_ts) >= _INTEL_WAREHOUSE_INTERVAL_S:
                     _intel_warehouse_last_compute_ts = now
-                    wh_state = _dw.compute_state()
+                    wh_state = _time_intel('dealer_warehouse', _dw.compute_state)
                     if _socketio is not None and wh_state:
                         try:
                             _socketio.emit('intel:dealer_warehouse', wh_state)
@@ -5216,6 +5236,19 @@ def _intel_compute_loop():
                             log.debug(f"[INTEL] events emit err: {_e}")
             except Exception as _ee:
                 log.debug(f"[INTEL] events compute err: {_ee}")
+
+            # Per-iteration summary: log if total compute time was >500ms
+            # OR every 6th iteration (~30s) regardless, so we have a visible
+            # baseline. Sorted descending — biggest hog at the front.
+            _iter_total_ms = (time.perf_counter() - _iter_t0) * 1000.0
+            if _intel_compute_times and (_iter_total_ms > 500.0 or _intel_iter_count % 6 == 0):
+                _ranked = sorted(_intel_compute_times.items(), key=lambda x: -x[1])
+                _summary = ', '.join(f'{n}={ms:.0f}ms' for n, ms in _ranked)
+                _level = 'warning' if _iter_total_ms > 500.0 else 'info'
+                if _level == 'warning':
+                    log.warning(f"[INTEL-PERF] iter#{_intel_iter_count} total={_iter_total_ms:.0f}ms — {_summary}")
+                else:
+                    log.info(f"[INTEL-PERF] iter#{_intel_iter_count} total={_iter_total_ms:.0f}ms — {_summary}")
 
             time.sleep(5)
         except Exception as _outer:

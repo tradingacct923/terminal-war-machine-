@@ -967,6 +967,17 @@ _MOVERS_TTL = 300               # 5 min
 _fundamentals_cache: dict = {}  # {symbol: (data, ts)}
 _FUNDAMENTALS_TTL = 3600        # 1 hr
 
+# ── /api/vprofile cache (2026-05-06) ─────────────────────────────────────────
+# Frontend polls vprofile from multiple panes simultaneously. Each call is
+# expensive: walks ~7000+ 1m candles, builds level-by-level profile, returns
+# 200KB-900KB of JSON. Worst observed: mode=session&step=1h returning 872KB
+# in 3.26s, monopolizing the gevent loop while WebSocket buffers fill →
+# TopStepX RSTs. With a 3-second TTL, the first poll computes; subsequent
+# polls within 3s return cached body. Profile changes ~once per minute on
+# new bar close, so 3s staleness is invisible to the user.
+_vprofile_cache: dict = {}       # {(query_string,): (response_body_bytes, ts)}
+_VPROFILE_TTL = 3.0              # seconds
+
 
 @app.route("/api/movers")
 def api_movers():
@@ -4909,6 +4920,20 @@ def api_vprofile():
         from datetime import datetime
         import pytz
 
+        # ── 3-second TTL cache (2026-05-06) ──────────────────────────────
+        # Without this, multiple frontend panes polling vprofile cause
+        # repeated 0.4-3.3s computes and 200KB-900KB JSON serializations
+        # that monopolize the gevent loop and trigger WS buffer pile-up
+        # → TopStepX RSTs. Cache key = full query string (different params
+        # get different entries). Profile changes ~once per minute on new
+        # bar close, so 3s staleness is invisible.
+        _cache_key = request.query_string  # bytes including all params
+        _now_t = _t.time()
+        _cached = _vprofile_cache.get(_cache_key)
+        if _cached and (_now_t - _cached[1]) < _VPROFILE_TTL:
+            from flask import Response
+            return Response(_cached[0], mimetype='application/json')
+
         symbol = request.args.get("symbol", "NQ").upper()
         mode = request.args.get("mode", "session")
         row_count = int(request.args.get("row_count", 0))
@@ -5415,7 +5440,18 @@ def api_vprofile():
         }
         if step_profiles is not None:
             result["step_profiles"] = step_profiles
-        return jsonify(result)
+        # Cache serialized body so subsequent polls within TTL skip the
+        # entire compute path. Cap cache size at 32 entries (well above
+        # the ~4 distinct query patterns observed).
+        from flask import Response
+        import json as _json_mod
+        _body = _json_mod.dumps(result).encode('utf-8')
+        if len(_vprofile_cache) > 32:
+            # drop oldest entries (rare — only if param explosion)
+            for _k in list(_vprofile_cache.keys())[:-16]:
+                _vprofile_cache.pop(_k, None)
+        _vprofile_cache[_cache_key] = (_body, _now_t)
+        return Response(_body, mimetype='application/json')
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -5853,7 +5889,7 @@ def _ensure_workers_started():
             print(f"[startup] WARNING: workers failed to start: {_e}", flush=True)
 
 # ── Socket.IO event handlers ──
-def _push_candle_history(sid, symbol='NQ', tf='1m', max_candles=200):
+def _push_candle_history(sid, symbol='NQ', tf='1m', max_candles=5000):
     """Push candle history to a specific client. Returns True if data was sent."""
     try:
         from background_engine.l2_worker import get_candles, _CURRENT_CANDLE
@@ -5986,7 +6022,7 @@ def handle_subscribe(data):
     except Exception:
         pass  # l2_worker not yet loaded on cold start
     # Push candle history — retry if worker hasn't loaded yet
-    if not _push_candle_history(sid, symbol, tf, max_candles=300):
+    if not _push_candle_history(sid, symbol, tf, max_candles=5000):
         print(f"[Socket.IO] No candles for {symbol}/{tf} yet, scheduling deferred push for {sid}...")
         import threading
         t = threading.Thread(target=_deferred_candle_push, args=(sid, symbol, tf), daemon=True)
