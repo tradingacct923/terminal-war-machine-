@@ -1,6 +1,12 @@
 """""
 Altaris Dev - Flask Web Server
 """
+# gevent monkey-patch must run before anything else imports threading/ssl/socket.
+# Without this, background threads (Schwab bridge, TopStepX L2 worker, L2 push
+# loop) make blocking syscalls that stall the gevent WS hub — every pane lags
+# together. Patching converts those calls to cooperative yields.
+from gevent import monkey; monkey.patch_all()
+
 import sys, os, json, secrets, hashlib, time, threading
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dotenv import load_dotenv
@@ -28,7 +34,7 @@ if not any(isinstance(h, RotatingFileHandler) for h in _root_logger.handlers):
 
 from flask import Flask, jsonify, request, send_from_directory, Response, make_response
 from flask_cors import CORS
-from flask_socketio import SocketIO, emit
+from flask_socketio import SocketIO, emit, join_room, leave_room
 from data_provider import fetch_all
 from config import TICKER as _DEFAULT_TICKER
 
@@ -119,13 +125,34 @@ def save_config(data: dict):
 def get_ticker():
     return load_config().get("ticker", _DEFAULT_TICKER).upper()
 
+
+# ── Symbol prefix alias (added 2026-05-04) ──────────────────────────────────
+# Schwab's chain/quote APIs require `$` prefix for cash indices ($SPX, $VIX,
+# $NDX, $VXN, $RUT, $DJX). Frontend/CLI consumers commonly send the bare
+# symbol. This helper auto-prefixes so callers don't need to know.
+# Already-prefixed inputs ($SPX, etc.) and non-index tickers (QQQ, AAPL) pass
+# through unchanged.
+_INDEX_ALIASES = frozenset({"SPX", "VIX", "NDX", "VXN", "RUT", "DJX"})
+
+def _resolve_index_ticker(t):
+    if not t: return t
+    t = t.upper()
+    return "$" + t if t in _INDEX_ALIASES else t
+
+
 # ── Thundering-herd guard for fetch_all ──────────────────────────────────────
 # When the cache is cold and N threads hit /api/data simultaneously, only one
 # actually calls fetch_all(); the rest wait on the Event and reuse the result.
 _fetch_locks: dict = {}          # ticker → threading.Event
 _fetch_results: dict = {}        # ticker → (data, timestamp)
 _fetch_meta_lock = _threading.Lock()
-_FETCH_TTL = 28                  # seconds — slightly under the 30s refresh interval
+_FETCH_TTL = 180                 # 2026-05-01 (post-fix audit): bumped 28→60→180.
+                                 # 60s wasn't enough — /api/data still hit 10s cache-miss
+                                 # spikes that drained Tradier WS Recv-Q to 7MB backlog
+                                 # in 16 min. 180s = 6× UI poll cadence, so cache hits on
+                                 # 5 of every 6 calls. Combined with gevent yields in
+                                 # _build_exposures (data_provider.py:267), the misses no
+                                 # longer monopolize the event loop.
 
 def _cached_fetch_all(ticker: str):
     """Thread-safe, single-flight wrapper around fetch_all."""
@@ -196,8 +223,11 @@ _BUILD_VER = _build_ver()
 _PUBLIC_PATHS = {"/login", "/api/login", "/login.css", "/style.css", "/app.js",
                  "/login.html", "/index.html"}
 _PUBLIC_PREFIXES = ("/web/",)
-_PUBLIC_EXTENSIONS = ('.css', '.js', '.html', '.ico', '.png', '.jpg', '.svg',
+_PUBLIC_EXTENSIONS = ('.css', '.js', '.ico', '.png', '.jpg', '.svg',
                       '.woff', '.woff2', '.ttf', '.map')
+# .html intentionally NOT public — explicit _PUBLIC_PATHS lists allowed HTMLs
+# (login.html, index.html). A blanket .html bypass risks exposing any future
+# debug/partial/template that lands in web/ unauthenticated.
 
 @app.before_request
 def require_auth():
@@ -221,15 +251,38 @@ def require_auth():
        any(path.startswith(b) for b in blocked_paths):
         return jsonify({"error": "Forbidden"}), 403
 
-    # Check token — cookie (browser nav) OR header (API calls)
+    # Check token — cookie (browser nav) OR header (API calls) OR the
+    # paste-link `?token=` query parameter. The query-string path is
+    # accepted to preserve paste-and-go nav from token-bearing URLs;
+    # to limit URL-token exposure (server logs, browser history, Referer
+    # headers — OWASP A02:2021), we PROMOTE a valid query-string token
+    # to an HttpOnly cookie + 302 to a clean URL on first hit (handled
+    # below in this function), so the second-and-subsequent navigation
+    # carries the token only in the cookie.
+    qs_tok = request.args.get("token", "")
     tok = (request.cookies.get("wm_auth")
-           or request.headers.get("X-Auth-Token")
-           or request.args.get("token", ""))
+           or request.headers.get("X-Auth-Token", "")
+           or qs_tok)
     if not _valid_token(tok):
         if path.startswith("/api/"):
             return jsonify({"error": "Unauthorized"}), 401
         resp = Response(status=302, headers={"Location": "/login"})
         resp.delete_cookie("wm_auth")
+        return resp
+    # Promote a query-string token to a cookie + redirect to a clean URL
+    # so subsequent navigation no longer carries the token in URLs (which
+    # leak to server logs, browser history, and Referer headers).
+    if qs_tok and not request.cookies.get("wm_auth") and not path.startswith("/api/"):
+        # Strip the token from the URL while preserving any other query args.
+        from urllib.parse import urlencode, parse_qsl
+        other = [(k, v) for (k, v) in parse_qsl(request.query_string.decode('utf-8'),
+                                                 keep_blank_values=True)
+                 if k != 'token']
+        clean_qs = ('?' + urlencode(other)) if other else ''
+        clean_url = path + clean_qs
+        resp = Response(status=302, headers={"Location": clean_url})
+        resp.set_cookie("wm_auth", qs_tok, max_age=_TOKEN_TTL,
+                        httponly=True, samesite="Lax")
         return resp
     return None
 
@@ -283,6 +336,15 @@ def index():
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     resp.headers["Pragma"] = "no-cache"
     resp.headers["Expires"] = "0"
+    # If auth came in via ?token=/header (cookie missing), persist it as cookie
+    # so subsequent API calls from app.js don't 401 and bounce to /login.
+    query_tok = request.args.get("token", "")
+    header_tok = request.headers.get("X-Auth-Token", "")
+    if not request.cookies.get("wm_auth"):
+        for tok in (query_tok, header_tok):
+            if tok and _valid_token(tok):
+                resp.set_cookie("wm_auth", tok, max_age=_TOKEN_TTL, httponly=True, samesite="Lax")
+                break
     return resp
 
 # ── Debug: prove what HTML is being served ────────────────────────────────────
@@ -818,6 +880,57 @@ def _schwab_chain_raw(ticker, exp_date):
     return options, data.get("underlyingPrice", 0)
 
 
+def _schwab_chain_range(ticker, from_date, to_date, strike_count=50):
+    """Get options chain from Schwab across a date RANGE (multiple expirations
+    in one REST call). Returns (flattened_options, underlying_price).
+
+    Unlike `_schwab_chain_raw` which hits `/chains` once per expiration,
+    this pulls every expiration in [from_date, to_date] in a single call —
+    the Tradier single-name Greek poller uses this to cover the full 60-day
+    expiration ladder with one REST roundtrip per ticker.
+
+    Each output dict carries an `exp_date` field so callers can group/sort by
+    expiration without needing a second API call.
+    """
+    data = _schwab_get("/marketdata/v1/chains", {
+        "symbol": ticker,
+        "contractType": "ALL",
+        "includeUnderlyingQuote": "true",
+        "fromDate": from_date,
+        "toDate": to_date,
+        "strikeCount": strike_count,
+    })
+    options = []
+    for leg_key in ("callExpDateMap", "putExpDateMap"):
+        exp_map = data.get(leg_key, {})
+        for _exp_str, strikes in exp_map.items():
+            _exp_iso = _exp_str.split(":")[0] if _exp_str else ""
+            for strike_str, contracts in strikes.items():
+                for c in contracts:
+                    options.append({
+                        "strike":         float(strike_str),
+                        "option_type":    "call" if leg_key == "callExpDateMap" else "put",
+                        "bid":            c.get("bid", 0),
+                        "ask":            c.get("ask", 0),
+                        "last":           c.get("last", 0),
+                        "volume":         c.get("totalVolume", 0),
+                        "open_interest":  c.get("openInterest", 0),
+                        "delta":          c.get("delta"),
+                        "gamma":          c.get("gamma"),
+                        "theta":          c.get("theta"),
+                        "vega":           c.get("vega"),
+                        "rho":            c.get("rho"),
+                        "volatility":     c.get("volatility"),
+                        "in_the_money":   c.get("inTheMoney", False),
+                        "dte":            c.get("daysToExpiration", 0),
+                        "symbol":         c.get("symbol", ""),
+                        "mark":           c.get("mark", 0),
+                        "mark_change":    c.get("markChange", 0),
+                        "exp_date":       _exp_iso,
+                    })
+    return options, data.get("underlyingPrice", 0)
+
+
 def _schwab_movers(symbol_id: str, sort: str = "PERCENT_CHANGE_UP",
                    frequency: str = "0") -> list:
     """Top movers within an index. symbol_id ∈ $SPX, $DJI, $COMPX, $IUXX, INDEX_ALL.
@@ -933,10 +1046,24 @@ def api_debug_flow_live():
 
 @app.route("/api/_debug/subs")
 def api_debug_subs():
-    """PUBLIC — dump exactly what option symbols we subscribed to."""
+    """PUBLIC — dump exactly what option symbols we subscribed to.
+    Includes:
+      - SPX/VIX/SPY: from _subscribed_option_symbols_by_ticker (subscribed
+        via _subscribe_options_for_ticker, populates the dict)
+      - QQQ: from _ndx_option_symbols (subscribed via _subscribe_qqq_options,
+        which doesn't populate the dict — this endpoint adds it explicitly)
+      - per-ticker source breakdown of _per_ticker_gex (streaming vs REST
+        rotation contributions, post-2026-04-29 chain-rotation ship)
+    """
     try:
         from background_engine import schwab_bridge as sb
-        subs = getattr(sb, '_subscribed_option_symbols_by_ticker', {})
+        subs = dict(getattr(sb, '_subscribed_option_symbols_by_ticker', {}))
+        # QQQ uses a separate global (_ndx_option_symbols), not the dict —
+        # inject it so the endpoint reflects ALL ticker subscriptions.
+        ndx_syms = getattr(sb, '_ndx_option_symbols', None) or []
+        if ndx_syms:
+            subs['QQQ'] = ndx_syms
+
         out = {}
         for ticker, syms in subs.items():
             # Bucket by YYMMDD expiration
@@ -945,12 +1072,36 @@ def api_debug_subs():
                 d = s[6:12] if len(s) >= 12 else '?'
                 by_date[d] = by_date.get(d, 0) + 1
             out[ticker] = {
-                'total': len(syms),
-                'by_expiration': by_date,
-                'first_3': syms[:3],
-                'last_3': syms[-3:],
+                'streamed_total': len(syms),
+                'by_expiration':  by_date,
+                'first_3':        syms[:3],
+                'last_3':         syms[-3:],
             }
-        return jsonify(out)
+
+        # Source breakdown for _per_ticker_gex (streaming vs REST rotation).
+        # Each entry has _source='rest_rotation' if it came via the chain
+        # rotation thread; otherwise it came from the LEVELONE_OPTIONS stream.
+        per_ticker_gex = getattr(sb, '_per_ticker_gex', {}) or {}
+        gex_breakdown = {}
+        for ticker, contract_dict in per_ticker_gex.items():
+            if not isinstance(contract_dict, dict): continue
+            stream_n = 0
+            rest_n   = 0
+            for sym_key, info in contract_dict.items():
+                if not isinstance(info, dict): continue
+                if info.get('_source') == 'rest_rotation':
+                    rest_n += 1
+                else:
+                    stream_n += 1
+            gex_breakdown[ticker] = {
+                'total_in_per_ticker_gex': stream_n + rest_n,
+                'from_streaming':          stream_n,
+                'from_rest_rotation':      rest_n,
+            }
+        return jsonify({
+            'subscriptions': out,
+            'per_ticker_gex_breakdown': gex_breakdown,
+        })
     except Exception as e:
         import traceback
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
@@ -964,7 +1115,86 @@ def api_debug_flow_diag():
         acc = get_accumulator()
         if acc is None:
             return jsonify({"note": "accumulator not ready"})
-        return jsonify(acc.get_diag())
+        result = acc.get_diag()
+        # Add Schwab _on_options_quote per-symbol call/distinct-trade counters
+        # for SPY/QQQ over-count forensic. If calls > distinct_tts for many
+        # symbols, Schwab is firing _on_options_quote multiple times per real
+        # trade (over-count). If calls == distinct_tts, the over-count is
+        # elsewhere (e.g., per-print magnitude amplification).
+        try:
+            from background_engine import schwab_bridge as _sb
+            ooq = getattr(_sb, '_on_options_quote', None)
+            if ooq is not None:
+                q_diag = getattr(ooq, '_q_diag', {})
+                summary = {}
+                top_repeat_syms = []
+                for sym, e in q_diag.items():
+                    calls = e['calls']; n_tts = len(e['tt_set'])
+                    if calls > n_tts:
+                        top_repeat_syms.append((sym, calls, n_tts, calls - n_tts))
+                top_repeat_syms.sort(key=lambda x: x[3], reverse=True)
+                summary['n_symbols_seen'] = len(q_diag)
+                summary['n_symbols_with_repeats'] = len(top_repeat_syms)
+                summary['top_repeat_syms'] = [
+                    {'sym': s, 'calls': c, 'distinct_tts': n, 'repeats': r}
+                    for s, c, n, r in top_repeat_syms[:20]
+                ]
+                summary['totals'] = {
+                    'total_calls':       sum(e['calls'] for e in q_diag.values()),
+                    'total_distinct_tts': sum(len(e['tt_set']) for e in q_diag.values()),
+                }
+                summary['oversize_drops'] = getattr(ooq, '_oversize_drops', 0)
+                result['schwab_quote_repeat_diag'] = summary
+        except Exception as ex:
+            result['schwab_quote_repeat_err'] = str(ex)
+        return jsonify(result)
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+
+@app.route("/api/_debug/kv")
+def api_debug_kv():
+    """Phase 19 — dump KvEstimator state per ticker.
+    Shows current k_v, sample count, and source (fitted vs default).
+
+    Optional: ?ticker=QQQ for single-ticker view.
+    """
+    try:
+        from connectors.kv_estimator import get_kv_estimator
+        from connectors.flow_accumulator import FLOW_ACC_KV_ADJUST_ENABLED
+        est = get_kv_estimator()
+        ticker = request.args.get('ticker')
+        out = {
+            'phase19_enabled': FLOW_ACC_KV_ADJUST_ENABLED,
+            'state': est.get_state(ticker),
+        }
+        # Show comparison vs raw cum_signed if accumulator is up
+        try:
+            from connectors.flow_accumulator import get_accumulator
+            acc = get_accumulator()
+            if acc is not None:
+                state = acc.get_state()
+                kv_compare = []
+                for t in state.get('tickers', []):
+                    name = t.get('ticker')
+                    adj = t.get('cum_signed_all', 0)
+                    raw = t.get('cum_signed_all_raw', 0)
+                    if abs(raw) > 0:
+                        diff_pct = 100 * (adj - raw) / raw
+                    else:
+                        diff_pct = 0
+                    kv_compare.append({
+                        'ticker': name,
+                        'cum_signed_all_adjusted': adj,
+                        'cum_signed_all_raw': raw,
+                        'diff_pct': round(diff_pct, 3),
+                        'kv_adjusted_trades': t.get('kv_adjusted_trades', 0),
+                    })
+                out['flow_comparison'] = kv_compare
+        except Exception:
+            pass
+        return jsonify(out)
     except Exception as e:
         import traceback
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
@@ -1027,6 +1257,1105 @@ def api_alerts_walls():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/_debug/walls_audit")
+def api_debug_walls_audit():
+    """PUBLIC — dump engine's cached walls + raw per-ticker GEX state so we can
+    verify the _per_ticker_gex → _compute_walls_for → update_walls pipeline."""
+    try:
+        from connectors.alert_engine import get_engine
+        from background_engine import schwab_bridge as sb
+        eng = get_engine()
+        ticker = _resolve_index_ticker(request.args.get("ticker", "QQQ"))
+        out = {"ticker": ticker, "server_time": time.time()}
+        if eng is not None:
+            with eng._lock:
+                h = eng._history.get(ticker)
+                out["engine_walls"] = dict(h.last_walls) if (h and h.last_walls) else None
+        try:
+            out["computed_walls"] = sb._compute_walls_for(ticker)
+        except Exception as e:
+            out["computed_walls_error"] = str(e)
+        per_contract = sb._per_ticker_gex.get(ticker, {}) if hasattr(sb, '_per_ticker_gex') else {}
+        out["contract_count"] = len(per_contract)
+        if per_contract:
+            # Aggregate across expirations for the top-10 view (same as
+            # _compute_walls_for). This is what the wall detector sees.
+            agg = {}
+            for e in per_contract.values():
+                k = e.get('strike'); s = e.get('side')
+                if not k or not s: continue
+                a = agg.setdefault(k, {'call_oi':0,'put_oi':0,'call_gamma':0,'put_gamma':0})
+                if s == 'call':
+                    a['call_oi']    += e.get('oi',0) or 0
+                    a['call_gamma'] += e.get('gamma_dollars',0) or 0
+                else:
+                    a['put_oi']    += e.get('oi',0) or 0
+                    a['put_gamma'] += e.get('gamma_dollars',0) or 0
+            out["strike_count"] = len(agg)
+            strikes = sorted(agg.keys())
+            out["strike_range"] = [strikes[0], strikes[-1]]
+            out["top_call_oi"]    = sorted([(k,a['call_oi'])    for k,a in agg.items()], key=lambda x:-x[1])[:10]
+            out["top_put_oi"]     = sorted([(k,a['put_oi'])     for k,a in agg.items()], key=lambda x:-x[1])[:10]
+            out["top_call_gamma"] = [(k,round(g,0)) for k,g in sorted([(k,a['call_gamma']) for k,a in agg.items()], key=lambda x:-x[1])[:10]]
+            out["top_put_gamma"]  = [(k,round(g,0)) for k,g in sorted([(k,a['put_gamma'])  for k,a in agg.items()], key=lambda x:-x[1])[:10]]
+            out["spot"] = sb._latest_spot_by_ticker.get(ticker, 0) if hasattr(sb, '_latest_spot_by_ticker') else 0
+        return jsonify(out)
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "tb": traceback.format_exc()}), 500
+
+
+@app.route("/api/ndx_wgc")
+def api_ndx_wgc():
+    """Last emitted NDX Weighted Gamma Composite payload. Used by AI panel
+    to hydrate the NDX regime cell on init so it's not blank until the next
+    socket emit."""
+    try:
+        from background_engine import schwab_bridge as _sb
+        return jsonify(_sb.get_latest_wgc())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/hedge_pressure/<ticker>")
+def api_hedge_pressure(ticker):
+    """Per-strike hedge-pressure snapshot (Γ · ΔS%, V · Δσpt, C · Δt_hr).
+
+    Signed shares convention: positive = dealers must BUY, negative = SELL.
+    Pure read of the GreekSurface double-buffered snapshot — no new compute.
+    """
+    try:
+        from background_engine import schwab_bridge as _sb
+        return jsonify(_sb.get_hedge_pressure_state(ticker.upper()))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/hedge_pressure/<ticker>/by_exchange")
+def api_hedge_pressure_by_exchange(ticker):
+    """Per-exchange HP_γ rollup (posted vs caught share × dn_gamma at each
+    contract's strike). Identifies which venue is carrying which side of the
+    dealer-γ book."""
+    try:
+        from background_engine import schwab_bridge as _sb
+        return jsonify(_sb.get_hedge_pressure_by_exchange(ticker.upper()))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/hedge_pressure/<ticker>/alignment/<path:contract_sym>")
+def api_hedge_pressure_alignment(ticker, contract_sym):
+    """WITH-MM / AGAINST-MM alignment for a specific OSI contract on <ticker>.
+    path:<contract_sym> handles any spacing / slashes in OSI strings."""
+    try:
+        from background_engine import schwab_bridge as _sb
+        return jsonify(_sb.get_alignment_for_contract(contract_sym))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/intel/sweeps")
+def api_intel_sweeps():
+    """Recent multi-strike option sweeps detected by connectors/sweep_detector.
+
+    Sweeps are 3+ adjacent option-strike prints walking within 500ms, all
+    aggressor-side same direction. Each record carries:
+      - leg-by-leg detail (sym, strike, size, price, exch, ts_ms)
+      - notional Δ exposure (DERIVED from Σ size × Δ × 100)
+      - venue_sequence (institutional fingerprint)
+
+    DESCRIPTIVE ONLY — no directional prediction. The dealer-hedging hypothesis
+    was falsified (+0.27% edge vs base rate, n=15,902). expected_hedge_side
+    and hf_alignment fields were stripped 2026-05-05.
+
+    Live: a new sweep also fires Socket.IO 'intel:sweep_alert' event
+    (push) — REST returns history for pane initial-load.
+
+    Query params:
+      limit: max records to return (default 50, max 200)
+    """
+    try:
+        from connectors import sweep_detector as _swd
+        limit = int(request.args.get('limit', 50))
+        sweeps = _swd.get_recent_sweeps(min(max(limit, 1), 200))
+        return jsonify({
+            'sweeps':      sweeps,
+            'server_time': time.time(),
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
+
+
+@app.route("/api/_debug/greek_routing")
+def api_debug_greek_routing():
+    """Phase 21 (2026-05-01): Diagnostic for explicit Greek source routing.
+
+    Returns counts and samples per source so we can verify:
+      - Every print resolved to ONE explicit source (Schwab WS / REST / BSM)
+      - schwab_ws_cache_miss + schwab_rest_cache_miss are ~0 in steady state
+        (non-zero indicates startup race or Schwab WS reconnect)
+      - Routing set sizes match expected subscriptions
+    """
+    try:
+        from background_engine import schwab_bridge as _sb
+        ws_set = getattr(_sb, '_SCHWAB_WS_OSIS', set())
+        rest_set = getattr(_sb, '_SCHWAB_REST_OSIS', set())
+        stats = dict(getattr(_sb, '_GREEK_ROUTING_STATS', {}))
+        # Compute totals
+        total_routed = sum(v for k, v in stats.items()
+                           if k in ('schwab_ws', 'schwab_rest', 'bsm'))
+        total_misses = sum(v for k, v in stats.items() if 'cache_miss' in k)
+        # Sample 5 symbols from each set for debugging
+        ws_sample = list(ws_set)[:5]
+        rest_sample = list(rest_set)[:5]
+        # Detect overlap
+        overlap = ws_set & rest_set
+        return jsonify({
+            'sets': {
+                'schwab_ws_size':   len(ws_set),
+                'schwab_rest_size': len(rest_set),
+                'overlap_size':     len(overlap),
+                'ws_sample':        ws_sample,
+                'rest_sample':      rest_sample,
+            },
+            'routing_stats': stats,
+            'totals': {
+                'total_routed':       total_routed,
+                'total_cache_misses': total_misses,
+                'cache_miss_pct':     (
+                    round(100 * total_misses / total_routed, 3)
+                    if total_routed > 0 else 0
+                ),
+            },
+            'health': {
+                'schwab_ws_healthy':   stats.get('schwab_ws_cache_miss', 0) < total_routed * 0.01,
+                'schwab_rest_healthy': stats.get('schwab_rest_cache_miss', 0) < total_routed * 0.01,
+            },
+            'server_time': time.time(),
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
+
+
+@app.route("/api/_debug/sweep_detector/stats")
+def api_debug_sweep_detector_stats():
+    """Diagnostic counters from connectors/sweep_detector.
+
+    Used to verify the detector is receiving prints (prints_seen),
+    classifying correctly (sweeps_detected vs dropped buckets), and
+    that the per-underlying buffer is pruning properly.
+    """
+    try:
+        from connectors import sweep_detector as _swd
+        return jsonify(_swd.get_stats())
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
+
+
+@app.route("/api/intel/pin/<ticker>")
+def api_intel_pin(ticker):
+    """End-of-day pin location prediction for <ticker>.
+
+    Pin = strike where 0DTE price is mechanically pulled toward at expiration
+    due to dealer Γ exposure. Source: connectors/pin_convergence.compute_pin_state.
+
+    Live: Socket.IO 'intel:pin_update' is pushed every 15s during last hour
+    and 60s otherwise (during RTH). REST returns the same cached state plus
+    time-evolution `history` for trajectory rendering.
+
+    Response includes per-strike pin_probability + score components
+    (gamma_score, distance_score, oi_score, warehouse_strength, time_amplifier),
+    expected_close + 95% CI band (ci_low/ci_high), walls overlay (max_pain,
+    gamma_flip, call_wall, put_wall), and data_ts/server_time freshness.
+    """
+    try:
+        from connectors import pin_convergence as _pc
+        return jsonify(_pc.get_state(ticker.upper()))
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
+
+
+@app.route("/api/intel/hedge_forecast/<ticker>")
+def api_intel_hedge_forecast(ticker):
+    """OBSERVABLE-ONLY hedge state for <ticker>.
+
+    2026-05-04: stripped of directional predictions. Audit on n=1,910 paired
+    records showed sign_match 53.3% vs majority-class baseline 62.7% — model
+    is 9.4 pts WORSE than constantly predicting positive. Calibration ratio
+    median 0.002 (3 orders of magnitude off). See /tmp/hedge_forecaster_audit.py.
+
+    Returns observable Γ-pressure × velocity components only:
+      - spot, velocity_per_sec, velocity_cv, velocity_stable
+      - distance_to_flip, gamma_flip, hp_gamma_shares_1pct
+      - observed_5min_actual / observed_5min_count (equity tape over [T-300, T])
+
+    The full predictive `forecasts` dict is still computed by
+    hedge_forecaster.compute_forecast and written to disk ledgers
+    (hedge_forecast_outcomes_*, hedge_forecast_paired_*) for offline research.
+    It is NOT exposed via REST or socket. Re-enable when a measured-edge
+    model replaces the dealer-hedging hypothesis.
+    """
+    try:
+        from connectors import hedge_forecaster as _hf
+        full = _hf.get_state(ticker.upper())
+        descriptive = {
+            'ticker':                full.get('ticker'),
+            'spot':                  full.get('spot'),
+            'velocity_per_sec':      full.get('velocity_per_sec'),
+            'velocity_cv':           full.get('velocity_cv'),
+            'velocity_stable':       full.get('velocity_stable'),
+            'distance_to_flip':      full.get('distance_to_flip'),
+            'gamma_flip':            full.get('gamma_flip'),
+            'hp_gamma_shares_1pct':  full.get('hp_gamma_shares_1pct'),
+            'observed_5min_actual':  full.get('observed_5min_actual'),
+            'observed_5min_count':   full.get('observed_5min_count'),
+            'data_ts':               full.get('data_ts'),
+            'server_time':           full.get('server_time'),
+            'reason':                full.get('reason'),  # for empty-state messaging
+            'kind':                  'observable_state',
+        }
+        return jsonify(descriptive)
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
+
+
+@app.route("/api/intel/events")
+def api_intel_events():
+    """Event Calendar — earnings + macro events that drive vol regime expectation.
+
+    Source: connectors/event_calendar.compute_state — reads
+    data/event_calendar.json (operator-maintained), reloaded every 60 min.
+
+    Live: Socket.IO 'intel:events' is pushed every 60 min during RTH.
+
+    Response includes:
+      - next_event: nearest upcoming event with time_until_sec / hours
+      - in_24hr / in_7d: time-bucketed event lists
+      - vol_warning: {active, event, hours} — flagged if high-impact within 24hr
+      - source: 'json_file' / 'no_data'
+      - last_loaded_ts, server_time, reason
+    """
+    try:
+        from connectors import event_calendar as _ec
+        return jsonify(_ec.get_state())
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
+
+
+@app.route("/api/intel/dealer_warehouse")
+def api_intel_dealer_warehouse():
+    """Dealer Warehouse Quality — per-strike commitment scorer.
+
+    Source: connectors/dealer_warehouse.compute_state — DERIVED from:
+      mm_attribution._capture (posted_bid/ask_time, caught_at_top, caught_count)
+      via Schwab OPTIONS_BOOK (≤120 contracts in budget) +
+      Schwab TIMESALE_OPTIONS / Tradier prints
+
+    Live: Socket.IO 'intel:dealer_warehouse' is pushed every 10s during RTH.
+
+    Response includes:
+      - strikes: per-K {posted_time_s, caught_at_top, catch_rate,
+        commitment_score, phantom_score, classification, top_exch}
+      - top_committed: 5 strikes with highest commitment_score
+      - top_phantom: 5 strikes with highest phantom_score
+      - totals: aggregate posted_time + caught_at_top + contract_count
+      - history: last 20 min of evolution samples
+    """
+    try:
+        from connectors import dealer_warehouse as _dw
+        return jsonify(_dw.get_state())
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
+
+
+@app.route("/api/intel/gamma_skyline")
+def api_intel_gamma_skyline():
+    """Gamma Skyline — per-strike dealer Γ$ vertical-bar visualization.
+
+    Source: connectors/gamma_skyline.compute_state — DERIVED from:
+      schwab_bridge._latest_qqq + _greek_surface.export_hedge_pressure(spot)
+      + wall_signals._walls['QQQ']
+
+    Live: Socket.IO 'intel:gamma_skyline' is pushed every 5s during RTH.
+
+    Response includes:
+      - spot, atm_strike, band_low/high (ATM ±$VIEWABLE_BAND_DOLLARS)
+      - strikes: per-K {dn_gamma, dn_vanna, dn_charm, oi_call, oi_put,
+        hp_gamma_shares_1pct, dist_pct, dn_gamma_norm, is_atm}
+      - totals: aggregate hedge pressures + dn_gamma_max_abs (bar normalizer)
+      - walls: call_wall / put_wall / gamma_flip / gamma_call_wall /
+        gamma_put_wall (overlay vertical lines)
+      - history: last 20 min of summary samples for evolution tracking
+    """
+    try:
+        from connectors import gamma_skyline as _gs
+        return jsonify(_gs.get_state())
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
+
+
+@app.route("/api/intel/wing_tracker")
+def api_intel_wing_tracker():
+    """0DTE Wing Tracker — far-OTM call/put aggressor flow classifier.
+
+    Source: connectors/wing_tracker.compute_state — DERIVED from each Tradier
+    options-print event (filtered to ANALYSIS_TICKER='QQQ' AND today's DTE).
+
+    Live: Socket.IO 'intel:wing_update' is pushed every 5s during RTH.
+
+    Response includes:
+      - spot, dte_key, session_age_sec
+      - zones: per-zone {ATM/NEAR_WING/DEEP_WING/TAIL} aggregates
+        (total_volume, total_premium, buy/sell counts/sizes, call/put split)
+      - top_strikes: 10 most active strikes with aggressor skew
+      - recent_prints: last 20 wing prints (size, price, aggressor, zone)
+      - regime: NORMAL / ACTIVE / EXTREME / NO_DATA
+      - regime_strength [0..1], rationale
+      - net_dealer_delta_est_shares (DERIVED proxy)
+    """
+    try:
+        from connectors import wing_tracker as _wt
+        return jsonify(_wt.get_state())
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
+
+
+@app.route("/api/_debug/regression")
+def api_debug_regression():
+    """Surface latest regression-runner summary. Reads logs/regression_summary.json
+    written by scripts/regression_runner.py (cron'd weekly).
+
+    Returns the headline per-panel hit-rates so the operator can check
+    CONFIGURED-constant validation status without re-running the script.
+    """
+    try:
+        path = os.path.join(os.path.dirname(__file__), 'logs', 'regression_summary.json')
+        if not os.path.exists(path):
+            return jsonify({
+                'available': False,
+                'reason':    'no regression report yet — run scripts/regression_runner.py',
+            })
+        with open(path, 'r') as f:
+            data = json.load(f)
+        data['available'] = True
+        return jsonify(data)
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
+
+
+@app.route("/api/_debug/wing_tracker/stats")
+def api_debug_wing_tracker_stats():
+    """Diagnostic counters for wing_tracker (print accept/reject rate)."""
+    try:
+        from connectors import wing_tracker as _wt
+        return jsonify(_wt.get_stats())
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
+
+
+@app.route("/api/intel/vix_term")
+def api_intel_vix_term():
+    """Cross-asset vol regime dashboard — VIX-family + cross-asset vol comparator.
+
+    Source: connectors/vix_term_structure.compute_state — DERIVED from:
+      schwab_bridge._latest_spot_by_ticker[VIX/VIX1D/VVIX/VXN/RVX/VXD/VXEEM/
+                                            SKEW/OVX/GVZ/TNX]
+
+    Live: Socket.IO 'intel:vix_term' is pushed every 10s during RTH.
+
+    Response includes:
+      - tickers: per-symbol live spot
+      - spreads: vxn-vix, rvx-vix, vxd-vix, vxeem-vix, vix1d-vix
+      - ratios: vix1d/vix (backwardation indicator), vvix/vix (institutional bid)
+      - regime: classifier result {CALM_CONTANGO/NORMAL/TECH_DIVERGENCE/
+                ELEVATED/STRESS_CONTANGO/STRESS_BACKWARDATION/VVIX_DIVERGENCE/
+                NO_DATA}
+      - regime_strength [0..1], rationale (human-readable)
+      - history: last 60 min of samples for trajectory display
+    """
+    try:
+        from connectors import vix_term_structure as _vts
+        return jsonify(_vts.get_state())
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
+
+
+@app.route("/api/intel/spx_qqq_divergence")
+def api_intel_spx_qqq_divergence():
+    """SPX-vs-QQQ option-flow regime divergence comparator.
+
+    Source: connectors/spx_qqq_divergence.compute_state — DERIVED from:
+      QQQ: greek_surface.export_hedge_pressure (totals + per-strike) + wall_signals
+      SPX: _per_ticker_gex['SPX'] aggregation + _compute_walls_for('SPX')
+
+    Live: Socket.IO 'intel:spx_qqq_divergence' is pushed every 10s during RTH.
+
+    Response includes:
+      - spx / qqq snapshot (spot, gamma_flip, distance_to_flip_pct, regime,
+        hp_gamma_shares_1pct, walls, pcr_oi, net_dealer_gamma_dollars)
+      - divergence: verdict (ALIGNED_BULL/ALIGNED_BEAR/DIVERGENT_REGIME/
+        DIVERGENT_MAGNITUDE/NEUTRAL/NO_DATA), strength [0..1],
+        regime_aligned, magnitude_ratio, flip_distance_diff_pct, rationale
+      - history: last 60 min of samples for trajectory display
+    """
+    try:
+        from connectors import spx_qqq_divergence as _sqd
+        return jsonify(_sqd.get_state())
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
+
+
+@app.route("/api/intel/svi/<ticker>")
+def api_intel_svi(ticker):
+    # Init rate-limit cache on first call (function-attr pattern; thread-safe
+    # under gevent since dict assignment is atomic in CPython)
+    if not hasattr(api_intel_svi, '_last_ledger_ts'):
+        api_intel_svi._last_ledger_ts = {}
+    """SVI volatility surface fit + per-strike residuals (Phase 20A).
+
+    Lifts arbitrage-free SVI parametrisation (Gatheral 2004 + Gatheral &
+    Jacquier 2014) from Nguyen (2025) "Regime-Adaptive Volatility Surface
+    Arbitrage" with our total-variance objective fix for small-T stability.
+
+    Query params:
+        exp:  expiration date YYYY-MM-DD (default: nearest expiry)
+
+    Source: connectors/svi_surface.compute_svi_state — feeds raw Schwab
+    chain through SVI calibration. RMSE typically 18-41bp on QQQ chains
+    at DTE [0, 3, 14, 21] (validated by scripts/svi_live_smoke.py).
+
+    Response:
+        ticker, exp_date, spot, T_years, dte
+        params: {a, b, rho, m, sigma}
+        rmse_bp, pass_rmse, butterfly_arb
+        strikes: per-K {K, k, side, iv_obs, iv_fit, residual_bp, vega_weight, oi, volume, delta}
+        aggregate_residual (vega-weighted mean residual in bp)
+        aggregate_z (z-score over rolling 20-sample window)
+        data_ts
+    """
+    from datetime import datetime, date
+    ticker = ticker.upper()
+    req_exp = request.args.get('exp', '').strip()
+
+    try:
+        # Resolve expiration
+        raw_dates = _schwab_expirations(ticker)
+        if not raw_dates:
+            return jsonify({'error': f'No expirations found for {ticker}'}), 404
+
+        today = date.today()
+        if req_exp and req_exp in raw_dates:
+            exp_date = req_exp
+        else:
+            exp_date = raw_dates[0]
+
+        try:
+            dte = (datetime.strptime(exp_date, '%Y-%m-%d').date() - today).days
+        except Exception:
+            dte = 0
+
+        # Fetch chain
+        raw_chain, schwab_underlying = _schwab_chain_raw(ticker, exp_date)
+        if not raw_chain:
+            return jsonify({'error': f'Empty chain for {ticker} {exp_date}'}), 404
+
+        spot = float(schwab_underlying) if schwab_underlying else float(_schwab_quote(ticker) or 0)
+        if spot <= 0:
+            return jsonify({'error': f'Cannot resolve spot for {ticker}'}), 503
+
+        # Map raw Schwab fields to our SVI input format
+        chain_for_svi = []
+        for c in raw_chain:
+            iv_decimal = c.get('volatility')   # Schwab: decimal (e.g. 0.20 = 20%)
+            if iv_decimal is None:
+                continue
+            try:
+                iv_pct = float(iv_decimal)     # Schwab "volatility" is % (e.g. 20.0 not 0.20)
+            except (TypeError, ValueError):
+                continue
+            chain_for_svi.append({
+                'strike':  c.get('strike'),
+                'type':    c.get('option_type'),
+                'iv':      iv_pct,
+                'oi':      c.get('open_interest', 0) or 0,
+                'volume':  c.get('volume', 0) or 0,
+                'delta':   c.get('delta', 0) or 0,
+            })
+
+        from connectors.svi_surface import compute_svi_state, append_outcome_record
+        state = compute_svi_state(
+            ticker=ticker,
+            exp_date=exp_date,
+            spot=spot,
+            chain=chain_for_svi,
+            dte=dte,
+        )
+
+        # Append to outcome ledger — rate-limited to 1 record per 30s per
+        # (ticker, exp_date) key. Audit issue #11 (2026-05-01): without this,
+        # multi-pane polling at 30s interval would write N×panes/min instead
+        # of 2/min, bloating the ledger over a session.
+        if 'error' not in state:
+            _now = time.time()
+            _key = f"{ticker}:{exp_date}"
+            _last = api_intel_svi._last_ledger_ts.get(_key, 0)  # type: ignore[attr-defined]
+            if _now - _last >= 30.0:
+                api_intel_svi._last_ledger_ts[_key] = _now  # type: ignore[attr-defined]
+                try:
+                    append_outcome_record({
+                        'ts':                     state['data_ts'],
+                        'ticker':                 ticker,
+                        'exp_date':               exp_date,
+                        'dte':                    dte,
+                        'spot':                   state['spot'],
+                        'rmse_bp':                state['rmse_bp'],
+                        'aggregate_residual_bp':  state['aggregate_residual'],
+                        'aggregate_z':            state.get('aggregate_z'),
+                        'samples_used':           state['samples_used'],
+                        'butterfly_arb':          state['butterfly_arb'],
+                        'params':                 state['params'],
+                    })
+                except Exception:
+                    pass
+
+        return jsonify(state)
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
+
+
+@app.route("/api/conviction/<ticker>")
+def api_conviction(ticker):
+    """Composite Conviction Score (CCS) for <ticker>.
+
+    Synthesizes regime, hedge pressure, options flow, MM attribution, time-of-day
+    and cross-asset confirm into a single 0–100 score with direction + size
+    recommendation. Source: connectors/conviction_score.py. Live cadence 5s.
+    """
+    try:
+        from connectors.conviction_score import get_scorer
+        s = get_scorer()
+        if s is None:
+            return jsonify({'error': 'scorer not initialized'}), 503
+        return jsonify(s.get_state(ticker.upper()))
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
+
+
+@app.route("/api/conviction")
+def api_conviction_all():
+    """All tickers' CCS state (currently QQQ only; SPY coming next)."""
+    try:
+        from connectors.conviction_score import get_scorer
+        s = get_scorer()
+        if s is None:
+            return jsonify({'tickers': {}})
+        return jsonify({'tickers': s.get_all_states()})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route("/api/option_flow/oi_split/<ticker>")
+def api_option_flow_oi_split(ticker):
+    """Opening vs Closing flow split via streaming OI velocity classification.
+
+    Returns:
+      {
+        ticker,
+        opening_long_signed,   closing_short_signed,
+        opening_short_signed,  closing_long_signed,
+        unknown_signed,
+        opening_signed_flow,   closing_signed_flow,
+        oi_classified_share,
+      }
+    Pan & Poteshman (2006) — opening flow has next-day forward return alpha;
+    closing flow does not. Use opening_signed_flow as the directional alpha
+    component, not raw cum_signed_all.
+    """
+    try:
+        from connectors.flow_accumulator import get_accumulator
+        acc = get_accumulator()
+        if acc is None:
+            return jsonify({'error': 'flow_accumulator not initialized'}), 503
+        states = acc.get_all_states() or {}
+        s = states.get(ticker.upper())
+        if not s:
+            return jsonify({'ticker': ticker.upper(), 'note': 'no data'}), 200
+        return jsonify({
+            'ticker': ticker.upper(),
+            'cohort_opening_long_signed':  s.get('cohort_opening_long_signed'),
+            'cohort_opening_long_trades':  s.get('cohort_opening_long_trades'),
+            'cohort_closing_short_signed': s.get('cohort_closing_short_signed'),
+            'cohort_closing_short_trades': s.get('cohort_closing_short_trades'),
+            'cohort_opening_short_signed': s.get('cohort_opening_short_signed'),
+            'cohort_opening_short_trades': s.get('cohort_opening_short_trades'),
+            'cohort_closing_long_signed':  s.get('cohort_closing_long_signed'),
+            'cohort_closing_long_trades':  s.get('cohort_closing_long_trades'),
+            'cohort_unknown_signed':       s.get('cohort_unknown_signed'),
+            'cohort_unknown_trades':       s.get('cohort_unknown_trades'),
+            'opening_signed_flow':         s.get('opening_signed_flow'),
+            'closing_signed_flow':         s.get('closing_signed_flow'),
+            'unknown_signed_flow':         s.get('unknown_signed_flow'),
+            'oi_classified_share':         s.get('oi_classified_share'),
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
+
+
+@app.route("/api/option_flow/by_exchange/<ticker>")
+def api_option_flow_by_exchange(ticker):
+    """Per-venue MIC flow attribution for a ticker.
+
+    Returns top venues sorted by |signed flow| with their share %, plus
+    concentration_score (top1 share). Concentration ≥ 0.60 = institutional
+    algo single-venue routing. < 0.30 = retail spread across many brokers.
+    Source: connectors/flow_accumulator.get_by_exchange.
+    """
+    try:
+        from connectors.flow_accumulator import get_accumulator
+        acc = get_accumulator()
+        if acc is None:
+            return jsonify({'error': 'flow_accumulator not initialized'}), 503
+        top_n = max(1, min(50, int(request.args.get('top_n', 10))))
+        return jsonify(acc.get_by_exchange(ticker.upper(), top_n=top_n))
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
+
+
+@app.route("/api/option_flow/mispricing/<ticker>")
+def api_option_flow_mispricing(ticker):
+    """Theoretical-vs-Mark mispricing snapshot for a ticker.
+
+    Surfaces strikes where the trade-weighted average premium-to-theoretical
+    is significantly non-zero. ≥+3% = institutional accumulation paying above
+    BSM fair value. ≤-3% = forced/distressed selling below fair value.
+    Source: connectors/flow_accumulator.get_mispricing.
+    """
+    try:
+        from connectors.flow_accumulator import get_accumulator
+        acc = get_accumulator()
+        if acc is None:
+            return jsonify({'error': 'flow_accumulator not initialized'}), 503
+        top_n = max(1, min(50, int(request.args.get('top_n', 10))))
+        return jsonify(acc.get_mispricing(ticker.upper(), top_n=top_n))
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
+
+
+@app.route("/api/mm_attribution/contracts")
+def api_mm_attribution_contracts():
+    """Ranked list of contracts tracked by mm_attribution. Ranking metric is
+    chosen via `metric` query param: events | prints | formations. Result
+    size bounded by `limit` (default 50) — pure display cap, not a filter
+    that discards structural events.
+    """
+    try:
+        from connectors import mm_attribution as _mma
+        metric = (request.args.get("metric") or "events").lower()
+        limit = max(1, min(500, int(request.args.get("limit", 50))))
+        rows = _mma.rank_contracts(metric=metric, limit=limit)
+        return jsonify({
+            "summary": _mma.module_summary(),
+            "metric": metric,
+            "contracts": rows,
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "tb": traceback.format_exc()}), 500
+
+
+@app.route("/api/mm_attribution/contract/<path:sym>")
+def api_mm_attribution_contract(sym):
+    """Full live state for one contract — ribbon, formations, capture, last
+    impulse. Polled every ~1s by the pane while the user has a contract
+    locked. Auth is automatic via `before_request`."""
+    try:
+        from connectors import mm_attribution as _mma
+        return jsonify(_mma.contract_state(sym))
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "tb": traceback.format_exc()}), 500
+
+
+@app.route("/api/mm_attribution/impulse/<path:sym>")
+def api_mm_attribution_impulse(sym):
+    """Lookup a specific closed impulse for a contract by `print_ts`. Used
+    by the pane's prev/next navigation over the impulse history. Without
+    `print_ts`, returns the list of recent impulses for that contract."""
+    try:
+        from connectors import mm_attribution as _mma
+        pts = request.args.get("print_ts")
+        if pts:
+            rec = _mma.impulse_for_print(sym, float(pts))
+            return jsonify(rec or {})
+        limit = max(1, min(500, int(request.args.get("limit", 50))))
+        return jsonify({"impulses": _mma.impulse_list(sym, limit=limit)})
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "tb": traceback.format_exc()}), 500
+
+
+@app.route("/api/_debug/wall_signals/sym_cache_counts")
+def api_debug_wall_signals_sym_cache_counts():
+    """Group sym_cache keys by OSI underlying prefix (first token).
+    Reveals whether SPX / SPY options are polluting the _live_gex strikes."""
+    try:
+        from background_engine import schwab_bridge as _sb
+        sym_cache = getattr(_sb._on_options_quote, '_sym_cache', {})
+        counts: dict = {}
+        for sym in sym_cache.keys():
+            prefix = (sym.split()[0] if sym else '').upper()
+            counts[prefix] = counts.get(prefix, 0) + 1
+        # Also inspect the strike padding of each underlying — last 8 chars of OSI.
+        # A QQQ spot-area strike prints as e.g. "00660000"; SPX prints as "07000000".
+        samples = {}
+        for sym in sym_cache.keys():
+            prefix = (sym.split()[0] if sym else '').upper()
+            if prefix not in samples:
+                samples[prefix] = sym
+        return jsonify({
+            'counts': counts,
+            'samples': samples,
+            'total_symbols': len(sym_cache),
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "tb": traceback.format_exc()}), 500
+
+
+@app.route("/api/_debug/wall_signals/symbols")
+def api_debug_wall_signals_symbols():
+    """Look up which Schwab option symbols feed a given strike in _live_gex.
+    Query: ?strike=7000 — returns matching symbols in the sym_cache. Lets us
+    tell 'SPX leakage' from 'QQQ LEAP w/ adjusted strike' at a glance."""
+    try:
+        from background_engine import schwab_bridge as _sb
+        strike_q = request.args.get("strike")
+        if not strike_q:
+            return jsonify({"error": "pass ?strike=<float>"}), 400
+        strike_target = float(strike_q)
+        sym_cache = getattr(_sb._on_options_quote, '_sym_cache', {})
+        matches = []
+        for sym, rec in sym_cache.items():
+            s = rec.get('strike') or 0
+            if abs(float(s or 0) - strike_target) < 1e-6:
+                matches.append({
+                    'symbol': sym,
+                    'strike': s,
+                    'contract_type': rec.get('contract_type'),
+                    'open_interest': rec.get('open_interest'),
+                    'underlying': rec.get('underlying_symbol', rec.get('underlying')),
+                    'dte': rec.get('dte'),
+                    'mark': rec.get('mark'),
+                })
+        return jsonify({
+            'strike': strike_target,
+            'match_count': len(matches),
+            'matches': matches[:20],
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "tb": traceback.format_exc()}), 500
+
+
+@app.route("/api/_debug/wall_signals/walls")
+def api_debug_wall_signals_walls():
+    """Dump current internal _walls state of connectors.wall_signals plus the
+    top-5 OI strikes from schwab_bridge._live_gex. Lets us compare what
+    wall_signals is seeing vs. what the raw GEX map says. No auth (under
+    /api/_debug)."""
+    try:
+        from connectors import wall_signals as _ws
+        from background_engine import schwab_bridge as _sb
+        live_gex = getattr(_sb, '_live_gex', {}) or {}
+        top_call = sorted(live_gex.items(), key=lambda kv: -(kv[1] or {}).get('call_oi', 0))[:8]
+        top_put  = sorted(live_gex.items(), key=lambda kv: -(kv[1] or {}).get('put_oi', 0))[:8]
+        return jsonify({
+            'wall_signals_walls': _ws._walls,
+            'wall_signals_spot':  _ws._spot,
+            'live_gex_strike_count': len(live_gex),
+            'top_call_oi': [{'strike': k, 'call_oi': v.get('call_oi'), 'put_oi': v.get('put_oi')}
+                            for k, v in top_call],
+            'top_put_oi':  [{'strike': k, 'call_oi': v.get('call_oi'), 'put_oi': v.get('put_oi')}
+                            for k, v in top_put],
+            'latest_qqq': getattr(_sb, '_latest_qqq', 0.0),
+            'latest_nq':  getattr(_sb, '_latest_nq', 0.0),
+            'ratio':      getattr(_sb, '_nq_qqq_ratio', 0.0),
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "tb": traceback.format_exc()}), 500
+
+
+@app.route("/api/wall_signals/state")
+def api_wall_signals_state():
+    """Current wall_signals snapshot for the requested ticker (default QQQ).
+    Query params: ?ticker=QQQ&proximity_pct=0.0025&lookback_sec=60 — only the
+    `ticker` param is required; the others default to CONFIGURED module values
+    (see connectors/wall_signals.py). All three params are runtime choices —
+    no internal magnitude thresholds."""
+    try:
+        from connectors import wall_signals as _ws
+        ticker = _resolve_index_ticker(request.args.get("ticker", "QQQ"))
+        prox = request.args.get("proximity_pct")
+        lookback = request.args.get("lookback_sec")
+        kwargs = {}
+        if prox is not None:
+            kwargs["proximity_pct"] = float(prox)
+        if lookback is not None:
+            kwargs["lookback_sec"] = float(lookback)
+        return jsonify(_ws.get_state(ticker, **kwargs))
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "tb": traceback.format_exc()}), 500
+
+
+@app.route("/api/wall_signals/ledger")
+def api_wall_signals_ledger():
+    """Ground-truth hit-rate summary for wall_signals crossings.
+
+    Bucket 1 (actionable): fire-time C or F ≥ actionable_threshold
+    Bucket 2 (baseline):   fire-time scores below threshold
+
+    The GAP (actionable_rate − baseline_rate) is the measured edge. When
+    <10 entries exist, stats are not meaningful — the UI should show the
+    total and a "collecting data…" state.
+
+    Query params (all optional, runtime-chosen, no CONFIGURED defaults baked
+    into the math):
+      hours                — window to compute stats over (default 24)
+      actionable_threshold — score floor for "actionable" bucket (default 0.3)
+      hit_delta_nq         — signed NQ move to count as a hit (default 10)
+      limit                — number of recent entries to return (default 20)
+    """
+    try:
+        from connectors import signal_ledger as _slg
+        hours = float(request.args.get("hours", 24.0))
+        at = request.args.get("actionable_threshold")
+        hd = request.args.get("hit_delta_nq")
+        limit = int(request.args.get("limit", 20))
+        at_f = float(at) if at is not None else None
+        hd_f = float(hd) if hd is not None else None
+        return jsonify({
+            "summary": _slg.get_hit_rate(
+                hours=hours,
+                actionable_threshold=at_f,
+                hit_delta_nq=hd_f,
+            ),
+            "recent": _slg.get_recent(limit=limit),
+            "wall_state": _slg.get_wall_state(
+                _resolve_index_ticker(request.args.get("ticker", "QQQ"))
+            ),
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "tb": traceback.format_exc()}), 500
+
+
+@app.route("/api/_debug/wall_signals/ledger_raw")
+def api_debug_wall_signals_ledger_raw():
+    """Unfiltered ledger dump for debugging the outcome tracker. No auth
+    (under /api/_debug)."""
+    try:
+        from connectors import signal_ledger as _slg
+        return jsonify({
+            "entries": list(_slg._ledger),
+            "wall_state_all": {
+                f"{k[0]}:{k[1]}": v for k, v in _slg._wall_state.items()
+            },
+            "cap": _slg.LEDGER_CAP,
+            "actionable_threshold": _slg.ACTIONABLE_THRESHOLD,
+            "hit_delta_nq": _slg.HIT_DELTA_NQ,
+            "windows_min": list(_slg.WINDOWS_MIN),
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "tb": traceback.format_exc()}), 500
+
+
+@app.route("/api/_debug/chain_rotation/stats")
+def api_debug_chain_rotation_stats():
+    """Live status of the REST chain rotation (cap-blocked tail backfill).
+    Reports: enabled flag, today's request count vs daily budget, last cycle
+    timestamp + per-ticker merge counts, 429 streak + last 429 ts.
+    Used to verify Schwab REST polling stays under safety thresholds.
+    """
+    try:
+        import time as _time
+        from background_engine import schwab_bridge as _sb
+        return jsonify({
+            'enabled':                getattr(_sb, '_chain_rotation_enabled', False),
+            'thread_started':         getattr(_sb, '_chain_rotation_thread_started', False),
+            'is_rth_now':             _sb._is_rth_now() if hasattr(_sb, '_is_rth_now') else None,
+            'cycle_interval_s':       getattr(_sb, '_CHAIN_ROTATION_INTERVAL_S', None),
+            'tickers':                getattr(_sb, '_CHAIN_ROTATION_TICKERS', []),
+            'requests_today':         getattr(_sb, '_chain_rotation_request_count', 0),
+            'daily_budget':           getattr(_sb, '_CHAIN_ROTATION_DAILY_BUDGET', 0),
+            'budget_pct_used':        round(
+                100 * getattr(_sb, '_chain_rotation_request_count', 0) /
+                max(getattr(_sb, '_CHAIN_ROTATION_DAILY_BUDGET', 1), 1), 2
+            ),
+            'last_cycle_ts':          getattr(_sb, '_chain_rotation_last_cycle_ts', 0.0),
+            'last_cycle_age_s':       round(
+                _time.time() - getattr(_sb, '_chain_rotation_last_cycle_ts', 0.0), 1
+            ) if getattr(_sb, '_chain_rotation_last_cycle_ts', 0.0) > 0 else None,
+            'last_merge_per_ticker':  dict(getattr(_sb, '_chain_rotation_last_merge_count', {})),
+            'lifetime_merged':        getattr(_sb, '_chain_rotation_lifetime_merged', 0),
+            '429_streak':             getattr(_sb, '_chain_rotation_429_streak', 0),
+            'last_429_ts':            getattr(_sb, '_chain_rotation_last_429_ts', 0.0),
+            'last_reset_date':        getattr(_sb, '_chain_rotation_last_reset_date', None),
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "tb": traceback.format_exc()}), 500
+
+
+@app.route("/api/_debug/tradier/equity_stats")
+def api_debug_tradier_equity_stats():
+    """Live Tradier equity-timesale counters per ticker. Verifies the
+    TIMESALE_EQUITY code=11 gap-fill is firing (QQQ + SPY equity tape
+    via Tradier WS, not L1 size-delta synthesis)."""
+    try:
+        import time as _time
+        from background_engine import schwab_bridge as _sb
+        return jsonify({
+            'subscribed':         list(getattr(_sb, '_TRADIER_EQUITY_TICKERS', ())),
+            'counters':           dict(getattr(_sb, '_tradier_equity_timesale_stats', {})),
+            'recent_buffer_sizes': {
+                sym: len(buf) for sym, buf in
+                getattr(_sb, '_recent_equity_prints', {}).items()
+            },
+            'retention_s':        getattr(_sb, 'EQUITY_PRINT_RETENTION_S', None),
+            'server_ts':          _time.time(),
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "tb": traceback.format_exc()}), 500
+
+
+@app.route("/api/_debug/tradier/stats")
+def api_debug_tradier_stats():
+    """Live Tradier streamer health + timesale counters (total / enriched /
+    bare / qqq). Used to verify the WS stays connected and QQQ prints flow."""
+    try:
+        import time as _time
+        from background_engine import schwab_bridge as _sb
+        streamer = getattr(_sb, '_tradier_streamer', None)
+        ws = streamer.stats() if streamer else {'running': False}
+        ts_stats = dict(getattr(_sb, '_tradier_timesale_stats', {}))
+        last_msg = getattr(streamer, '_last_msg_ts', 0.0) if streamer else 0.0
+        # Flow accumulator feed diagnostics (post-Tradier-feed fix)
+        _ott = getattr(_sb, '_on_tradier_timesale', None)
+        flow_diag = dict(getattr(_ott, '_flow_diag', {})) if _ott else {}
+        return jsonify({
+            'ws': ws,
+            'last_msg_ts': last_msg,
+            'silence_s': (_time.time() - last_msg) if last_msg > 0 else -1,
+            'timesale_counters': ts_stats,
+            'flow_accumulator_feed_diag': flow_diag,
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "tb": traceback.format_exc()}), 500
+
+
+@app.route("/api/_debug/dealer_prints/summary")
+def api_debug_dealer_prints_summary():
+    """Descriptive distributions over recent dealer prints — NO thresholds.
+    `window_s` query param (default 300). See connectors/dealer_print_capture.py
+    for the capture schema."""
+    try:
+        from connectors import dealer_print_capture as _dpc
+        window_s = float(request.args.get("window_s", 300))
+        return jsonify(_dpc.live_summary(window_s=window_s))
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "tb": traceback.format_exc()}), 500
+
+
+@app.route("/api/_debug/dealer_prints/recent")
+def api_debug_dealer_prints_recent():
+    """Last N captured prints with top-of-book context for live panel display.
+    `n` query param (default 100, max 10000 — was 500 prior to 2026-05-04)."""
+    try:
+        from connectors import dealer_print_capture as _dpc
+        n = max(1, min(10000, int(request.args.get("n", 100))))
+        return jsonify({"prints": _dpc.recent_prints(n=n)})
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "tb": traceback.format_exc()}), 500
+
+
+@app.route("/api/_debug/capture_rate")
+def api_debug_capture_rate():
+    """Live capture-rate metrics for the dealer-print pipeline. Replaces the
+    expensive disk-log audits as a continuous SLA monitor. See
+    `connectors/dealer_print_capture.capture_rate()` for field definitions.
+
+    Healthy session shape (steady-state, >30 min after start):
+        rate ≈ 1 − pending / in_total
+    A drift > 0.001 suggests prints are being dropped between input and disk.
+    A non-zero stale_pending means the flush loop is failing to write entries
+    whose enrichment window already closed.
+
+    2026-05-05 — added `tradier_conns` array. Each entry exposes per-conn
+    uptime/disconnect history so reconnects are visible without log-grep.
+    """
+    try:
+        from connectors import dealer_print_capture as _dpc
+        out = _dpc.capture_rate()
+        try:
+            from background_engine import schwab_bridge as _sb
+            out['tradier_conns'] = _sb.get_tradier_conn_stats()
+        except Exception as e:
+            out['tradier_conns'] = {'error': str(e)[:120]}
+        return jsonify(out)
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "tb": traceback.format_exc()}), 500
+
+
+@app.route("/api/_debug/alert_samples")
+def api_debug_alert_samples():
+    """PUBLIC — dump AlertEngine per-ticker 1Hz samples (ts, s0, sa, u0, ua, spot).
+    Used for post-hoc verification of forward spot movement after specific alerts."""
+    try:
+        from connectors.alert_engine import get_engine
+        eng = get_engine()
+        if eng is None:
+            return jsonify({"ready": False})
+        ticker = _resolve_index_ticker(request.args.get("ticker", "QQQ"))
+        with eng._lock:
+            h = eng._history.get(ticker)
+            if not h:
+                return jsonify({"ready": True, "ticker": ticker, "samples": []})
+            # Samples are (ts, s0, sa, u0, ua, spot)
+            samples = [
+                {"ts": s[0], "s0": s[1], "sa": s[2], "spot": s[5]}
+                for s in h.samples
+            ]
+        return jsonify({"ready": True, "ticker": ticker, "n": len(samples), "samples": samples})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/alerts/state")
 def api_alerts_state():
     """Per-ticker current-state matrix for the AI Panel 4×3 UI.
@@ -1044,6 +2373,608 @@ def api_alerts_state():
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/alerts/outcomes")
+def api_alerts_outcomes():
+    """Realized hit rates for fired alerts per (ticker, type, bucket, horizon).
+    Each alert's direction is checked against spot(t+300s), +900s, +1800s.
+    Returns empirical win rate, avg |move%|, and expectancy (signed move).
+    Query param: days=N (default 7)."""
+    try:
+        from connectors.alert_engine import get_engine
+        eng = get_engine()
+        if eng is None:
+            return jsonify({"ready": False, "outcomes": {}})
+        days = int(request.args.get('days', 7))
+        days = max(1, min(days, 90))
+        return jsonify({
+            "ready": True,
+            "server_time": time.time(),
+            "days": days,
+            "horizons_sec": [300, 900, 1800],
+            "outcomes": eng.get_hit_rates(last_n_days=days),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/_debug/vix_term_structure")
+def api_debug_vix_term_structure():
+    """Implied VIX term structure via put-call parity on VIX options.
+
+    Schwab does NOT support /VX futures market data (every /VX* symbol
+    returns invalidSymbols). To still get the term curve we use the
+    well-known dealer technique: the underlying for VIX options at a
+    given expiration IS the VIX FUTURE for that expiration. Put-call
+    parity at the ATM strike recovers the forward:
+
+        F(T) ≈ C(K_atm, T) − P(K_atm, T) + K_atm × e^(−r·T)
+
+    where r ≈ short-rate (we use $IRX). For short-dated VIX options
+    (DTE < 60), the discount factor is ~1.000 to 0.997 — sub-cent
+    impact on F. We carry it for completeness.
+
+    Returns a curve [{exp, dte, atm_strike, call_mark, put_mark,
+    implied_forward, vs_spot}] sorted by DTE.
+    """
+    try:
+        import math, time as _t
+        spot_vix = float(_schwab_quote('$VIX') or 0)
+        if spot_vix <= 0:
+            return jsonify({'error': 'spot VIX unavailable', 'spot': 0}), 503
+        # Risk-free rate from $IRX (CBOE 13-week T-bill).
+        # CBOE convention: $IRX is published as yield × 10 (e.g. 35.9 = 3.59%
+        # actual yield). Same for $TNX (43.62 = 4.362% 10-year). To get the
+        # decimal rate for e^(-r·T) discounting: IRX / 1000.
+        # Earlier code used /100.0 which gave a 10× inflated rate (35.9%) and
+        # over-discounted the back-month implied forwards by ~10%.
+        try:
+            irx = float(_schwab_quote('$IRX') or 0)
+            r = irx / 1000.0  # CBOE × 10 convention
+            # Sanity clamp: real short rates 0–10%; reject obviously bad data
+            if not (0.0 < r < 0.10):
+                r = 0.045
+        except Exception:
+            r = 0.045  # fallback
+        try:
+            exps = _schwab_expirations('$VIX') or []
+        except Exception as _e:
+            return jsonify({'error': f'expirations fetch failed: {_e}'}), 500
+        rows = []
+        # Walk every expiration Schwab returns (typically ~13 weeklies out
+        # to 9 months). Each chain fetch is one REST call (~50-150ms), so
+        # the full curve takes ~1-2 seconds — acceptable for a debug endpoint
+        # that's polled occasionally rather than per-tick.
+        for exp_date in exps:
+            try:
+                chain, underlying = _schwab_chain_raw('$VIX', exp_date)
+            except Exception:
+                continue
+            if not chain:
+                continue
+            # Find ATM strike (closest to spot VIX)
+            strikes = sorted({float(c['strike']) for c in chain if c.get('strike', 0) > 0})
+            if not strikes:
+                continue
+            atm = min(strikes, key=lambda k: abs(k - spot_vix))
+            call = next((c for c in chain
+                         if abs(float(c.get('strike', 0)) - atm) < 0.01
+                         and c.get('option_type') == 'call'), None)
+            put  = next((c for c in chain
+                         if abs(float(c.get('strike', 0)) - atm) < 0.01
+                         and c.get('option_type') == 'put'), None)
+            if not call or not put:
+                continue
+            call_mark = float(call.get('mark') or call.get('last') or 0)
+            put_mark  = float(put.get('mark')  or put.get('last')  or 0)
+            dte = int(call.get('dte') or 0)
+            # ── Book-staleness check via streamer cache ──
+            # If the displayed bid/ask is wide but indicative is tight,
+            # Schwab's `mark` from REST may be a stale midpoint. Pull the
+            # latest streamer-side `book_indicative_mid` and use it
+            # instead when book_stale=True. Falls back to mark cleanly.
+            try:
+                from background_engine import schwab_bridge as _sb
+                _cache = getattr(_sb._on_options_quote, '_sym_cache', {}) or {}
+                _csym = call.get('symbol', '')
+                _psym = put.get('symbol', '')
+                _ccache = _cache.get(_csym) or {}
+                _pcache = _cache.get(_psym) or {}
+                if _ccache.get('book_stale') and _ccache.get('book_indicative_mid'):
+                    call_mark = float(_ccache['book_indicative_mid'])
+                if _pcache.get('book_stale') and _pcache.get('book_indicative_mid'):
+                    put_mark = float(_pcache['book_indicative_mid'])
+                _book_stale = bool(_ccache.get('book_stale') or _pcache.get('book_stale'))
+            except Exception:
+                _book_stale = False
+            # Discount factor e^(-r·T) where T = dte/365
+            T = dte / 365.0
+            disc = math.exp(-r * T)
+            implied_fwd = call_mark - put_mark + atm * disc
+            rows.append({
+                'exp':             exp_date,
+                'dte':             dte,
+                'atm_strike':      round(atm, 2),
+                'call_mark':       round(call_mark, 4),
+                'put_mark':        round(put_mark, 4),
+                'discount_factor': round(disc, 6),
+                'implied_forward': round(implied_fwd, 4),
+                'vs_spot':         round(implied_fwd - spot_vix, 4),
+                'book_stale':      _book_stale,  # marks expirations whose ATM book was gapped
+            })
+        rows.sort(key=lambda x: x['dte'])
+        # Spreads
+        spreads = {}
+        if len(rows) >= 2:
+            spreads['front_minus_second'] = round(rows[0]['implied_forward'] - rows[1]['implied_forward'], 4)
+        if len(rows) >= 4:
+            spreads['front_minus_fourth'] = round(rows[0]['implied_forward'] - rows[3]['implied_forward'], 4)
+        # Regime tag
+        regime = 'unknown'
+        if len(rows) >= 2:
+            if rows[0]['implied_forward'] < rows[1]['implied_forward']:
+                regime = 'contango'  # back > front = normal
+            elif rows[0]['implied_forward'] > rows[1]['implied_forward']:
+                regime = 'backwardation'  # front > back = stress
+            else:
+                regime = 'flat'
+        return jsonify({
+            'spot_vix':       round(spot_vix, 2),
+            'risk_free_rate': round(r, 4),
+            'curve':          rows,
+            'spreads':        spreads,
+            'regime':         regime,
+            'ts':             _t.time(),
+            'note':           'Implied via put-call parity on VIX options chain. /VX futures unavailable on Schwab.',
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
+
+
+@app.route("/api/_debug/vol_indices")
+def api_debug_vol_indices():
+    """Live dashboard of every CBOE vol-related index Schwab is streaming.
+
+    Surfaces each index with its current value + structural interpretation:
+      VIX     CBOE 30-day SPX vol             (the headline number)
+      VXN     CBOE 30-day NDX vol             (more relevant for QQQ hedging)
+      VVIX    Vol-of-VIX-options              (institutional tail-hedge demand)
+      SKEW    OTM-put crash premium           (>135 = elevated tail risk)
+      VIX1D   1-day VIX (overnight gap vol)   (front-of-curve)
+
+    Plus computed derivatives:
+      VXN/VIX ratio   structural NDX-vs-SPX vol bias (typically 1.20-1.40)
+      VIX1D/VIX       overnight discount/premium
+      VVIX regime     calm <90, normal 90-100, stressed 100-120, panic >120
+      SKEW regime     normal <130, elevated 130-140, crash-hedge >140
+    """
+    try:
+        import time as _t
+        from background_engine import schwab_bridge as _sb
+        cache = getattr(_sb, '_latest_spot_by_ticker', {}) or {}
+        vix    = float(cache.get('VIX', 0) or 0)
+        vxn    = float(cache.get('VXN', 0) or 0)
+        vvix   = float(cache.get('VVIX', 0) or 0)
+        skew   = float(cache.get('SKEW', 0) or 0)
+        vix1d  = float(cache.get('VIX1D', 0) or 0)
+
+        # Regime labels (structural, not magic-number tuned — these are
+        # CBOE-published regime bands).
+        def _vvix_regime(v):
+            if v <= 0: return 'unknown'
+            if v < 90: return 'calm'
+            if v < 100: return 'normal'
+            if v < 120: return 'stressed'
+            return 'panic'
+        def _skew_regime(s):
+            if s <= 0: return 'unknown'
+            if s < 130: return 'normal'
+            if s < 140: return 'elevated'
+            return 'crash_hedge_bid'
+
+        return jsonify({
+            'ts':    _t.time(),
+            'indices': {
+                'VIX':   {'last': vix,   'desc': 'CBOE SPX 30-day implied vol'},
+                'VXN':   {'last': vxn,   'desc': 'CBOE NDX 30-day implied vol'},
+                'VVIX':  {'last': vvix,  'desc': 'Vol-of-VIX (vol on VIX options)',
+                          'regime': _vvix_regime(vvix)},
+                'SKEW':  {'last': skew,  'desc': 'OTM-put tail-risk premium',
+                          'regime': _skew_regime(skew)},
+                'VIX1D': {'last': vix1d, 'desc': '1-day VIX (overnight gap vol)'},
+            },
+            'derived': {
+                'vxn_minus_vix':    round(vxn - vix, 3) if (vxn and vix) else None,
+                'vxn_over_vix':     round(vxn / vix, 3) if (vxn and vix) else None,
+                'vix1d_minus_vix':  round(vix1d - vix, 3) if (vix1d and vix) else None,
+                'vix1d_over_vix':   round(vix1d / vix, 3) if (vix1d and vix) else None,
+            },
+            'note':  'All 5 indices stream from Schwab LEVELONE_EQUITIES with '
+                     'realtime=true. VVIX/SKEW/VIX1D added 2026-04-28.',
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
+
+
+@app.route("/api/_debug/vxn_history")
+def api_debug_vxn_history():
+    """Historical VXN bars via Schwab /pricehistory.
+
+    Schwab carries spot $VXN (we stream it live) but not VXN options.
+    /pricehistory works for the index symbol — pulls daily/intraday bars
+    for realized-vol-of-VXN computations + IV-RV spread tracking.
+
+    Query params:
+      ?period=1   period count (default 1)
+      ?period_type=month   day/month/year/ytd (default month)
+      ?freq=daily          minute/daily/weekly/monthly (default daily)
+      ?freq_count=1        (default 1)
+    """
+    try:
+        period       = int(request.args.get('period', 1))
+        period_type  = request.args.get('period_type', 'month')
+        freq         = request.args.get('freq', 'daily')
+        freq_count   = int(request.args.get('freq_count', 1))
+        # /pricehistory accepts $VXN since the spot streams (verified)
+        data = _schwab_get('/marketdata/v1/pricehistory', {
+            'symbol':              '$VXN',
+            'periodType':          period_type,
+            'period':              period,
+            'frequencyType':       freq,
+            'frequency':           freq_count,
+            'needExtendedHoursData': 'false',
+        })
+        if not data or 'candles' not in data:
+            return jsonify({'error': 'no candles returned', 'raw': data}), 503
+        candles = data.get('candles', []) or []
+        # Compute realized vol from log returns of close prices
+        import math as _m
+        rv_pct = None
+        if len(candles) >= 5:
+            closes = [c.get('close', 0) for c in candles if c.get('close', 0) > 0]
+            if len(closes) >= 5:
+                log_rets = [_m.log(closes[i] / closes[i-1])
+                            for i in range(1, len(closes))]
+                mean_r = sum(log_rets) / len(log_rets)
+                var = sum((r - mean_r) ** 2 for r in log_rets) / max(len(log_rets) - 1, 1)
+                # Annualize: daily bars → ×sqrt(252); minute bars → ×sqrt(252×6.5×60)
+                if freq == 'daily':
+                    annualizer = _m.sqrt(252)
+                elif freq == 'minute':
+                    annualizer = _m.sqrt(252 * 6.5 * 60 / freq_count)
+                else:
+                    annualizer = _m.sqrt(252)
+                rv_pct = _m.sqrt(var) * annualizer * 100
+        return jsonify({
+            'symbol':         '$VXN',
+            'count':          len(candles),
+            'period':         f"{period}{period_type}",
+            'frequency':      f"{freq_count} {freq}",
+            'realized_vol_pct': round(rv_pct, 3) if rv_pct else None,
+            'first_close':    candles[0].get('close') if candles else None,
+            'last_close':     candles[-1].get('close') if candles else None,
+            'candles':        candles[-50:],   # last 50 bars only (response size)
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
+
+
+@app.route("/api/_debug/qqq_iv_term_structure")
+def api_debug_qqq_iv_term_structure():
+    """QQQ implied-volatility term structure — substitute for VXN options.
+
+    Schwab does not carry VXN options (verified — see comments in
+    schwab_bridge.py). However QQQ tracks NDX directly (~25× ratio,
+    correlation ~1), so QQQ option IVs ARE NDX vol expressed in QQQ
+    terms. Per-strike IV is on the chain already (Schwab field 'volatility').
+
+    Methodology:
+      1. For each subscribed QQQ expiration, find the strike closest
+         to spot (ATM). Take the average of the ATM call IV and ATM
+         put IV — those should be equal under put-call parity but
+         averaging smooths the bid-ask noise.
+      2. Build the curve [{exp, dte, atm_iv_pct}] sorted by DTE.
+      3. Interpolate to a fixed 30-day tenor (linear between the two
+         bracketing expirations). That number IS the QQQ-equivalent
+         of VXN — they should track within a few vol-points.
+      4. Return alongside live spot VIX (CBOE SPX-vol) and spot VXN
+         (CBOE NDX-vol from Schwab equity stream) for context.
+
+    The 30-day interpolated IV vs spot VXN spread tells you whether
+    QQQ option market is pricing more or less vol than the official
+    CBOE NDX-vol calc — useful for cross-checking and arb signals.
+    """
+    try:
+        import math, time as _t
+        spot_qqq = float(_schwab_quote('QQQ') or 0)
+        if spot_qqq <= 0:
+            return jsonify({'error': 'spot QQQ unavailable'}), 503
+        # Pull live VIX + VXN spots from streamer cache
+        try:
+            from background_engine import schwab_bridge as _sb
+            _spot_cache = getattr(_sb, '_latest_spot_by_ticker', {}) or {}
+            spot_vix = float(_spot_cache.get('VIX', 0) or 0)
+            spot_vxn = float(_spot_cache.get('VXN', 0) or 0)
+        except Exception:
+            spot_vix = spot_vxn = 0.0
+        # Get every QQQ expiration Schwab returns (we subscribed to the
+        # roughly 30 closest to spot — chain endpoint enumerates all).
+        exps = _schwab_expirations('QQQ') or []
+        if not exps:
+            return jsonify({'error': 'no QQQ expirations'}), 503
+        rows = []
+        # Cap at first ~15 expirations to keep response time reasonable
+        # (each /chains call is one REST hit). Front 15 covers daily +
+        # weekly + monthly out to ~3 months — the meaningful tenor range.
+        for exp_date in exps[:15]:
+            try:
+                chain, _ = _schwab_chain_raw('QQQ', exp_date)
+            except Exception:
+                continue
+            if not chain:
+                continue
+            # Find ATM strike (closest available to spot)
+            strikes = sorted({float(c.get('strike', 0)) for c in chain
+                              if c.get('strike', 0) > 0})
+            if not strikes:
+                continue
+            atm = min(strikes, key=lambda k: abs(k - spot_qqq))
+            atm_call = next((c for c in chain
+                             if abs(float(c.get('strike', 0)) - atm) < 0.01
+                             and c.get('option_type') == 'call'), None)
+            atm_put  = next((c for c in chain
+                             if abs(float(c.get('strike', 0)) - atm) < 0.01
+                             and c.get('option_type') == 'put'), None)
+            if not (atm_call and atm_put):
+                continue
+            # Schwab's `volatility` field is annualized IV in percent.
+            iv_call = float(atm_call.get('volatility') or 0)
+            iv_put  = float(atm_put.get('volatility') or 0)
+            # Skip expirations where IV isn't populated (e.g. 0DTE
+            # with one side stale)
+            if iv_call <= 0 and iv_put <= 0:
+                continue
+            atm_iv = (iv_call + iv_put) / 2 if (iv_call > 0 and iv_put > 0) else max(iv_call, iv_put)
+            dte = int(atm_call.get('dte') or atm_put.get('dte') or 0)
+            rows.append({
+                'exp':           exp_date,
+                'dte':           dte,
+                'atm_strike':    round(atm, 2),
+                'iv_call':       round(iv_call, 3),
+                'iv_put':        round(iv_put, 3),
+                'atm_iv_pct':    round(atm_iv, 3),
+            })
+        rows.sort(key=lambda r: r['dte'])
+        # Linear-interpolate to 30-day fixed tenor — that's the
+        # canonical "QVX" reading directly comparable to VXN.
+        qvx_30d = None
+        if len(rows) >= 2:
+            target_dte = 30
+            below = next((r for r in reversed(rows) if r['dte'] <= target_dte), None)
+            above = next((r for r in rows if r['dte'] > target_dte), None)
+            if below and above and above['dte'] > below['dte']:
+                w = (target_dte - below['dte']) / (above['dte'] - below['dte'])
+                qvx_30d = below['atm_iv_pct'] + w * (above['atm_iv_pct'] - below['atm_iv_pct'])
+            elif below:
+                qvx_30d = below['atm_iv_pct']
+            elif above:
+                qvx_30d = above['atm_iv_pct']
+        # Spreads vs the official CBOE indexes
+        vs_vxn = round(qvx_30d - spot_vxn, 3) if (qvx_30d and spot_vxn > 0) else None
+        vs_vix = round(qvx_30d - spot_vix, 3) if (qvx_30d and spot_vix > 0) else None
+        return jsonify({
+            'spot_qqq':           round(spot_qqq, 2),
+            'spot_vix':           round(spot_vix, 2) if spot_vix > 0 else None,
+            'spot_vxn':           round(spot_vxn, 2) if spot_vxn > 0 else None,
+            'qvx_30d':            round(qvx_30d, 3) if qvx_30d else None,
+            'qvx_30d_minus_vxn':  vs_vxn,
+            'qvx_30d_minus_vix':  vs_vix,
+            'curve':              rows,
+            'ts':                 _t.time(),
+            'note':               'QQQ implied vol term structure. ATM IV per expiration. '
+                                  'qvx_30d is linear-interpolated 30-day fixed-tenor IV — '
+                                  'the QQQ-derived equivalent of CBOE VXN. Should track '
+                                  'spot VXN within ~2 vol points; large divergence = '
+                                  'NDX option market disagrees with the CBOE calc.',
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
+
+
+@app.route("/api/_debug/equity_tape/<ticker>")
+def api_debug_equity_tape(ticker):
+    """Per-print equity tape from Schwab TIMESALE_EQUITY for QQQ/SPY.
+
+    Returns:
+      - Recent N prints (default 50) — ts, price, size, mic, side
+      - Per-venue cumulative buy/sell volume
+      - Net signed volume in last 60s / 300s
+      - Bull/bear ratio across the rolling window
+    """
+    try:
+        from background_engine import schwab_bridge as sb
+        sym = (ticker or '').upper()
+        if sym not in ('QQQ', 'SPY'):
+            return jsonify({'error': 'ticker must be QQQ or SPY'}), 400
+        n = max(1, min(500, int(request.args.get('n', 50))))
+        with sb._timesale_equity_lock:
+            buf = sb._timesale_equity_prints.get(sym)
+            ven = sb._timesale_equity_by_venue.get(sym, {}) or {}
+            prints_recent = list(buf)[-n:] if buf else []
+            all_prints = list(buf) if buf else []
+            venues_snapshot = {k: dict(v) for k, v in ven.items()}
+        import time as _t
+        now_ms = int(_t.time() * 1000)
+        # Compute rolling windows
+        cutoff_60   = now_ms -   60_000
+        cutoff_300  = now_ms -  300_000
+        net_60s_buy = sum(p[2] for p in all_prints if p[0] >= cutoff_60 and p[4] > 0)
+        net_60s_sell= sum(p[2] for p in all_prints if p[0] >= cutoff_60 and p[4] < 0)
+        net_300s_buy  = sum(p[2] for p in all_prints if p[0] >= cutoff_300 and p[4] > 0)
+        net_300s_sell = sum(p[2] for p in all_prints if p[0] >= cutoff_300 and p[4] < 0)
+        # Per-venue summary sorted by total volume
+        venue_rows = []
+        for mic, v in venues_snapshot.items():
+            tot = v['buy_sz'] + v['sell_sz'] + v['neutral_sz']
+            net = v['buy_sz'] - v['sell_sz']
+            venue_rows.append({
+                'mic':         mic,
+                'buy_sz':      v['buy_sz'],
+                'sell_sz':     v['sell_sz'],
+                'neutral_sz':  v['neutral_sz'],
+                'total_sz':    tot,
+                'net_signed':  net,
+                'trades':      v['trades'],
+                'last_age_s':  round((now_ms - v['last_ts']) / 1000.0, 1),
+                'share_pct':   round(100.0 * tot / max(sum(x['buy_sz']+x['sell_sz']+x['neutral_sz']
+                                                          for x in venues_snapshot.values()), 1), 2),
+            })
+        venue_rows.sort(key=lambda r: -r['total_sz'])
+        return jsonify({
+            'ticker':              sym,
+            'total_prints':        len(all_prints),
+            'recent_prints':       [
+                {'ts_ms': p[0], 'price': p[1], 'size': p[2], 'mic': p[3],
+                 'side': p[4], 'sequence': p[5]}
+                for p in prints_recent
+            ],
+            'venues':              venue_rows[:20],
+            'rolling_60s': {
+                'buy':  net_60s_buy, 'sell': net_60s_sell,
+                'net':  net_60s_buy - net_60s_sell,
+                'bull_ratio': round(net_60s_buy / max(net_60s_sell, 1), 3),
+            },
+            'rolling_300s': {
+                'buy':  net_300s_buy, 'sell': net_300s_sell,
+                'net':  net_300s_buy - net_300s_sell,
+                'bull_ratio': round(net_300s_buy / max(net_300s_sell, 1), 3),
+            },
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
+
+
+@app.route("/api/_debug/book_health")
+def api_debug_book_health():
+    """Survey indicative-quote book staleness across all subscribed options.
+
+    Filters: ?ticker=$VIX (or QQQ/$SPX/SPY) limits to one underlying.
+             ?stale_only=1 returns only contracts flagged stale.
+
+    Each row shows displayed bid/ask vs indicative bid/ask + the staleness
+    ratio (disp_spread / max(ind_spread, 0.01)) so you can see how
+    extreme the gap is. Use this to debug why a particular VIX term
+    structure point is reading off — book_stale=True on the ATM strikes
+    means the implied forward used the indicative midpoint instead of
+    Schwab's `mark`.
+    """
+    try:
+        from background_engine import schwab_bridge as _sb
+        cache = getattr(_sb._on_options_quote, '_sym_cache', {}) or {}
+        ticker_filter = (request.args.get('ticker', '') or '').upper()
+        stale_only = request.args.get('stale_only') in ('1', 'true', 'yes')
+        rows = []
+        stale_count = 0
+        for sym, c in cache.items():
+            if ticker_filter:
+                root = (c.get('option_root') or sym[:6]).strip().upper()
+                if not root.startswith(ticker_filter.lstrip('$')) and ticker_filter not in sym:
+                    continue
+            stale = bool(c.get('book_stale'))
+            if stale:
+                stale_count += 1
+            if stale_only and not stale:
+                continue
+            rows.append({
+                'sym':                  sym,
+                'strike':               c.get('strike'),
+                'side':                 c.get('contract_type'),
+                'bid':                  c.get('bid'),
+                'ask':                  c.get('ask'),
+                'displayed_mid':        c.get('book_displayed_mid'),
+                'indicative_bid':       c.get('indicative_bid'),
+                'indicative_ask':       c.get('indicative_ask'),
+                'indicative_mid':       c.get('book_indicative_mid'),
+                'mark':                 c.get('mark'),
+                'stale_ratio':          c.get('book_stale_ratio'),
+                'book_stale':           stale,
+            })
+        # Sort: stale first, then by stale_ratio desc
+        rows.sort(key=lambda r: (-int(bool(r['book_stale'])),
+                                  -(r.get('stale_ratio') or 0)))
+        return jsonify({
+            'total_cached':   len(cache),
+            'matched':        len(rows),
+            'stale_count':    stale_count,
+            'stale_pct':      round(100.0 * stale_count / max(len(cache), 1), 2),
+            'contracts':      rows[:100],
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
+
+
+@app.route("/api/_debug/vix_chain")
+def api_debug_vix_chain():
+    """Snapshot of the live $VIX option chain — strike, mark, IV, OI, delta.
+    Useful for skew analysis (call IV vs put IV at equidistant strikes from
+    spot) and identifying VIX walls (high-OI strikes)."""
+    try:
+        from background_engine import schwab_bridge as sb
+        per_ticker = getattr(sb, '_per_ticker_gex', {}) or {}
+        vix = per_ticker.get('VIX', {}) or per_ticker.get('$VIX', {}) or {}
+        rows = []
+        for sym_key, info in vix.items():
+            rows.append({
+                'sym':           sym_key,
+                'strike':        info.get('strike'),
+                'side':          info.get('side'),
+                'oi':            info.get('oi'),
+                'delta':         info.get('delta'),
+                'gamma_dollars': info.get('gamma_dollars'),
+            })
+        rows.sort(key=lambda r: (r.get('strike') or 0, r.get('side') or ''))
+        return jsonify({
+            'count':       len(rows),
+            'spot_vix':    sb._latest_spot_by_ticker.get('VIX', 0) if hasattr(sb, '_latest_spot_by_ticker') else 0,
+            'contracts':   rows[:50],
+            'note':        'Live VIX option chain from LEVELONE_OPTIONS stream. Sorted by strike+side.',
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
+
+
+@app.route("/api/_debug/spots")
+def api_debug_spots():
+    """Dump the universal spot cache populated by Schwab LEVELONE_EQUITIES.
+    Surfaces VIX, $NDX.X, SPY, QQQ live levels + last-update age in seconds."""
+    try:
+        from background_engine import schwab_bridge as sb
+        cache = getattr(sb, '_latest_spot_by_ticker', {}) or {}
+        # Schwab streamer's per-symbol last-update timestamps (if tracked)
+        eq_mic = getattr(sb._on_equity_quote, '_eq_mic', {}) if hasattr(sb, '_on_equity_quote') else {}
+        rows = []
+        for sym, last in sorted(cache.items()):
+            rows.append({
+                'symbol': sym,
+                'last':   round(float(last or 0), 4),
+                'mic_cached': bool(eq_mic.get(sym)),
+            })
+        return jsonify({
+            'count':  len(cache),
+            'spots':  rows,
+            'note':   'Populated by _on_equity_quote (LEVELONE_EQUITIES) + _on_options_quote (per-strike underlying_price echoes)',
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
 
 
 @app.route("/api/_debug/levelone_cache_probe")
@@ -1149,6 +3080,51 @@ def api_debug_flow_classify():
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 
+@app.route("/api/_debug/sym_cache_sample")
+def api_debug_sym_cache_sample():
+    """Inspect the live Schwab streaming cache for a sample of symbols matching
+    a prefix, returning the exact field values Schwab is sending us. Used to
+    audit whether Schwab actually delivers fields like `exp_type` (field 36)
+    for non-index roots like QQQ.
+    Args: prefix (str) — symbol prefix to match (e.g. "QQQ", "SPXW", "$NDX").
+          limit (int)  — max samples to return (default 5)
+    """
+    try:
+        from background_engine.schwab_bridge import _on_options_quote
+        prefix = (request.args.get('prefix') or 'QQQ').upper()
+        limit = int(request.args.get('limit', 5))
+        cache = getattr(_on_options_quote, '_sym_cache', {}) or {}
+        keys = [k for k in cache.keys() if k.startswith(prefix)]
+        sample = {}
+        for k in keys[:limit]:
+            v = cache.get(k) or {}
+            # Return ALL fields so we can see exp_type, settlement_type, etc.
+            sample[k] = {fk: fv for fk, fv in v.items() if not fk.startswith('_')}
+        return jsonify({
+            "prefix": prefix,
+            "total_matches": len(keys),
+            "first_keys": keys[:limit],
+            "sample": sample,
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+
+@app.route("/api/_debug/timesale")
+def api_debug_timesale():
+    """PUBLIC — TIMESALE_OPTIONS feed stats. Confirms the raw trade stream
+    is alive and trades are being merged with LEVELONE cache."""
+    try:
+        from background_engine import schwab_bridge
+        stats = getattr(schwab_bridge, '_timesale_stats', None)
+        if stats is None:
+            return jsonify({"ready": False, "reason": "bridge not imported yet"})
+        return jsonify({"ready": True, **stats})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/_debug/flow_live_alerts")
 def api_debug_flow_alerts():
     """PUBLIC — run alert engine against current accumulator state; return alerts.
@@ -1203,13 +3179,76 @@ def api_option_flow():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/intel/signal_quality")
+def api_intel_signal_quality():
+    """Signal Quality Dashboard backend.
+
+    Reads outcome ledgers (logs/dealer_prints, sweep_outcomes, pin_outcomes,
+    hmm_ab, hedge_forecast, spx_qqq_divergence) and returns per-signal
+    quality metrics: hit_rate, sample_size, edge_$, verdict.
+
+    Cached for 60s (file reads are expensive — dealer_prints today is
+    181MB / 533K lines). Use ?force=1 to bypass cache.
+    """
+    try:
+        from connectors import signal_audit
+        force = (request.args.get('force') or '').lower() in ('1', 'true', 'yes')
+        return jsonify(signal_audit.get_signal_audit(force=force))
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "tb": traceback.format_exc()}), 500
+
+
+@app.route("/api/option_flow/history")
+def api_option_flow_history():
+    """Return rolling 2h history buffer for a ticker — used by flow_pane.js
+    to hydrate the chart on page-load so users see the past 2 hours of
+    cumulative flow without waiting for live ticks to populate.
+
+    Query params:
+      ticker: 'QQQ' | 'SPX' | 'SPY' | etc. (defaults: QQQ)
+      since:  optional ms-epoch — return only snapshots AFTER this time
+
+    Each snapshot has compact field names (matched to flow_pane.js render):
+      t, s0, sa, u0, ua,                    legacy 2-way + unsigned
+      cb, cs, pb, ps,                       calls/puts decomposition
+      c_0am, c_0pm, c_wk, c_mo, c_qt, c_lp  6-cohort drill-down
+
+    Cadence: snapshotted every 30s, maxlen 240 = 2h.
+    Persists to logs/flow_history_buffer.json — survives server restarts
+    within the same trading day.
+    """
+    try:
+        from connectors.flow_accumulator import get_accumulator
+        ticker = (request.args.get('ticker', 'QQQ') or 'QQQ').upper()
+        since_str = request.args.get('since', '0')
+        try:
+            since_ms = int(since_str) if since_str else 0
+        except Exception:
+            since_ms = 0
+        acc = get_accumulator()
+        if acc is None:
+            return jsonify({"ticker": ticker, "snapshots": [], "ready": False})
+        snapshots = acc.get_history(ticker, since_ts_ms=since_ms)
+        return jsonify({
+            "ticker": ticker,
+            "snapshots": snapshots,
+            "ready": True,
+            "interval_s": 30,
+            "maxlen_s": 7200,  # 2h
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "tb": traceback.format_exc()}), 500
+
+
 @app.route("/api/chain")
 def api_chain():
     """Return real options chain from Schwab for the terminal options panel.
     Self-contained — calls Schwab API directly."""
     from datetime import datetime, date
 
-    ticker = request.args.get("ticker", "QQQ").upper()
+    ticker = _resolve_index_ticker(request.args.get("ticker", "QQQ"))
 
     try:
         # Step 1: Get expirations from Schwab
@@ -1365,7 +3404,79 @@ def api_chain():
 _walls_cache = {}
 _walls_locks = {}
 _walls_meta_lock = _threading.Lock()
-_WALLS_TTL = 28
+# 2026-05-01 fix (Tradier flap diagnosis): /api/walls compute is 10-17s and
+# was firing every 28s, monopolising the gevent event loop and starving the
+# Tradier WS reader greenlet (10.5MB Recv-Q backlog observed in production).
+# Bumped TTL to 300s. Also added gevent.sleep(0) yields inside the heavy
+# loops below so a single compute can no longer hold the loop for >200 ms.
+_WALLS_TTL = 300
+
+@app.route("/api/_debug/single_name")
+def api_single_name_debug():
+    """DEBUG: per-ticker breakdown of the 8-name Greeks cache.
+
+    Returns unique DTEs, strike ranges, min/max DTE, and total contract counts
+    so we can verify the /chains poll is returning the full 60-day expiration
+    ladder for each ticker (not just front-month).
+    """
+    try:
+        from background_engine import schwab_bridge as _sb
+    except Exception as e:
+        return jsonify({"err": str(e)})
+    out = {}
+    with _sb._single_name_greeks_lock:
+        for osi, entry in _sb._single_name_greeks_cache.items():
+            root = (osi[:6] or '').strip()
+            if not root:
+                continue
+            slot = out.setdefault(root, {
+                'n_contracts': 0, 'dtes': set(), 'strikes': set(),
+                'calls': 0, 'puts': 0, 'oi_sum': 0, 'vol_sum': 0,
+                'spot': 0.0, 'oldest_ms': 0, 'newest_ms': 0,
+            })
+            slot['n_contracts'] += 1
+            slot['dtes'].add(int(entry.get('dte') or 0))
+            slot['strikes'].add(float(entry.get('strike') or 0))
+            if entry.get('contract_type') == 'C':
+                slot['calls'] += 1
+            else:
+                slot['puts'] += 1
+            slot['oi_sum'] += int(entry.get('oi') or 0)
+            slot['vol_sum'] += int(entry.get('vol') or 0)
+            if not slot['spot']:
+                slot['spot'] = float(entry.get('underlying_price') or 0)
+            ts = int(entry.get('updated_ms') or 0)
+            if not slot['oldest_ms'] or ts < slot['oldest_ms']:
+                slot['oldest_ms'] = ts
+            if ts > slot['newest_ms']:
+                slot['newest_ms'] = ts
+    # Serialize sets + summarise
+    result = {}
+    for tk, s in out.items():
+        dtes = sorted(s['dtes'])
+        strikes = sorted(s['strikes'])
+        result[tk] = {
+            'n_contracts':   s['n_contracts'],
+            'n_expirations': len(dtes),
+            'n_strikes':     len(strikes),
+            'dte_min':       dtes[0] if dtes else 0,
+            'dte_max':       dtes[-1] if dtes else 0,
+            'dte_list':      dtes,
+            'strike_min':    strikes[0] if strikes else 0.0,
+            'strike_max':    strikes[-1] if strikes else 0.0,
+            'calls':         s['calls'],
+            'puts':          s['puts'],
+            'oi_sum':        s['oi_sum'],
+            'vol_sum':       s['vol_sum'],
+            'spot':          s['spot'],
+            'oldest_ms':     s['oldest_ms'],
+            'newest_ms':     s['newest_ms'],
+        }
+    return jsonify({
+        'tickers':       result,
+        'total_cached':  sum(s['n_contracts'] for s in result.values()),
+    })
+
 
 @app.route("/api/walls")
 def api_walls():
@@ -1383,7 +3494,7 @@ def api_walls():
     # Determine underlying ticker and futures symbol from ?symbol= param
     futures_sym = request.args.get("symbol", "NQ").upper()
     FUTURES_TO_UNDERLYING = {"NQ": "QQQ", "GC": "GLD"}
-    ticker = request.args.get("ticker", FUTURES_TO_UNDERLYING.get(futures_sym, "QQQ")).upper()
+    ticker = _resolve_index_ticker(request.args.get("ticker", FUTURES_TO_UNDERLYING.get(futures_sym, "QQQ")))
 
     cache_key = f"{ticker}_{futures_sym}"
     with _walls_meta_lock:
@@ -1410,6 +3521,15 @@ def api_walls():
         import numpy as np
         from scipy.stats import norm as _norm
         import math
+        # gevent yield helper — used inside hot loops so the WS reader greenlet
+        # gets cycles. Without these, a single /api/walls call holds the event
+        # loop for 10-17s which back-pressures Tradier WS and kills conns.
+        try:
+            import gevent as _gevent
+            _yield = _gevent.sleep
+        except Exception:
+            def _yield(t=0):  # fallback no-op
+                pass
 
         # ── BSM greeks helper ────────────────────────────────────────────
         def _bsm_greeks(S, K, T, r, sigma, opt_type='call'):
@@ -1457,14 +3577,38 @@ def api_walls():
         # Best single-expiry gamma for 0DTE pin (only nearest expiry)
         best_gamma_strike, best_gamma_score = 0, 0
 
-        for exp_idx, exp_date in enumerate(exp_dates):
-            try:
-                raw_chain, schwab_underlying = _schwab_chain_raw(ticker, exp_date)
-                if exp_idx == 0 and schwab_underlying > 0:
-                    spot = schwab_underlying
-            except Exception as e:
-                print(f"[api/walls] expiry {exp_date} fetch failed: {e}")
-                continue
+        # ── Parallelize the 5 chain fetches using gevent.spawn ──────────────
+        # 2026-05-01 fix (bulletproof): sequential fetches were the dominant
+        # /api/walls latency contributor (~5-7s for 5 REST calls). Spawning
+        # them in parallel via gevent reduces total fetch time to ~max(call)
+        # instead of sum(calls). Each greenlet yields naturally during socket
+        # I/O so the Tradier WS reader keeps draining its kernel buffer.
+        try:
+            import gevent as _gevent_mod
+            _greenlets = [_gevent_mod.spawn(_schwab_chain_raw, ticker, exp_date)
+                          for exp_date in exp_dates]
+            _gevent_mod.joinall(_greenlets, timeout=15)
+            _fetched_chains = []
+            for i, g in enumerate(_greenlets):
+                if g.successful() and g.value:
+                    _fetched_chains.append((exp_dates[i], g.value[0], g.value[1]))
+                else:
+                    _fetched_chains.append((exp_dates[i], [], 0))
+        except Exception as e:
+            # Fallback to sequential if gevent.spawn fails for any reason
+            _fetched_chains = []
+            for exp_date in exp_dates:
+                try:
+                    rc, su = _schwab_chain_raw(ticker, exp_date)
+                    _fetched_chains.append((exp_date, rc, su))
+                except Exception:
+                    _fetched_chains.append((exp_date, [], 0))
+
+        for exp_idx, (exp_date, raw_chain, schwab_underlying) in enumerate(_fetched_chains):
+            # Yield once per expiry to give other greenlets a slot
+            _yield(0)
+            if exp_idx == 0 and schwab_underlying > 0:
+                spot = schwab_underlying
 
             if not raw_chain:
                 continue
@@ -1499,7 +3643,15 @@ def api_walls():
             #   + dollar GEX (gamma × OI × 100 × spot²)
             #   + volume+OI hybrid for 0DTE
             s = spot or schwab_underlying
-            for opt in raw_chain:
+            for _opt_i, opt in enumerate(raw_chain):
+                # Yield every 50 contracts (was 200; tightened 2026-05-01 for
+                # bulletproof gevent reader-friendliness). BSM vanna/charm math
+                # uses numpy + scipy.stats.norm.pdf which can each take 5-15µs.
+                # 50 contracts × ~10µs = 500µs per batch, then yield. Each
+                # /api/walls compute now yields ~200 times (5 expiries × 40
+                # batches) keeping Tradier WS reader fully responsive.
+                if _opt_i and (_opt_i % 50 == 0):
+                    _yield(0)
                 strike = opt["strike"]
                 oi = int(opt.get("open_interest") or 0)
                 vol = int(opt.get("volume") or 0)
@@ -1564,10 +3716,17 @@ def api_walls():
         underlying_call_wall = max(agg_call_oi, key=agg_call_oi.get) if agg_call_oi else 0
 
         # Max pain (using aggregated weighted OI)
+        # O(N²) over strikes — for ~200 strikes that's 40K iterations of pure
+        # Python multiplication + dict lookup. Yield every 10 outer iterations
+        # (tightened from 25 for bulletproof responsiveness — was contributing
+        # to /api/walls compute time during cache miss; with 200 strikes that's
+        # 20 yields scattered through the max-pain compute).
         sorted_strikes = sorted(all_strikes)
         min_pain = float("inf")
         underlying_max_pain = spot
-        for K in sorted_strikes:
+        for _k_i, K in enumerate(sorted_strikes):
+            if _k_i and (_k_i % 10 == 0):
+                _yield(0)
             pain = 0
             for S in sorted_strikes:
                 if S < K:  pain += agg_put_oi.get(S, 0) * (K - S) * 100
@@ -1738,10 +3897,15 @@ def api_walls():
 
 @app.route("/api/spot")
 def api_spot():
-    """Lightweight quote-only endpoint — single Tradier call, no options processing."""
+    """Lightweight quote-only endpoint — single Tradier call, no options processing.
+
+    2026-05-01 fix (audit issue #8): now honors `?ticker=` query param. Previously
+    returned the configured default ticker regardless of query string.
+    """
     try:
         from data_provider import _fetch_quote, _cached
-        ticker = get_ticker()
+        # Honor ?ticker= override; fall back to default if not specified
+        ticker = _resolve_index_ticker(request.args.get("ticker") or get_ticker())
         # Bypass cache so we always get the freshest price
         spot = _fetch_quote(ticker)
         return jsonify({"ticker": ticker, "spot": round(float(spot), 2)})
@@ -3757,10 +5921,10 @@ def handle_connect():
     # Push candle history on connect — subscribe handler also pushes on tf switch
     # but the initial connect needs this for first load
     _client_active_tf[sid] = '1m'
-    # Ensure _ACTIVE_TFS contains this client's default tf
+    # Ensure _ACTIVE_TFS contains this client's default tf + always-enriched preferred TFs
     try:
         import background_engine.l2_worker as _l2w
-        _l2w._ACTIVE_TFS = set(_client_active_tf.values()) or {"1m"}
+        _l2w._ACTIVE_TFS = set(_client_active_tf.values()) | _l2w._PREFERRED_ENRICHED_TFS
     except Exception:
         pass
     if not _push_candle_history(sid):
@@ -3773,15 +5937,25 @@ def handle_disconnect():
     sid = request.sid
     print(f"[Socket.IO] Client disconnected: {sid}")
     # Drop this client's tf and rebuild _ACTIVE_TFS set
+    # Floor at _PREFERRED_ENRICHED_TFS so disconnects don't strand the user's
+    # default chart-TFs (30s/1m/3m/200s/5m) un-enriched.
     _client_active_tf.pop(sid, None)
     try:
         import background_engine.l2_worker as _l2w
-        live = set(_client_active_tf.values()) or {"1m"}
+        live = set(_client_active_tf.values()) | _l2w._PREFERRED_ENRICHED_TFS
         _l2w._ACTIVE_TFS = live
         # Keep legacy singleton roughly in sync (arbitrary pick)
         _l2w._ACTIVE_TF = next(iter(live))
     except Exception:
         pass
+    # Clean up any MM-Attribution watch this client had.
+    sym = _mma_sid_sym.pop(sid, None)
+    if sym:
+        try:
+            from connectors import mm_attribution as _mma
+            _mma.unwatch(sym)
+        except Exception:
+            pass
 
 @socketio.on('subscribe')
 def handle_subscribe(data):
@@ -3795,10 +5969,12 @@ def handle_subscribe(data):
     emit('subscribed', {'symbol': symbol, 'tf': tf})
     # Track per-client tf (kills stale deferred pushes)
     _client_active_tf[sid] = tf
-    # Update active tf set — union of all clients' TFs (multi-client safe)
+    # Update active tf set — union of all clients' TFs ∪ preferred-enriched defaults
+    # so chart-TF switching never leaves a bar un-enriched on the user's
+    # commonly-viewed timeframes (30s/1m/3m/200s/5m).
     try:
         import background_engine.l2_worker as _l2w
-        live = set(_client_active_tf.values()) or {"1m"}
+        live = set(_client_active_tf.values()) | _l2w._PREFERRED_ENRICHED_TFS
         _l2w._ACTIVE_TFS = live
         _l2w._ACTIVE_TF = tf  # legacy field — last-subscriber wins (harmless now)
     except Exception:
@@ -3815,6 +5991,54 @@ def handle_subscribe(data):
         import threading
         t = threading.Thread(target=_deferred_candle_push, args=(sid, symbol, tf), daemon=True)
         t.start()
+
+
+# ── MM Attribution socket subscriptions ────────────────────────────────────
+# Per-client watch map: sid -> sym. Lets us cleanly decrement refcounts on
+# disconnect/switch without the client having to send `unwatch`.
+_mma_sid_sym: dict = {}
+
+@socketio.on('mm_attribution:watch')
+def handle_mma_watch(data):
+    """Client declares interest in a contract. Joins room `mma:<sym>`, bumps
+    server-side refcount, and sends initial state immediately so the pane
+    has something to render without waiting for the next flush tick."""
+    sid = request.sid
+    sym = (data or {}).get('sym')
+    if not sym:
+        return
+    prev = _mma_sid_sym.get(sid)
+    if prev == sym:
+        return  # idempotent
+    try:
+        from connectors import mm_attribution as _mma
+        if prev:
+            try:
+                leave_room(f'mma:{prev}')
+                _mma.unwatch(prev)
+            except Exception:
+                pass
+        _mma_sid_sym[sid] = sym
+        join_room(f'mma:{sym}')
+        _mma.watch(sym)
+        emit('mm_contract_state', _mma.contract_state(sym))
+    except Exception as e:
+        print(f"[Socket.IO] mma:watch error sid={sid} sym={sym}: {e}")
+
+@socketio.on('mm_attribution:unwatch')
+def handle_mma_unwatch(_data=None):
+    """Client explicitly stops watching (pane destroy)."""
+    sid = request.sid
+    sym = _mma_sid_sym.pop(sid, None)
+    if not sym:
+        return
+    try:
+        leave_room(f'mma:{sym}')
+        from connectors import mm_attribution as _mma
+        _mma.unwatch(sym)
+    except Exception:
+        pass
+
 
 if __name__ == "__main__":
     print("Starting Altaris Dev with Socket.IO...")

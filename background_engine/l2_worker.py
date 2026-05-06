@@ -67,7 +67,7 @@ SYMBOLS = ["NQ"]
 # Aggregates tick-by-tick trades into OHLC candles for multiple timeframes.
 CANDLE_TIMEFRAMES = {
     "5s": 5, "15s": 15, "30s": 30,
-    "1m": 60, "200s": 200, "5m": 300, "10m": 600, "15m": 900, "30m": 1800,
+    "1m": 60, "3m": 180, "200s": 200, "5m": 300, "10m": 600, "15m": 900, "30m": 1800,
     "1h": 3600, "4h": 14400,
 }
 CANDLE_MAX = 10080  # max candles stored per TF per symbol (7 days × 1440 min for 1m)
@@ -91,7 +91,12 @@ _socketio = None
 _last_emit_time: dict = {}  # throttle: {"symbol:tf": timestamp}
 _EMIT_MIN_INTERVAL = 0.05   # max 20 emits/sec per symbol/tf (was 150ms)
 _ACTIVE_TF = "1m"           # legacy singleton — kept for back-compat, do not rely on
-_ACTIVE_TFS: set = {"1m"}   # set union of all client-requested TFs (multi-client safe)
+# 2026-05-06: User views charts on 30s / 1m / 3m / 200s / 5m. Always enrich
+# these so bars BEFORE a chart-tf-switch don't render with empty
+# delta_div/depth_deltas/absorption fields. The set is unioned with currently-
+# subscribed client TFs by handle_connect/disconnect/subscribe in server.py.
+_PREFERRED_ENRICHED_TFS: set = {"30s", "1m", "3m", "200s", "5m"}
+_ACTIVE_TFS: set = set(_PREFERRED_ENRICHED_TFS)   # set union of all client-requested TFs (multi-client safe)
 
 # ── Reconnect gap-fill tracking ──
 _LAST_TRADE_TS: dict[str, float] = {}   # {symbol: unix_ts of last trade}
@@ -1549,6 +1554,62 @@ if _INVEST_LOG_ENABLED and not _INVEST_FLUSHER_STARTED:
     threading.Thread(target=_invest_log_flusher, daemon=True, name="invest-flush").start()
     _INVEST_FLUSHER_STARTED = True
     log.info("[INVEST-LOG] enabled via INVEST_LOG env, background flusher started")
+
+
+# ── CPU Watchdog (2026-05-06) ─────────────────────────────────────────────────
+# Self-monitor: log a warning when our process spends ≥98% CPU for ≥30s.
+# Sustained pinned-CPU is the precursor to WebSocket buffer pile-up + RST
+# disconnects (proven empirically: pre-active-TF-fix pegged at 100% → 14
+# disconnects/30min; post-fix at 31% → 0 disconnects). With user's 5
+# enriched TFs raising baseline back toward 95%, we want a tripwire that
+# tells us when the system slips back into the danger zone.
+_CPU_WATCHDOG_STARTED = False
+
+def _cpu_watchdog_loop():
+    """Sample own-process CPU% every 5s. Log warning if 30s rolling avg ≥98%."""
+    import os as _os_cpu
+    import time as _time_cpu
+    samples = deque(maxlen=6)   # 6 × 5s = 30s rolling window
+    pid = _os_cpu.getpid()
+    last_sample_ts = 0.0
+    last_user_t = 0.0
+    last_sys_t = 0.0
+    while True:
+        try:
+            _time_cpu.sleep(5.0)
+            # Use os.times() for cumulative CPU time of this process+children.
+            # Diff between snapshots / wall-clock interval = CPU% on a 1-core basis.
+            t = _os_cpu.times()
+            now = _time_cpu.time()
+            cur_cpu = t.user + t.system
+            if last_sample_ts > 0:
+                wall_dt = now - last_sample_ts
+                cpu_dt = cur_cpu - last_user_t - last_sys_t
+                if wall_dt > 0:
+                    pct = 100.0 * cpu_dt / wall_dt
+                    samples.append(pct)
+                    if len(samples) >= 6:
+                        avg = sum(samples) / len(samples)
+                        if avg >= 98.0:
+                            log.warning(
+                                f"[CPU-WATCHDOG] sustained {avg:.0f}% CPU over 30s "
+                                f"— back-pressure imminent (samples={[round(s) for s in samples]})"
+                            )
+                        elif avg >= 90.0:
+                            log.info(
+                                f"[CPU-WATCHDOG] elevated {avg:.0f}% CPU 30s avg "
+                                f"(margin tight; {[round(s) for s in samples]})"
+                            )
+            last_sample_ts = now
+            last_user_t = t.user
+            last_sys_t = t.system
+        except Exception:
+            _time_cpu.sleep(5.0)
+
+if not _CPU_WATCHDOG_STARTED:
+    threading.Thread(target=_cpu_watchdog_loop, daemon=True, name="cpu-watchdog").start()
+    _CPU_WATCHDOG_STARTED = True
+    log.info("[CPU-WATCHDOG] started (warns at ≥98% sustained 30s, info at ≥90%)")
 
 
 # ── Adaptive thresholds: replace static lot floors with session-relative ──
