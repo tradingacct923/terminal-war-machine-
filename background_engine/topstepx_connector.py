@@ -116,6 +116,11 @@ class TopStepXConnector:
         self._token: Optional[str] = None
         self._connection = None
         self._running    = False
+        # 2026-05-05 — track last app-level message arrival so the data
+        # watchdog can detect dead-but-still-open WS connections without
+        # the spurious WS-level ping/pong timeouts.
+        self._last_msg_ts: float = 0.0
+        self._ws_data_silence_sec: float = 60.0
 
         # Per-contract ID → our friendly symbol name
         self._contract_to_symbol: dict[str, str] = {}
@@ -337,12 +342,16 @@ class TopStepXConnector:
         _subscribed = [False]
 
         def _send_subscriptions(ws):
+            # invocationId set so server can return completion errors if subscribe rejected
+            inv_counter = [100]
             for cid in contract_ids:
                 for method in ("SubscribeContractQuotes",
                                "SubscribeContractTrades",
                                "SubscribeContractMarketDepth"):
+                    inv_id = str(inv_counter[0]); inv_counter[0] += 1
                     msg = _json.dumps({
                         "type": 1,
+                        "invocationId": inv_id,
                         "target": method,
                         "arguments": [cid],
                     }) + SEP
@@ -475,6 +484,11 @@ class TopStepXConnector:
 
 
         def on_message(ws, raw):
+            # Record app-level activity for the data watchdog (replaces the
+            # WS-level ping/pong which TopStepX's SignalR server doesn't
+            # honor reliably — observed spurious "ping/pong timed out"
+            # closures every ~7-10 min on otherwise-healthy conns).
+            self._last_msg_ts = time.time()
             # Handle binary frames (depth events can be binary)
             if isinstance(raw, bytes):
                 try:
@@ -500,12 +514,16 @@ class TopStepXConnector:
                         _dispatch(data)
                     except Exception as e:
                         log.debug("TopStepX dispatch error: %s", e)
+                elif msg_type == 3:        # Completion — only log on actual error
+                    err = data.get("error")
+                    if err:
+                        log.warning(f"TopStepX subscribe failure invId={data.get('invocationId')} err={err}")
                 elif msg_type == 6:        # Ping → pong
                     try:
                         ws.send(PING)
                     except Exception:
                         pass
-                # type 3 = completion, type 7 = close — ignore
+                # type 7 = close — ignore
 
         def on_open(ws):
             log.info("TopStepX WS: connected, sending handshake...")
@@ -532,8 +550,57 @@ class TopStepXConnector:
         def on_close(ws, code, msg):
             log.warning("TopStepX WS: closed (code=%s) — will reconnect", code)
 
+        # Data-activity watchdog — TopStepX SignalR server doesn't honor
+        # WS-level control-frame pings, so ping_timeout fires spuriously
+        # (caught 2026-05-05 14:24:14 after 7min uptime — server was sending
+        # GatewayQuote/Depth fine but missed the WS pong → 19s of NQ data
+        # was lost during reconnect). Fix: disable WS ping below
+        # (ping_interval=0) and detect dead conns via app-level message
+        # silence here. NQ trades arrive ~150/s during RTH → 60s of
+        # silence is unambiguous death.
+        def _data_watchdog():
+            while self._running:
+                time.sleep(10.0)
+                if not self._running:
+                    break
+                if self._last_msg_ts <= 0:
+                    continue
+                silence = time.time() - self._last_msg_ts
+                if silence > self._ws_data_silence_sec and self._connection is not None:
+                    log.warning(f"TopStepX: no data for {silence:.0f}s — forcing reconnect")
+                    try:
+                        self._connection.close()
+                    except Exception:
+                        pass
+
+        import threading as _t_wd
+        _t_wd.Thread(target=_data_watchdog, daemon=True, name="TopStepXWatchdog").start()
+
         while self._running and not getattr(self, '_signalr_cancel', False):
             try:
+                # 2026-05-06 BUG FIX: explicitly close the OLD WS + socket
+                # before creating a new one. Previously the old `ws` object
+                # went out of scope and relied on GC, but websocket-client
+                # doesn't close the underlying TCP socket until __del__.
+                # Result: zombie ESTABLISHED conns accumulated (6 observed
+                # instead of 1), each holding 200-400KB unread in kernel TCP
+                # buffer. When buffer filled, server RST'd the conn (Errno 54
+                # / "remote host lost"). Now we force the old WS + raw socket
+                # closed before allocating the next one — kernel reclaims the
+                # FD and stops buffering data we're not reading.
+                if self._connection is not None:
+                    try:
+                        self._connection.close()
+                    except Exception:
+                        pass
+                    try:
+                        _sock = getattr(self._connection, 'sock', None)
+                        if _sock is not None:
+                            _sock.close()
+                    except Exception:
+                        pass
+                    self._connection = None
+
                 # Rebuild URL with current token on each reconnect attempt
                 hub_url = f"{hub_base}?access_token={self._token}"
                 ws = _ws.WebSocketApp(
@@ -544,8 +611,15 @@ class TopStepXConnector:
                     on_close=on_close,
                 )
                 self._connection = ws
+                self._last_msg_ts = time.time()  # reset watchdog clock per-connect
                 log.info("TopStepX WS: connecting to %s...", MARKET_HUB)
-                ws.run_forever(ping_interval=20, ping_timeout=10)
+                # ping_interval=0 disables WS-level ping/pong (TopStepX's
+                # SignalR layer doesn't reliably reciprocate — was causing
+                # spurious "ping/pong timed out" disconnects). The
+                # _data_watchdog thread above detects dead conns via
+                # message-arrival silence instead. App-level SignalR pings
+                # (msg_type=6) are still answered in on_message above.
+                ws.run_forever(ping_interval=0)
             except Exception as e:
                 log.error("TopStepX WS loop error: %s", e)
             if self._running and not getattr(self, '_signalr_cancel', False):

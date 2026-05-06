@@ -70,7 +70,7 @@ CANDLE_TIMEFRAMES = {
     "1m": 60, "200s": 200, "5m": 300, "10m": 600, "15m": 900, "30m": 1800,
     "1h": 3600, "4h": 14400,
 }
-CANDLE_MAX = 2000  # max candles stored per timeframe per symbol (holds full 24h session)
+CANDLE_MAX = 10080  # max candles stored per TF per symbol (7 days × 1440 min for 1m)
 
 # Per-symbol tick sizes for bubble profile price quantization
 TICK_SIZES = {
@@ -100,6 +100,23 @@ _connector_ref = None                    # set by start() for gap-fill access
 # ── Refill Speed Tracking (for VP absorption quality) ──
 _REFILL_TRACKER: dict = {}    # {symbol: {price_str: {hit_ts, avg_ms, count, classification}}}
 _LAST_DOM_DEPTH: dict = {}    # {symbol: {price_str: depth}} — previous DOM snapshot for diff
+
+# ── Max Book Size Seen (BUG FIX 2026-05-03) ──────────────────────────────
+# Trade events read DOM AFTER the trade has consumed the inside price level,
+# so reading `dom.asks[trade_price]` returns 0 (already eaten). True
+# absorption needs to know the WALL DEPTH that was sitting at the price
+# BEFORE the trade hit it. We solve this with a per-symbol per-price
+# rolling-max tracker, updated on EVERY L2 depth update (at ~10-50Hz).
+# At trade time, we read this tracker — it remembers the largest book
+# seen at the price within the recent window, regardless of whether the
+# current snapshot still shows the wall.
+#
+# Format: {symbol: {price_str: {'depth': float, 'set_at': epoch_sec}}}
+# Decay: entries older than _MAX_BOOK_TTL_S are reset (stale walls cleared)
+# Cap:   trimmed to top _MAX_BOOK_CAP entries per symbol on each update
+_MAX_BOOK_SEEN: dict = {}
+_MAX_BOOK_TTL_S = 60.0          # rolling 60s window — wall must be recent
+_MAX_BOOK_CAP   = 1000          # per-symbol cap (NQ touches ~50-200 prices/min)
 
 # ── Bubble Profile Persistence ──
 # Saves bp data to disk each time a 1m candle closes, loads on startup.
@@ -653,6 +670,15 @@ _SWEEP_TRACKER: dict = defaultdict(deque)
 # Detected results attached to current candle: {symbol: {tf: {sweeps: []}}}
 _DETECT_RESULTS: dict = defaultdict(lambda: defaultdict(dict))
 
+# ── Big Print Detection (signal-only volume bubbles) ──
+# Rolling per-symbol deque of (ts, size). 5-min window provides a MEASURED
+# baseline; size ≥ P90 of this deque qualifies as "big" — adapts to regime
+# (overnight low-activity vs RTH open) within 5 min, no fixed lot threshold.
+_PRINT_RING_SEC       = 300.0    # CONFIGURED 5-min rolling baseline window
+_PRINT_RING_MIN_N     = 30       # STRUCTURAL — need ≥30 samples to compute P90
+_PRINT_RING: dict = defaultdict(deque)
+_PRINT_RING_LOCK = threading.Lock()
+
 # ── Cumulative Delta Divergence Constants ──
 _DIV_LOOKBACK_CANDLES = 20       # rolling window to find swing highs/lows
 _DIV_MIN_PRICE_MOVE   = 5.0      # minimum price difference for swing (20 ticks on NQ)
@@ -756,6 +782,176 @@ def _detect_sweep(symbol: str, price: float, volume: int,
     }
     tracker.clear()
     return sweep_result
+
+
+def _emit_big_print(symbol: str, price: float, volume: int, side: str,
+                    timestamp: float, sweep_hit) -> None:
+    """Per-print big-order detector + classifier + socket emitter.
+
+    Fires for the top decile of trades over the rolling 5-min window
+    (size ≥ P90). Classifies into:
+        block      — book_before ≥ 2× size  (institutional absorbed)
+        sweep      — sweep_hit fired OR size ≥ 2× book_before  (consumed)
+        aggression — neither block nor sweep (top-decile, isolated)
+
+    Emits 'big_print' socket event:
+      {symbol, ts (ms), price, size, side, book_before, classification}
+
+    Frontend reads via window.AltarisEvents.on('data:big_print', ...) once
+    the index.html fan-out is wired.
+
+    Numerical sanity:
+      - Rolling baseline: MEASURED from live print sizes, not magic number
+      - P90 cutoff: STRUCTURAL percentile (top decile)
+      - 2× book ratio for block: DERIVED (book absorbs ≥2× margin)
+      - 2× size ratio for sweep: STRUCTURAL (consumed ≥2× visible book)
+    """
+    if side not in ('b', 's') or volume <= 0:
+        return
+    # Update rolling ring + compute P90
+    with _PRINT_RING_LOCK:
+        ring = _PRINT_RING[symbol]
+        ring.append((timestamp, volume))
+        cutoff = timestamp - _PRINT_RING_SEC
+        while ring and ring[0][0] < cutoff:
+            ring.popleft()
+        if len(ring) < _PRINT_RING_MIN_N:
+            return
+        # snapshot for P90 outside lock
+        sizes_snapshot = [s for _, s in ring]
+    sizes_snapshot.sort()
+    n_samples = len(sizes_snapshot)
+    p90_idx = int(n_samples * 0.90)
+    p99_idx = int(n_samples * 0.99) if n_samples >= 100 else max(0, n_samples - 1)
+    p90 = sizes_snapshot[p90_idx]
+    p99 = sizes_snapshot[p99_idx]
+    if volume < p90:
+        return
+    # Extreme flag: top 1% of rolling 5-min distribution.
+    # STRUCTURAL percentile — adapts to regime (quiet overnight P99 ≈ 5 lots,
+    # RTH peak P99 ≈ 200+ lots). Frontend renders extra outer ring when set.
+    is_extreme = volume >= p99
+    # Look up book_before + cross-stream context at the trade level
+    tick_size = TICK_SIZES.get(symbol, DEFAULT_TICK_SIZE)
+    qp = str(round(round(price / tick_size) * tick_size, 2))
+    book_before = 0.0
+    abs_tier_label = None       # FORTRESS/SOLID/HELD or None — from absorption v2 engine
+    with _L2_LOCK:
+        # ── book_before lookup (FIXED 2026-05-04) ──
+        # PRIOR BUG: read live DOM at trade time, but the level at the trade
+        # price has ALREADY been consumed by this very trade → book_before
+        # almost always 0 → block-classification path under-fired.
+        # FIX: read _MAX_BOOK_SEEN rolling-max tracker FIRST (same pattern
+        # as _feed_candle at L1216-1237). Tracker remembers the LARGEST wall
+        # at this price within the rolling 60s window — i.e. the wall that
+        # was THERE just before this trade ate it.
+        # Fallback to live DOM if tracker is cold for this price.
+        mbs = _MAX_BOOK_SEEN.get(symbol, {})
+        ent = mbs.get(qp)
+        if ent is not None:
+            book_before = float(ent.get('depth') or 0)
+        if book_before == 0.0:
+            dom = L2_STATE["dom"].get(symbol, {})
+            if side == 'b':      # buy hit ask side
+                book_before = float(dom.get("asks", {}).get(qp, 0))
+            elif side == 's':    # sell hit bid side
+                book_before = float(dom.get("bids", {}).get(qp, 0))
+        # Cross-reference: is THIS price level a defended absorption level?
+        # absorption v2 engine populates L2_STATE["absorption"][symbol][qp] with
+        # tier/label keys (FORTRESS=3, SOLID=2, HELD=1). FORTRESS/SOLID = level
+        # has been REPEATEDLY defended in the session (refill ≥ p75, traded ≥ p50).
+        abs_at_level = L2_STATE.get("absorption", {}).get(symbol, {}).get(qp)
+        if abs_at_level:
+            abs_tier_label = abs_at_level.get('label')
+    # Refill class at this level (per-tick, lighter check than full v2)
+    refill_class_now = None
+    refill_data = _REFILL_TRACKER.get(symbol, {}).get(qp)
+    if refill_data:
+        refill_class_now = refill_data.get('classification')
+
+    # ── REFINED CLASSIFICATION (multi-leg confirmation) ──
+    #
+    # SWEEP — only when REAL _detect_sweep fired (multi-tick traversal <200ms).
+    #         When a sweep fires, the *trigger* trade may be small (e.g. the
+    #         final 1-lot of a 10-tick consume), but the SIGNAL is the whole
+    #         sweep. So when sweep_hit is set we override emit_volume +
+    #         emit_price with the full sweep totals → ONE bubble per sweep
+    #         showing the total swept contracts at the principal price.
+    #
+    # BLOCK — institutional absorbed. Requires:
+    #         (1) book_before ≥ 1.5× size  (passive defender had margin)
+    #         AND
+    #         (2) refill_class ∈ {instant, fast}  (book RELOADED after eating)
+    #             OR abs_tier_label ∈ {FORTRESS, SOLID}  (level historically defended)
+    #
+    # AGGRESSION — top-decile size, no sweep, no defended level.
+    is_at_defended_level = abs_tier_label in ('FORTRESS', 'SOLID')
+    is_refill_strong     = refill_class_now in ('instant', 'fast')
+    sweep_levels = 0
+    emit_volume  = volume
+    emit_price   = price
+    if sweep_hit:
+        cls = 'sweep'
+        # Use the full sweep totals as the emit values — the trigger trade
+        # is just the final tick. Without this override, sweeps look like
+        # 1-lot bubbles instead of representing the multi-tick consume.
+        sweep_prices = sweep_hit.get('prices') or [price]
+        sweep_levels = len(sweep_prices)
+        emit_volume  = int(sweep_hit.get('vol', volume))
+        # Principal price = middle of the consumed range (visually centered
+        # in the sweep). On a buy sweep this is between bottom and top of
+        # the swept range; same for sell sweep.
+        try:
+            sorted_p = sorted(sweep_prices)
+            emit_price = float(sorted_p[len(sorted_p) // 2])
+        except Exception:
+            emit_price = float(price)
+    elif book_before >= 1.5 * volume and (is_refill_strong or is_at_defended_level):
+        cls = 'block'
+    else:
+        cls = 'aggression'
+
+    # ── Aggression noise filter ──
+    # Aggression = "top-decile size, no other signal." On its own this is the
+    # weakest of our classifications — just "big print, don't know why."
+    # Without filtering, every top-decile print on quiet tape (where P90 is
+    # near-zero) generates an aggression bubble, producing visual columns.
+    #
+    # Real footprint chart logic: aggression should only show when the print
+    # is GENUINELY extreme (top 1%, not top 10%). Block/sweep/real_abs already
+    # have additional signal context (sweep_hit / book + refill / level tier)
+    # so they fire at P90. Aggression alone needs P99.
+    #
+    # STRUCTURAL: percentile gate against same rolling distribution. No
+    # absolute lot threshold introduced.
+    if cls == 'aggression' and volume < p99:
+        return
+    # Emit
+    if _socketio is not None:
+        _payload = {
+            'symbol':         symbol,
+            'ts':             int(timestamp * 1000),
+            'price':          float(emit_price),    # principal price (sweep) or trade price
+            'size':           int(emit_volume),     # total swept volume (sweep) or trade size
+            'side':           side,
+            'book_before':    int(book_before),
+            'classification': cls,
+            'p90':            int(p90),
+            'p99':            int(p99),
+            'extreme':        bool(is_extreme),
+            'at_level_tier':  abs_tier_label,       # FORTRESS/SOLID/HELD or None
+            'refill_class':   refill_class_now,     # instant/fast/slow/gone or None
+            'sweep_levels':   int(sweep_levels),    # >0 when this is a real sweep
+        }
+        try:
+            _socketio.emit('big_print', _payload, namespace='/')
+        except Exception:
+            pass
+        # INVESTIGATION LOG — capture every emitted big_print
+        try:
+            _invest_log("big_prints", {**_payload, "ts_ms": int(time.time() * 1000)})
+        except Exception:
+            pass
 
 
 def _detect_delta_divergence(symbol: str, tf: str):
@@ -1026,16 +1222,33 @@ def _feed_candle(symbol: str, price: float, volume: int, timestamp: float,
     tick_size = TICK_SIZES.get(symbol, DEFAULT_TICK_SIZE)
     qp = str(round(round(price / tick_size) * tick_size, 2))
 
-    # ── Upgrade A: snapshot book size under L2_LOCK before entering CANDLE_LOCK ──
-    # Reading DOM inside CANDLE_LOCK without L2_LOCK is a race condition.
+    # ── Book-size snapshot for absorption detection (FIXED 2026-05-04) ──
+    # PRIOR BUG: read live DOM at trade time → ask/bid at the trade price
+    # had ALREADY been consumed by this trade → _book_sz always 0 → true_abs
+    # never fired (verified empirically: 0 of 22,065 levels in Friday's data).
+    #
+    # FIX: read from _MAX_BOOK_SEEN tracker, which is updated on every L2
+    # depth message and remembers the LARGEST wall seen at this price within
+    # the rolling 60s window. So if a 50-deep wall sat at $27935 for 30s
+    # then a 50-lot trade swept it, we still see depth=50 (the wall that
+    # was absorbed), not depth=0 (post-trade live state).
+    #
+    # Fallback to live DOM if max-seen tracker is empty (cold start).
     _book_sz = 0.0
     with _L2_LOCK:
-        _dom = L2_STATE["dom"].get(symbol, {})
-        if side == "b":      # aggressive buy hits the ask side
-            _book_sz = float(_dom.get("asks", {}).get(qp, 0))
-        elif side == "s":    # aggressive sell hits the bid side
-            _book_sz = float(_dom.get("bids", {}).get(qp, 0))
-        # side == "n": neutral/unknown — leave _book_sz = 0 (no meaningful book context)
+        # Primary: rolling-max tracker (the wall that was THERE)
+        mbs = _MAX_BOOK_SEEN.get(symbol, {})
+        ent = mbs.get(qp)
+        if ent is not None:
+            _book_sz = float(ent.get('depth') or 0)
+        # Fallback: live DOM (in case tracker is cold for this price)
+        if _book_sz == 0.0:
+            _dom = L2_STATE["dom"].get(symbol, {})
+            if side == "b":      # aggressive buy hits the ask side
+                _book_sz = float(_dom.get("asks", {}).get(qp, 0))
+            elif side == "s":    # aggressive sell hits the bid side
+                _book_sz = float(_dom.get("bids", {}).get(qp, 0))
+        # side == "n": neutral/unknown — _book_sz from tracker (no side gate)
 
     _pending_emits = []       # collect fast OHLCV payloads (no heavy computation)
     _pending_enriched = []    # collect enriched payloads (bp, depth_deltas, etc.) at 5Hz
@@ -1048,49 +1261,72 @@ def _feed_candle(symbol: str, price: float, volume: int, timestamp: float,
             if cur is None or cur["t"] != boundary:
                 # Close previous candle if it exists
                 if cur is not None:
+                    # 2026-05-06 PERF FIX: gate expensive per-close enrichment
+                    # by _ACTIVE_TFS. Frontend only ever requests tf=1m (verified
+                    # in /api/l2/candles access log), but pre-fix this loop ran
+                    # depth_deltas + divergence + absorption snapshots for ALL
+                    # 11 timeframes (5s/15s/30s/200s/5m/10m/15m/30m/1h/4h
+                    # included). 5s alone fires 12× per minute. Combined waste
+                    # ≈ 20 expensive bar-closes/min vs the 1 we actually need.
+                    # Now: only do the heavy work for active TFs. Lightweight
+                    # OHLC tracking + cum_delta still happens for all TFs (cheap)
+                    # so historical 5m/15m bars remain available via get_candles
+                    # if a pane ever subscribes.
+                    is_active_tf = tf in _ACTIVE_TFS
+
                     # ── Cumulative Delta tracking on candle close ──
+                    # Lightweight; keep for all TFs.
                     candle_bp = cur.get("bp", {})
                     candle_buy = sum(v[0] for v in candle_bp.values() if isinstance(v, list) and len(v) >= 2)
                     candle_sell = sum(v[1] for v in candle_bp.values() if isinstance(v, list) and len(v) >= 2)
                     candle_delta = candle_buy - candle_sell
                     _CUM_DELTA[symbol][tf] += candle_delta
-                    # Record delta history for divergence detection
-                    _DELTA_HISTORY[symbol][tf].append({
-                        "t": cur["t"],
-                        "high": cur["h"],
-                        "low": cur["l"],
-                        "delta": _CUM_DELTA[symbol][tf],
-                    })
-                    # Keep only last 50 entries
-                    if len(_DELTA_HISTORY[symbol][tf]) > 50:
-                        _DELTA_HISTORY[symbol][tf] = _DELTA_HISTORY[symbol][tf][-50:]
-                    # Check for divergence
-                    div_hit = _detect_delta_divergence(symbol, tf)
-                    if div_hit:
-                        cur["delta_div"] = div_hit
 
-                    # ── Snapshot absorption + depth_deltas onto closing candle ──
-                    # So history bars carry this data for frontend rendering.
-                    candle_bp_keys = list(cur.get("bp", {}).keys())
-                    if candle_bp_keys:
-                        _dd = _compute_depth_deltas(symbol, cur["t"], timestamp, candle_bp_keys)
-                        if _dd:
-                            cur["depth_deltas"] = _dd
-                        # Snapshot absorption scores for prices in this candle's range
-                        _abs_global = L2_STATE["absorption"].get(symbol, {})
-                        if _abs_global:
-                            _abs_snap = {}
-                            for pk in candle_bp_keys:
-                                if pk in _abs_global:
-                                    _abs_snap[pk] = _abs_global[pk]
-                            if _abs_snap:
-                                cur["absorption"] = _abs_snap
+                    if is_active_tf:
+                        # Record delta history for divergence detection (active TFs only)
+                        _DELTA_HISTORY[symbol][tf].append({
+                            "t": cur["t"],
+                            "high": cur["h"],
+                            "low": cur["l"],
+                            "delta": _CUM_DELTA[symbol][tf],
+                        })
+                        # Keep only last 50 entries
+                        if len(_DELTA_HISTORY[symbol][tf]) > 50:
+                            _DELTA_HISTORY[symbol][tf] = _DELTA_HISTORY[symbol][tf][-50:]
+                        # Check for divergence (walks history — skip for inactive TFs)
+                        div_hit = _detect_delta_divergence(symbol, tf)
+                        if div_hit:
+                            cur["delta_div"] = div_hit
+
+                        # ── Snapshot absorption + depth_deltas onto closing candle ──
+                        # So history bars carry this data for frontend rendering.
+                        candle_bp_keys = list(cur.get("bp", {}).keys())
+                        if candle_bp_keys:
+                            _dd = _compute_depth_deltas(symbol, cur["t"], timestamp, candle_bp_keys)
+                            if _dd:
+                                cur["depth_deltas"] = _dd
+                            # Snapshot absorption scores for prices in this candle's range
+                            _abs_global = L2_STATE["absorption"].get(symbol, {})
+                            if _abs_global:
+                                _abs_snap = {}
+                                for pk in candle_bp_keys:
+                                    if pk in _abs_global:
+                                        _abs_snap[pk] = _abs_global[pk]
+                                if _abs_snap:
+                                    cur["absorption"] = _abs_snap
 
                     frozen = _freeze_candle(cur)
                     _CANDLES[symbol][tf].append(frozen)
                     # Persist bubble profile to disk (1m only) so it survives restarts
                     if tf == _BP_PERSIST_TF:
                         _bp_save_candle(symbol, frozen)
+                    # Bar-level signal engine — emits absorption/exhaustion/
+                    # aggression at most once per bar each (zero spam).
+                    if tf == '1m':
+                        try:
+                            _emit_bar_signals(symbol, tf, frozen, _CANDLES[symbol][tf])
+                        except Exception as e:
+                            log.debug(f"bar_signal compute err: {e}")
                 # Start new candle with bubble profile
                 bp = {}
                 bp[qp] = [volume if side == "b" else 0,
@@ -1128,8 +1364,11 @@ def _feed_candle(symbol: str, price: float, volume: int, timestamp: float,
                     else:
                         bp[qp] = [volume if side == "b" else 0,
                                   volume if side == "s" else 0,
-                                  None, None,   # [2], [3] reserved
+                                  None, None,   # [2]=fp_score, [3]=true_abs (set below)
                                   _book_sz]     # [4]=book_size_at_trade
+                        entry = bp[qp]
+                    # Update fp_score (entry[2]) + true_abs flag (entry[3])
+                    _update_bp_signals(entry, symbol, qp)
 
                 # ── bp_large: same as bp but only trades >= threshold ──
                 _LARGE_THRESHOLD = {"NQ": 10, "ES": 20}
@@ -1219,6 +1458,704 @@ def _feed_candle(symbol: str, price: float, volume: int, timestamp: float,
                 _socketio.emit("candle_enriched", _emit_enrich, namespace="/")
             except Exception as e:
                 log.warning("candle_enriched emit failed: %s", e)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# BAR-LEVEL SIGNAL ENGINE — Absorption / Exhaustion / Aggression
+# ═══════════════════════════════════════════════════════════════════
+#
+# Footprint-grade bar-level detection. Runs on candle close.
+# Emits ≤1 of each signal type per bar via 'bar_signal' socket event.
+# Most bars produce ZERO signals — only fires when criteria converge.
+#
+# Inputs (all already populated by upstream engine):
+#   candle.bp[priceStr]    = [buyVol, sellVol, fp_score, true_abs, max_book_size]
+#   candle.h, l, o, c, v   = OHLCV
+#   _REFILL_TRACKER[sym]   = per-level refill classification
+#   history (deque)        = prior closed bars for swing/divergence comparison
+
+# ── Investigation Logger ──────────────────────────────────────────────────
+# OVERHAULED 2026-05-04. Old version had three problems flagged by audit:
+#   (1) Comment claimed "auto-stops 09:00 EDT 2026-04-27" — no stop logic existed,
+#       so it kept writing past expiry (today is 2026-05-04, ~7 days past expiry).
+#   (2) `open(path, "a")` synchronously per call inside _CANDLE_LOCK — measurable
+#       hot-path drag during high print rates.
+#   (3) `_INVEST_DAY_TAG` set at module import → cross-midnight UTC misroutes all
+#       next-day writes to the prior day's file.
+#
+# New design:
+#   - Off by default (`_INVEST_LOG_ENABLED = False`); operator flips on for
+#     targeted debugging by setting env var INVEST_LOG=1
+#   - When on: buffered writes via in-memory queue, flushed by a background thread
+#     at 1 Hz. Hot path's _invest_log() is a non-blocking enqueue.
+#   - Day tag computed per-write (not per-import) so cross-midnight writes route
+#     correctly.
+#   - When env var off, _invest_log() is a no-op (single attribute check).
+import os as _os_invest
+
+_INVEST_DIR = "/Users/kaali/Desktop/altaris-dev/investigation"
+_INVEST_LOG_LOCK = threading.Lock()  # protects _invest_buffer
+_INVEST_BUFFER: list = []            # (category, payload_str) tuples — drained by flusher thread
+_INVEST_LOG_ENABLED = bool(_os_invest.environ.get("INVEST_LOG"))
+_INVEST_FLUSHER_STARTED = False
+
+
+def _invest_log(category: str, payload: dict) -> None:
+    """Best-effort enqueue for offline analysis. Off by default — opt in via
+    `INVEST_LOG=1` env var. Hot-path-safe: non-blocking enqueue, no I/O,
+    no JSON serialization on the call site (deferred to flusher).
+    """
+    if not _INVEST_LOG_ENABLED:
+        return
+    try:
+        line = json.dumps(payload, default=str)
+        with _INVEST_LOG_LOCK:
+            _INVEST_BUFFER.append((category, line))
+    except Exception:
+        pass
+
+
+def _invest_log_flusher():
+    """Background thread — drains _INVEST_BUFFER to disk every 1s.
+    Files routed by today's UTC date (computed per flush, not import-time).
+    """
+    while _INVEST_LOG_ENABLED:
+        try:
+            time.sleep(1.0)
+            with _INVEST_LOG_LOCK:
+                if not _INVEST_BUFFER:
+                    continue
+                batch = _INVEST_BUFFER[:]
+                _INVEST_BUFFER.clear()
+            # Group by category to minimize file open() calls
+            by_cat: dict = {}
+            for cat, line in batch:
+                by_cat.setdefault(cat, []).append(line)
+            day_tag = datetime.utcnow().strftime("%Y%m%d")
+            for cat, lines in by_cat.items():
+                path = f"{_INVEST_DIR}/{cat}/{cat}_{day_tag}.jsonl"
+                try:
+                    _os_invest.makedirs(_os_invest.path.dirname(path), exist_ok=True)
+                    with open(path, "a") as f:
+                        for ln in lines:
+                            f.write(ln); f.write("\n")
+                except Exception:
+                    pass
+        except Exception:
+            time.sleep(2.0)
+
+
+if _INVEST_LOG_ENABLED and not _INVEST_FLUSHER_STARTED:
+    threading.Thread(target=_invest_log_flusher, daemon=True, name="invest-flush").start()
+    _INVEST_FLUSHER_STARTED = True
+    log.info("[INVEST-LOG] enabled via INVEST_LOG env, background flusher started")
+
+
+# ── Adaptive thresholds: replace static lot floors with session-relative ──
+# Rolling per-symbol distributions of (per-level volume, per-bar volume).
+# Used to derive regime-aware gates: floor = median × 0.30. Warmup samples
+# fall back to constants until N reaches the structural minimum.
+_LEVEL_VOL_SAMPLES: dict = defaultdict(lambda: deque(maxlen=500))
+_BAR_VOL_SAMPLES:   dict = defaultdict(lambda: deque(maxlen=200))
+
+
+def _adaptive_level_floor(symbol: str, fallback: float = 1.0) -> float:
+    """Return 45 % of session-rolling median per-level volume.
+
+    Tuning history:
+      0.30  initial — fire rate 87% of bars (visual noise wall)
+      0.50  2026-04-27 tightening — fire rate dropped to 36% of bars (under target)
+      0.45  2026-04-28 fine-tune — re-loosened slightly to land in 50-55% target band
+            (38h investigation snapshot data showed 36% under-fires the actual
+            absorption activity which the snapshots saw at 79.7% of windows)
+    """
+    samples = _LEVEL_VOL_SAMPLES.get(symbol)
+    if not samples or len(samples) < 30:
+        return fallback
+    sorted_s = sorted(samples)
+    median = sorted_s[len(sorted_s) // 2]
+    return median * 0.45
+
+
+def _adaptive_bar_floor(symbol: str, fallback: float = 5.0) -> float:
+    """Return 45 % of session-rolling median bar volume.
+
+    Same calibration history as _adaptive_level_floor (0.30 → 0.50 → 0.45).
+    Filters out micro-volume bars where any signal is noise.
+    """
+    samples = _BAR_VOL_SAMPLES.get(symbol)
+    if not samples or len(samples) < 10:
+        return fallback
+    sorted_s = sorted(samples)
+    median = sorted_s[len(sorted_s) // 2]
+    return median * 0.45
+
+
+def _wilson_lower(k: int, n: int, z: float = 1.96) -> float:
+    """95% Wilson-score confidence lower bound on the binomial proportion k/n.
+    Used in aggression's stacked-imbalance check to reject side-dominance
+    claims that are not statistically defensible (small N, marginal share).
+    z = 1.96 is the standard normal critical value for 95% confidence — a
+    universal statistical constant, not a magic threshold.
+    """
+    if n <= 0:
+        return 0.0
+    p_hat = k / n
+    denom = 1.0 + (z * z) / n
+    center = p_hat + (z * z) / (2.0 * n)
+    margin = z * math.sqrt((p_hat * (1.0 - p_hat) + (z * z) / (4.0 * n)) / n)
+    return max(0.0, (center - margin) / denom)
+
+
+def _bp_level_stats(bp):
+    """Convert bp dict to sorted level list with delta + imbalance."""
+    out = []
+    for ps, e in bp.items():
+        if not isinstance(e, list) or len(e) < 2:
+            continue
+        b = e[0] or 0
+        s = e[1] or 0
+        if b + s == 0:
+            continue
+        out.append({
+            'price': float(ps),
+            'b': b, 's': s,
+            'tot': b + s,
+            'delta': b - s,
+            'imbalance': abs(b - s) / (b + s),  # 0=balanced, 1=pure
+        })
+    out.sort(key=lambda x: x['price'])
+    return out
+
+
+def _bar_delta(bar):
+    """Sum of (buy − sell) across all bp price levels in a bar."""
+    bp = bar.get("bp")
+    if not bp:
+        return 0
+    d = 0
+    for e in bp.values():
+        if isinstance(e, list) and len(e) >= 2:
+            d += (e[0] or 0) - (e[1] or 0)
+    return d
+
+
+def _bar_total_volume(bar):
+    bp = bar.get("bp")
+    if not bp:
+        return 0
+    t = 0
+    for e in bp.values():
+        if isinstance(e, list) and len(e) >= 2:
+            t += (e[0] or 0) + (e[1] or 0)
+    return t
+
+
+def _detect_bar_absorption(symbol, candle):
+    """ABSORPTION: large passive limit orders absorbing aggressive flow with
+    minimal price displacement.
+
+    Confirmation cascade (ALL required):
+      (1) High volume at level: total ≥ P75 of bar's per-level volumes
+      (2) Balanced delta: imbalance < 0.40 (delta NOT expanding despite flow)
+      (3) Refill holding: refill_class ∈ {instant, fast, slow} (not 'gone')
+      (4) Minimal displacement: level near a bar extreme (price tested but held)
+
+    Returns: list of {price, side, volume, strength, ...} — top 1.
+    """
+    bp = candle.get("bp")
+    if not bp:
+        return []
+    levels = _bp_level_stats(bp)
+    if len(levels) < 3:
+        return []
+
+    h = candle.get("h", 0)
+    l = candle.get("l", 0)
+    bar_range = max(h - l, 0.001)
+    bar_total = sum(lv['tot'] for lv in levels)
+    # Adaptive bar floor — replaces hard-coded `< 5` with regime-aware gate
+    if bar_total < _adaptive_bar_floor(symbol, fallback=5.0):
+        return []
+
+    vols = sorted(lv['tot'] for lv in levels)
+    p75 = vols[int(len(vols) * 0.75)] if vols else 0
+    avg_vol = bar_total / max(len(levels), 1)
+    # Adaptive level floor — replaces hard-coded `< 5` per level
+    level_floor = _adaptive_level_floor(symbol, fallback=1.0)
+
+    candidates = []
+    for lv in levels:
+        # (1) High volume gate — must beat both the bar's P75 (relative to
+        # this bar's own distribution) AND the session-rolling level floor
+        # (relative to recent regime). Both gates required.
+        if lv['tot'] < p75 or lv['tot'] < level_floor:
+            continue
+        # (2) IMBALANCE GATE — INVERTED 2026-05-04 from data audit.
+        # Original heuristic was "balanced flow = absorption" but 24,121-bar
+        # backtest showed it was empirically wrong: "balanced" levels are
+        # transit/VWAP zones, not real defense. REAL absorption is when
+        # aggressive flow on ONE side dominates but the level still holds.
+        # Ledger numbers (level held ±1tick over 3 bars):
+        #   B1+B2(≤0.30)+B4(≥0.50)  CURRENT pre-fix → 16.9% (worse than random)
+        #   B1+B2(≥0.50)+B4(≤0.40)  inverted both    → 30.1%
+        # Old: if lv['imbalance'] > 0.30: continue   (reject imbalanced)
+        if lv['imbalance'] < 0.50:
+            continue
+        # (3) Refill class gate — unchanged
+        # 2026-05-05 BUG FIX: was `f"{lv['price']:.2f}"` which produces
+        # "X.00"/"X.50" — but _REFILL_TRACKER stores keys via line 4095's
+        # `str(round(float(ps), 2))` which drops trailing zeros and produces
+        # "X.0"/"X.5". 50% of NQ tick prices (.0 and .5) silently key-missed,
+        # losing refill_class on 184 of 551 fires/day (33%) — those fires
+        # got refill_boost=1.0 instead of 1.3-1.5 and could only paint via
+        # strength≥3.5 extreme path (92.7% silently dropped from chart).
+        # Now uses the same str(round(...)) formatter as the writer.
+        ps_str = str(round(float(lv['price']), 2))
+        refill = _REFILL_TRACKER.get(symbol, {}).get(ps_str)
+        refill_class = refill.get('classification') if refill else None
+        if refill_class == 'gone':
+            continue  # level wiped out — not absorption
+        # (4) PROXIMITY GATE — INVERTED 2026-05-04. Production formula gives
+        # ep=1.0 at MID-bar (pos=0.5) and ep=0.0 at extremes (pos=0 or 1) —
+        # opposite of the variable name. Old check `if ep < 0.50: continue`
+        # rejected near-extreme levels and KEPT mid-bar. Empirically this
+        # filtered AWAY the better signals: mid-bar high-vol levels are
+        # bar-shape noise; near-extreme levels (where price was tested AND
+        # rejected) carry the defense signal.
+        # New: keep ep ≤ 0.40 (i.e. position ∈ [0,0.20] ∪ [0.80,1.0]) — the
+        # outer 20% of the bar where defense actually shows up.
+        position = (lv['price'] - l) / bar_range
+        # ep = 1.0 at mid (pos=0.5), 0.0 at h/l (pos=0 or 1)
+        extreme_proximity = max(0.0, 1.0 - 2.0 * abs(position - 0.5))
+        if extreme_proximity > 0.40:
+            continue
+
+        # Strength composition
+        vol_score = lv['tot'] / max(avg_vol, 1.0)
+        refill_boost = {'instant': 1.5, 'fast': 1.3, 'slow': 1.0}.get(refill_class, 1.0)
+        # PROPOSAL C (2026-04-28): replenishment-ratio multiplier on top of
+        # the timing-based refill_boost. ratio = avg_refill_size / avg_hit_size.
+        # 1.0 = neutral (level fully restored on average), >1 = grew past prior
+        # depth (very strong defense), <1 = partial restoration. Bound to
+        # [0.7, 1.5] so a single noisy measurement can't dominate the score.
+        rep_ratio = (refill or {}).get('replenish_ratio')
+        rep_boost = max(0.7, min(1.5, rep_ratio)) if (rep_ratio is not None) else 1.0
+        strength = vol_score * refill_boost * rep_boost * (0.5 + 0.5 * extreme_proximity)
+        # (5) Strength minimum gate — tuned 2026-04-27.
+        # Backtest: strength p25=1.65, p50=2.16, p75=2.71, p95=3.61.
+        # Floor at 1.5 cuts ~25% of weakest signals — those that fired
+        # because of marginal volume, not real defense.
+        if strength < 1.5:
+            continue
+
+        # Side: which direction is implied by the absorption
+        # Absorption near low = bid defended → bullish (sellers exhausted)
+        # Absorption near high = ask defended → bearish (buyers exhausted)
+        side = 'bullish' if position < 0.5 else 'bearish'
+
+        candidates.append({
+            'price':             lv['price'],
+            'side':              side,
+            'volume':            lv['tot'],
+            'b':                 lv['b'],
+            's':                 lv['s'],
+            'imbalance':         round(lv['imbalance'], 3),
+            'strength':          round(strength, 3),
+            'refill_class':      refill_class,
+            'extreme_proximity': round(extreme_proximity, 2),
+        })
+
+    candidates.sort(key=lambda c: -c['strength'])
+    return candidates[:1]  # ≤ 1 absorption signal per bar
+
+
+def _detect_bar_exhaustion(symbol, tf, candle, history):
+    """EXHAUSTION: delta climax with price failure to extend.
+
+    Confirmation:
+      Sell exhaustion (at HIGHS):
+        - Bar makes new high vs recent swing
+        - But bar_delta is significantly LOWER than swing-bar delta
+          (buyers spent more energy with less result → exhausted)
+
+      Buy exhaustion (at LOWS):
+        - Bar makes new low vs recent swing
+        - But bar_delta is significantly HIGHER (less negative) than swing-bar delta
+          (sellers exhausted)
+
+    Returns: {side, price, volume, strength, ...} or None.
+    """
+    if not history or len(history) < 5:
+        return None
+    bp = candle.get("bp")
+    if not bp:
+        return None
+
+    bar_total = _bar_total_volume(candle)
+    # Adaptive bar floor — was hard-coded `< 10`, now regime-relative
+    if bar_total < _adaptive_bar_floor(symbol, fallback=10.0):
+        return None
+
+    bar_delta = _bar_delta(candle)
+    h = candle.get("h", 0)
+    l = candle.get("l", 0)
+
+    # Recent swing window — RELAXED 2026-04-27: 5 → 10 bars.
+    # 5-bar window was too narrow — most "new highs/lows" within 5 bars
+    # are just minor extension, rarely the true swing top/bottom that
+    # exhaustion patterns mark. 10 bars catches genuine turning points.
+    recent = list(history)[-10:]
+    if len(recent) < 5:
+        return None
+
+    swing_high_idx, _ = max(enumerate(recent), key=lambda x: x[1].get("h", 0))
+    swing_low_idx,  _ = min(enumerate(recent), key=lambda x: x[1].get("l", 0))
+    swing_high_p = recent[swing_high_idx].get("h", 0)
+    swing_low_p  = recent[swing_low_idx].get("l", 0)
+
+    # Divergence threshold RELAXED 2026-04-27: 0.7 → 0.55.
+    DELTA_DIVERGENCE = 0.55
+
+    # NQ tick = 0.25. Tolerance allows the bar to TEST/REJECT the swing
+    # high or low without strictly exceeding it — this is exactly when
+    # exhaustion most often prints (rejection candle at the high).
+    SWING_TOL = 0.25
+
+    # Minimum prior_delta magnitude — some net direction must exist
+    # to "exhaust." Was strictly > 0 / < 0; relaxed to ≥ 5 contracts of
+    # net flow so doji-like prior bars don't disqualify the test.
+    MIN_PRIOR_DELTA = 5
+
+    # ── PROPOSAL E (2026-04-28): 3-bar cumulative delta decay ───────────────
+    # Single-bar comparison can miss exhaustion that builds across multiple
+    # bars — buyers spending energy across 3 bars to make a marginal new
+    # high while the prior swing was made in 3 bars of much stronger flow.
+    # We compute 3-bar cumulative delta on BOTH sides (current trailing 3
+    # vs the 3 bars centered on the swing) and accept the OR with the
+    # single-bar path. Decay ratio uses the same DELTA_DIVERGENCE so the
+    # detector is internally consistent.
+    DECAY_3BAR = DELTA_DIVERGENCE  # 0.55 — share with single-bar path
+    MIN_3BAR_PRIOR_DELTA = 12      # 3× single-bar floor (5 → 15-ish), keep doji-3bar out
+
+    def _cum3(idx_list):
+        """Sum _bar_delta over idx positions in `recent` (clamped)."""
+        return sum(_bar_delta(recent[i]) for i in idx_list if 0 <= i < len(recent))
+
+    # Trailing 3 bars (current bar plus the 2 history bars right before it).
+    # `candle` itself is the current bar; `recent` is history up through prior.
+    cur_trail = bar_delta + _cum3([len(recent) - 1, len(recent) - 2])
+
+    # SELL EXHAUSTION (top): bar tests/exceeds swing high but delta failed to expand.
+    # Was `h > swing_high_p` (strict) — many bars REJECT at the high without
+    # exceeding by a full tick. Relaxed to within-tick of the swing high.
+    if h >= swing_high_p - SWING_TOL:
+        prior_swing = recent[swing_high_idx]
+        prior_delta = _bar_delta(prior_swing)
+        # Buyers exhausted: delta lower than the swing-high bar despite testing/making new high
+        if prior_delta >= MIN_PRIOR_DELTA and bar_delta < prior_delta * DELTA_DIVERGENCE:
+            strength = (prior_delta - bar_delta) / max(abs(prior_delta), 1)
+            return {
+                'side':         'sell_exhaustion',
+                'price':        h,
+                'volume':       bar_total,
+                'cur_delta':    bar_delta,
+                'prior_delta':  prior_delta,
+                'strength':     round(strength, 3),
+                'reason':       'new_high_delta_div' if h > swing_high_p else 'rejected_at_high',
+            }
+        # Proposal E secondary path — 3-bar cumulative delta decay
+        prior_trail = _cum3([swing_high_idx - 1, swing_high_idx, swing_high_idx + 1])
+        if prior_trail >= MIN_3BAR_PRIOR_DELTA and cur_trail < prior_trail * DECAY_3BAR:
+            strength = (prior_trail - cur_trail) / max(abs(prior_trail), 1)
+            return {
+                'side':         'sell_exhaustion',
+                'price':        h,
+                'volume':       bar_total,
+                'cur_delta':    bar_delta,
+                'prior_delta':  prior_delta,
+                'cur_3bar_delta':   cur_trail,
+                'prior_3bar_delta': prior_trail,
+                'strength':     round(strength, 3),
+                'reason':       '3bar_decay_at_high',
+            }
+
+    # BUY EXHAUSTION (bottom): bar tests/breaks swing low but delta less negative
+    if l <= swing_low_p + SWING_TOL:
+        prior_swing = recent[swing_low_idx]
+        prior_delta = _bar_delta(prior_swing)
+        if prior_delta <= -MIN_PRIOR_DELTA and bar_delta > prior_delta * DELTA_DIVERGENCE:
+            strength = (bar_delta - prior_delta) / max(abs(prior_delta), 1)
+            return {
+                'side':         'buy_exhaustion',
+                'price':        l,
+                'volume':       bar_total,
+                'cur_delta':    bar_delta,
+                'prior_delta':  prior_delta,
+                'strength':     round(strength, 3),
+                'reason':       'new_low_delta_div' if l < swing_low_p else 'rejected_at_low',
+            }
+        # Proposal E secondary path — 3-bar cumulative delta decay (sell side)
+        prior_trail = _cum3([swing_low_idx - 1, swing_low_idx, swing_low_idx + 1])
+        if prior_trail <= -MIN_3BAR_PRIOR_DELTA and cur_trail > prior_trail * DECAY_3BAR:
+            strength = (cur_trail - prior_trail) / max(abs(prior_trail), 1)
+            return {
+                'side':         'buy_exhaustion',
+                'price':        l,
+                'volume':       bar_total,
+                'cur_delta':    bar_delta,
+                'prior_delta':  prior_delta,
+                'cur_3bar_delta':   cur_trail,
+                'prior_3bar_delta': prior_trail,
+                'strength':     round(strength, 3),
+                'reason':       '3bar_decay_at_low',
+            }
+
+    return None
+
+
+def _detect_bar_aggression(symbol, tf, candle, history):
+    """AGGRESSION: one-sided delta surge with stacked imbalance + follow-through.
+
+    Confirmation cascade (ALL required):
+      (1) Delta surge: |bar_delta| ≥ P75 of last 10 bars' |delta|  (DYNAMIC)
+      (2) Stacked imbalance: 3+ adjacent prices with same-side dominance ≥ 70%
+      (3) Price follow-through: close in trade direction (c>o for buy, c<o for sell)
+
+    Returns: {side, price, levels, range, volume, strength, ...} or None.
+    """
+    bp = candle.get("bp")
+    if not bp:
+        return None
+    levels = _bp_level_stats(bp)
+    if len(levels) < 3:
+        return None
+
+    bar_total = sum(lv['tot'] for lv in levels)
+    # Adaptive bar floor — regime-relative noise gate
+    if bar_total < _adaptive_bar_floor(symbol, fallback=10.0):
+        return None
+
+    h = candle.get("h", 0)
+    l = candle.get("l", 0)
+    o = candle.get("o", 0)
+    c = candle.get("c", 0)
+    bar_delta = sum(lv['delta'] for lv in levels)
+
+    # (1) Delta surge — dynamic threshold from recent history
+    if history and len(history) >= 5:
+        recent_abs_deltas = []
+        for prior in list(history)[-10:]:
+            recent_abs_deltas.append(abs(_bar_delta(prior)))
+        if recent_abs_deltas:
+            recent_abs_deltas.sort()
+            delta_p75 = recent_abs_deltas[int(len(recent_abs_deltas) * 0.75)]
+            if abs(bar_delta) < max(delta_p75, 5):
+                return None  # not a surge
+
+    # (2) Stacked imbalance — find runs of 3+ same-side dominant levels
+    SIDE_THRESHOLD = 0.70
+    runs = []
+    cur_run = []
+    cur_side = None
+
+    def _flush():
+        if cur_run and len(cur_run) >= 3:
+            runs.append({
+                'side':   cur_side,
+                'levels': cur_run.copy(),
+                'total':  sum(x['tot'] for x in cur_run),
+            })
+
+    for lv in levels:  # sorted by price ascending
+        # Per-level noise: skip levels below the adaptive level floor
+        # (was hard-coded `< 2`). Below this, side dominance is meaningless.
+        if lv['tot'] < _adaptive_level_floor(symbol, fallback=2.0):
+            _flush()
+            cur_run = []
+            cur_side = None
+            continue
+        # Wilson 95% CI lower bound on side share — replaces raw share check.
+        # Rejects small-N levels where high raw % is statistical luck.
+        # E.g. 5-lot level 4-buy: raw=0.80 but Wilson=0.38 → not aggressive.
+        # 200-lot level 160-buy: raw=0.80 and Wilson=0.74 → confirmed aggressive.
+        wilson_b = _wilson_lower(lv['b'], lv['tot'])
+        wilson_s = _wilson_lower(lv['s'], lv['tot'])
+        if wilson_b >= SIDE_THRESHOLD:
+            side = 'b'
+        elif wilson_s >= SIDE_THRESHOLD:
+            side = 's'
+        else:
+            _flush()
+            cur_run = []
+            cur_side = None
+            continue
+        if cur_side is None or side == cur_side:
+            cur_side = side
+            cur_run.append(lv)
+        else:
+            _flush()
+            cur_run = [lv]
+            cur_side = side
+    _flush()
+
+    if not runs:
+        return None
+
+    best_run = max(runs, key=lambda r: r['total'])
+
+    # (3) Price follow-through
+    if best_run['side'] == 'b' and c <= o:
+        return None
+    if best_run['side'] == 's' and c >= o:
+        return None
+
+    sorted_prices = sorted(x['price'] for x in best_run['levels'])
+    principal = sorted_prices[len(sorted_prices) // 2]
+    n_levels = len(best_run['levels'])
+
+    strength = (best_run['total'] / bar_total) * (n_levels / 3.0)
+
+    return {
+        'side':        'buy_aggression' if best_run['side'] == 'b' else 'sell_aggression',
+        'price':       principal,
+        'price_range': [sorted_prices[0], sorted_prices[-1]],
+        'levels':      n_levels,
+        'volume':      best_run['total'],
+        'bar_delta':   bar_delta,
+        'strength':    round(strength, 3),
+    }
+
+
+def _emit_bar_signals(symbol, tf, candle, history):
+    """Run all 3 detectors on a closed bar; emit a single bar_signal event
+    only when at least one signal fires. Most bars produce no event.
+    """
+    if _socketio is None:
+        return
+
+    # ── Update rolling distributions for adaptive floors ──
+    # Recorded BEFORE detection so the next bar's gate is regime-current.
+    bp = candle.get("bp")
+    if bp:
+        bar_vol = 0
+        for entry in bp.values():
+            if isinstance(entry, list) and len(entry) >= 2:
+                lv = (entry[0] or 0) + (entry[1] or 0)
+                if lv > 0:
+                    _LEVEL_VOL_SAMPLES[symbol].append(lv)
+                    bar_vol += lv
+        if bar_vol > 0:
+            _BAR_VOL_SAMPLES[symbol].append(bar_vol)
+
+    # ── INVESTIGATION LOG: capture this bar's full context for offline replay ──
+    _now_ms = int(time.time() * 1000)
+    _bar_t = candle.get("t", 0)
+    if bp:
+        try:
+            _invest_log("candle_bp", {
+                "ts_ms":  _now_ms,
+                "bar_t":  _bar_t,
+                "symbol": symbol,
+                "tf":     tf,
+                "ohlc":   {
+                    "o": candle.get("o"),
+                    "h": candle.get("h"),
+                    "l": candle.get("l"),
+                    "c": candle.get("c"),
+                    "v": candle.get("v"),
+                },
+                "bp":     {k: list(v) if isinstance(v, list) else v for k, v in bp.items()},
+                "delta":  _bar_delta(candle),
+            })
+        except Exception:
+            pass
+    # Snapshot adaptive floors at this moment (every bar = ~every minute)
+    try:
+        _level_samples = _LEVEL_VOL_SAMPLES.get(symbol)
+        _bar_samples   = _BAR_VOL_SAMPLES.get(symbol)
+        _level_med = None
+        _bar_med = None
+        if _level_samples and len(_level_samples) >= 1:
+            _ls = sorted(_level_samples)
+            _level_med = _ls[len(_ls) // 2]
+        if _bar_samples and len(_bar_samples) >= 1:
+            _bs = sorted(_bar_samples)
+            _bar_med = _bs[len(_bs) // 2]
+        _invest_log("floors_evolution", {
+            "ts_ms":           _now_ms,
+            "symbol":          symbol,
+            "level_floor":     _adaptive_level_floor(symbol),
+            "bar_floor":       _adaptive_bar_floor(symbol),
+            "level_samples_n": len(_level_samples) if _level_samples else 0,
+            "bar_samples_n":   len(_bar_samples) if _bar_samples else 0,
+            "level_median":    _level_med,
+            "bar_median":      _bar_med,
+        })
+    except Exception:
+        pass
+
+    try:
+        abs_events = _detect_bar_absorption(symbol, candle)
+    except Exception as e:
+        abs_events = []
+        log.warning(f"[BAR_SIGNAL] absorption detect err: {e}")
+    try:
+        exh_event = _detect_bar_exhaustion(symbol, tf, candle, history)
+    except Exception as e:
+        exh_event = None
+        log.warning(f"[BAR_SIGNAL] exhaustion detect err: {e}")
+    try:
+        agg_event = _detect_bar_aggression(symbol, tf, candle, history)
+    except Exception as e:
+        agg_event = None
+        log.warning(f"[BAR_SIGNAL] aggression detect err: {e}")
+
+    log.info(
+        f"[BAR_SIGNAL] {symbol} {tf} t={candle.get('t')} "
+        f"abs={len(abs_events)} exh={'Y' if exh_event else 'N'} "
+        f"agg={'Y' if agg_event else 'N'} bar_vol={_bar_total_volume(candle)} "
+        f"levels={len(candle.get('bp', {}))}"
+    )
+
+    # INVESTIGATION LOG: record EVERY bar-signal computation outcome,
+    # including 'no signal' results, so we can analyze why the system
+    # missed events (false negatives) just as much as why it fired.
+    try:
+        _invest_log("bar_signals", {
+            "ts_ms":      _now_ms,
+            "bar_t":      _bar_t,
+            "symbol":     symbol,
+            "tf":         tf,
+            "phase":      "fired" if (abs_events or exh_event or agg_event) else "no_signal",
+            "absorption": abs_events,
+            "exhaustion": exh_event,
+            "aggression": agg_event,
+            "bar_total":  _bar_total_volume(candle),
+            "level_count": len(candle.get('bp', {})),
+            "thresholds_at_emit": {
+                "level_floor": _adaptive_level_floor(symbol),
+                "bar_floor":   _adaptive_bar_floor(symbol),
+            },
+        })
+    except Exception:
+        pass
+
+    if not abs_events and not exh_event and not agg_event:
+        return
+
+    try:
+        _socketio.emit('bar_signal', {
+            'symbol':     symbol,
+            'tf':         tf,
+            't':          candle.get("t", 0),
+            'absorption': abs_events,
+            'exhaustion': exh_event,
+            'aggression': agg_event,
+        }, namespace='/')
+        log.info(f"[BAR_SIGNAL] EMITTED {symbol} {tf} t={candle.get('t')}")
+    except Exception as e:
+        log.warning(f"[BAR_SIGNAL] emit err: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1332,6 +2269,54 @@ def get_refill_stats(symbol: str) -> dict:
     """Return refill speed data per price for VP overlay.
     {price_str: {avg_ms, count, classification}}"""
     return dict(_REFILL_TRACKER.get(symbol, {}))
+
+
+def _update_bp_signals(entry: list, symbol: str, qp: str) -> None:
+    """Update entry[2]=fp_score and entry[3]=true_abs flag.
+
+    Called after each bp update in the trade hot path.
+
+    fp_score (entry[2]) — Shannon-derived imbalance asymmetry:
+        H(p) = -[p·log2(p) + (1-p)·log2(1-p)] where p = buy / (buy + sell)
+        fp_score = 1.0 - H  → 0.0=perfectly balanced, 1.0=pure one-sided
+
+    true_abs (entry[3]) — multi-condition L2-confirmed absorption:
+        (1) flow balanced: fp_score ≤ 0.30  (DERIVED: H ≥ 0.85 ↔ p∈[0.28,0.72])
+        (2) book absorbed: book_size_at_trade ≥ 2 × total_flow  (STRUCTURAL margin)
+        (3) refill confirmed: refill_class ∈ {instant, fast}    (VERIFIED from
+            l2_worker refill tracker — independent persistence test)
+        (4) min volume floor: total ≥ 5  (STRUCTURAL — excludes 1-tick noise)
+    """
+    try:
+        b = entry[0] or 0
+        s = entry[1] or 0
+        tot = b + s
+        if tot <= 0:
+            return
+        # fp_score (always populated when there's any flow)
+        if 0.001 < b / tot < 0.999:
+            p = b / tot
+            H = -(p * math.log2(p) + (1.0 - p) * math.log2(1.0 - p))
+            entry[2] = round(1.0 - H, 4)
+        else:
+            entry[2] = 1.0
+        # true_abs: only set if all 4 conditions pass
+        # (don't unset — once a level qualifies in this candle, it stays flagged)
+        if entry[3] == 1:
+            return
+        if tot < 5:
+            return
+        if entry[2] is None or entry[2] > 0.30:
+            return
+        book = entry[4] if (len(entry) >= 5 and entry[4] is not None) else 0
+        if book < 2 * tot:
+            return
+        rs = _REFILL_TRACKER.get(symbol, {}).get(qp)
+        rc = rs.get('classification') if rs else None
+        if rc in ('instant', 'fast'):
+            entry[3] = 1
+    except Exception:
+        pass
 
 
 # ── Shared signal store (read by server.py /api/l2 endpoint) ─────────────────
@@ -3013,6 +3998,58 @@ def on_dom_update(symbol: str, dom: dict):
         L2_STATE["mid_prices"][symbol] = mid
         L2_STATE["last_update"]        = time.time()
 
+        # ── Update _MAX_BOOK_SEEN tracker (book_size capture fix 2026-05-03) ──
+        # For every price in current DOM, retain the maximum depth observed
+        # over the last _MAX_BOOK_TTL_S window. Trade hot-path reads from
+        # this tracker instead of the live (already-consumed) DOM.
+        # FIX 2026-05-04: DOM stores prices as FLOATs (e.g. 27889.0) but the
+        # trade hot-path queries by STRING (e.g. "27889.00") computed via
+        # `str(round(round(price/tick)*tick, 2))`. Quantize and stringify keys
+        # at write time so reader and writer share the same key space.
+        try:
+            tick_size = TICK_SIZES.get(symbol, DEFAULT_TICK_SIZE)
+            def _qp(p):
+                try:
+                    return str(round(round(float(p) / tick_size) * tick_size, 2))
+                except Exception:
+                    return None
+            _now_mb = time.time()
+            mbs = _MAX_BOOK_SEEN.setdefault(symbol, {})
+            # 1. Update with current DOM depths (both bid + ask sides)
+            for ps, depth in dom.get("bids", {}).items():
+                d = float(depth or 0)
+                if d <= 0:
+                    continue
+                qp_key = _qp(ps)
+                if qp_key is None: continue
+                ent = mbs.get(qp_key)
+                if ent is None or d > ent['depth']:
+                    mbs[qp_key] = {'depth': d, 'set_at': _now_mb}
+                else:
+                    ent['set_at'] = _now_mb  # touch — wall still being seen
+            for ps, depth in dom.get("asks", {}).items():
+                d = float(depth or 0)
+                if d <= 0:
+                    continue
+                qp_key = _qp(ps)
+                if qp_key is None: continue
+                ent = mbs.get(qp_key)
+                if ent is None or d > ent['depth']:
+                    mbs[qp_key] = {'depth': d, 'set_at': _now_mb}
+                else:
+                    ent['set_at'] = _now_mb
+            # 2. Decay stale entries (wall hasn't been seen in TTL seconds)
+            stale_keys = [ps for ps, e in mbs.items() if _now_mb - e['set_at'] > _MAX_BOOK_TTL_S]
+            for ps in stale_keys:
+                del mbs[ps]
+            # 3. Cap size — drop oldest entries if over limit
+            if len(mbs) > _MAX_BOOK_CAP:
+                # Sort by set_at desc, keep newest _MAX_BOOK_CAP
+                kept = dict(sorted(mbs.items(), key=lambda kv: -kv[1]['set_at'])[:_MAX_BOOK_CAP])
+                _MAX_BOOK_SEEN[symbol] = kept
+        except Exception as _mbe:
+            log.debug(f"[MAX_BOOK_SEEN] update err: {_mbe}")
+
         if _shannon:
             L2_STATE["signals"]["shannon_entropy"] = _shannon.get_signal()
         if _reynolds and mid > 0:
@@ -3094,8 +4131,25 @@ def on_dom_update(symbol: str, dom: dict):
             prev_sz = prev.get(ps, 0)
             # Hit detection: depth decreased by 2+ contracts (not percentage — works on thin books)
             if prev_sz >= 2 and cur_sz < prev_sz - 1:
-                rt[ps] = {"hit_ts": now_rf, "avg_ms": rt.get(ps, {}).get("avg_ms", 0),
-                          "count": rt.get(ps, {}).get("count", 0), "classification": "gone"}
+                # PROPOSAL C (2026-04-28): track *how much* was hit, not just
+                # the timing. Used by absorption detector for replenishment-
+                # ratio scoring (refill_size / hit_size). Persist running
+                # averages across hits at this level so transient noise is
+                # smoothed out.
+                hit_size_now = prev_sz - cur_sz
+                old = rt.get(ps, {})
+                old_avg_hit  = old.get("avg_hit_size", 0.0)
+                old_avg_rfsz = old.get("avg_refill_size", 0.0)
+                rt[ps] = {
+                    "hit_ts":          now_rf,
+                    "hit_size_last":   hit_size_now,
+                    "hit_size_at_hit": prev_sz,    # remember pre-hit depth for ratio @ refill
+                    "avg_hit_size":    old_avg_hit,
+                    "avg_refill_size": old_avg_rfsz,
+                    "avg_ms":          old.get("avg_ms", 0),
+                    "count":           old.get("count", 0),
+                    "classification":  "gone",
+                }
             # Refill detection: was hit, now depth increased
             elif ps in rt and rt[ps].get("hit_ts", 0) > 0 and cur_sz > prev_sz:
                 hit_ts = rt[ps]["hit_ts"]
@@ -3106,7 +4160,28 @@ def on_dom_update(symbol: str, dom: dict):
                     new_count = old_count + 1
                     new_avg = (old_avg * old_count + ms) / new_count
                     cls = "instant" if new_avg < 150 else "fast" if new_avg < 1000 else "slow"
-                    rt[ps] = {"hit_ts": 0, "avg_ms": round(new_avg, 0), "count": new_count, "classification": cls}
+                    # PROPOSAL C: refill SIZE bookkeeping. Replenishment ratio
+                    # = refill_size_so_far / hit_size_at_hit_time. Capped at
+                    # 1.0 (full restoration) — values >1 mean the level got
+                    # bigger than before, which is even stronger absorption,
+                    # so we keep the full ratio (no cap on upside).
+                    hit_size_at_hit = rt[ps].get("hit_size_at_hit") or 0
+                    refill_size_now = max(cur_sz - 0, 0)  # current depth = total restored
+                    # rolling-average update for both hit & refill sizes
+                    old_avg_hit  = rt[ps].get("avg_hit_size",    0.0)
+                    old_avg_rfsz = rt[ps].get("avg_refill_size", 0.0)
+                    new_avg_hit  = (old_avg_hit  * old_count + (rt[ps].get("hit_size_last", 0) or 0)) / new_count
+                    new_avg_rfsz = (old_avg_rfsz * old_count + refill_size_now) / new_count
+                    replenish_ratio = (new_avg_rfsz / new_avg_hit) if new_avg_hit > 0 else 1.0
+                    rt[ps] = {
+                        "hit_ts":          0,
+                        "avg_ms":          round(new_avg, 0),
+                        "count":           new_count,
+                        "classification":  cls,
+                        "avg_hit_size":    round(new_avg_hit, 1),
+                        "avg_refill_size": round(new_avg_rfsz, 1),
+                        "replenish_ratio": round(replenish_ratio, 3),
+                    }
 
         # Expire stale entries (>10s since hit with no refill = gone)
         stale = [ps for ps, v in rt.items() if v.get("hit_ts", 0) > 0 and now_rf - v["hit_ts"] > 10]
@@ -3383,6 +4458,12 @@ def on_trade(symbol: str, trade: dict):
         _cleanup_detection_state()
 
         _feed_candle(symbol, price, vol, ts, side=side)
+
+        # ── Big-print signal: top-decile rolling 5-min, classified by book ──
+        # Fires after _feed_candle so bp is up to date; emits 'big_print'
+        # socket event when size ≥ P90(rolling 5-min) for the volume bubbles
+        # signal-only renderer (block/sweep/aggression).
+        _emit_big_print(symbol, price, vol, side, ts, sweep_hit)
 
     # Store trade in L2_STATE + buffer for heatmap (single lock acquisition)
     with _L2_LOCK:
@@ -3910,39 +4991,37 @@ def start_l2_worker() -> TopStepXConnector:
                          session_open.strftime('%Y-%m-%d %H:%M %Z'),
                          session_open.strftime('%A'))
 
+                # Pull N days of history so VP prior_day / weekly / 2day modes
+                # have real data. 7 days × 1440 min = 10,080 bars (< 20k API cap).
+                # Configurable via BACKFILL_DAYS env var; defaults to 7.
+                try:
+                    _backfill_days = int(os.environ.get("BACKFILL_DAYS", "7"))
+                except Exception:
+                    _backfill_days = 7
+                _backfill_days = max(1, min(_backfill_days, 13))  # 20k cap ≈ 13.8 days
+
                 for sym in SYMBOLS:
                     cid = _connector._symbol_to_contract.get(sym)
                     if not cid:
                         log.warning("L2 backfill: no contract ID for %s — skipping", sym)
                         continue
 
-                    # Try current session first, then go back up to 5 days
-                    # (handles holidays where retrieve_bars returns empty)
-                    bars = []
-                    for day_offset in range(6):  # 0..5 days back
-                        try_open = session_open - timedelta(days=day_offset)
-                        # Skip weekends in the retry loop too
-                        if try_open.weekday() in (5, 6):  # Sat or Sun
-                            log.debug("L2 backfill: %s skipping %s (%s) — weekend",
-                                      sym, try_open.strftime('%Y-%m-%d'), try_open.strftime('%A'))
-                            continue
-                        try_utc = try_open.astimezone(timezone.utc).isoformat()
-                        log.info("L2 backfill: %s trying session %s NY (%s) → %s UTC (offset=%d)",
-                                 sym, try_open.strftime('%Y-%m-%d %H:%M'),
-                                 try_open.strftime('%A'), try_utc, day_offset)
-                        bars = _connector.retrieve_bars(
-                            cid, start_time=try_utc,
-                            unit=2, unit_number=1, limit=20000
-                        )
-                        if bars:
-                            log.info("L2 backfill: %s ✓ got %d bars from %s (offset=%d)",
-                                     sym, len(bars), try_open.strftime('%Y-%m-%d'), day_offset)
-                            break
-                        else:
-                            log.info("L2 backfill: %s ✗ 0 bars from %s (offset=%d)",
-                                     sym, try_open.strftime('%Y-%m-%d'), day_offset)
-                    if not bars:
-                        log.warning("L2 backfill: no bars for %s after trying 6 sessions — chart will be empty", sym)
+                    # Single call from session_open - N days → now covers weekly
+                    start_dt = session_open - timedelta(days=_backfill_days)
+                    start_utc = start_dt.astimezone(timezone.utc).isoformat()
+                    log.info("L2 backfill: %s fetching %d days from %s NY → %s UTC",
+                             sym, _backfill_days,
+                             start_dt.strftime('%Y-%m-%d %H:%M'),
+                             start_utc)
+                    bars = _connector.retrieve_bars(
+                        cid, start_time=start_utc,
+                        unit=2, unit_number=1, limit=20000
+                    )
+                    if bars:
+                        log.info("L2 backfill: %s ✓ got %d bars spanning %d days",
+                                 sym, len(bars), _backfill_days)
+                    else:
+                        log.warning("L2 backfill: no bars for %s — chart will be empty", sym)
                         continue
 
                     # Seed price history — build list outside lock, then publish
