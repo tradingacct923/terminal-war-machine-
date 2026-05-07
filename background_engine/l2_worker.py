@@ -2314,10 +2314,14 @@ _BATTLE_BAND_TICKS      = 2      # ± ticks for activity tracking
 _BATTLE_MIN_HISTORY     = 20     # min events before switching from cold-start to rolling p75/p25
 _BATTLE_LOOP_INTERVAL_S = 5.0    # process pending events every 5s
 
-# Cold-start absolute defaults (NQ-tuned; replaced by rolling percentiles after warmup)
+# Cold-start absolute defaults (NQ-tuned; replaced by rolling percentiles after warmup).
+# Note: live F12 is computed from T0 DOM snapshots (~500ms throttle = max ~60/30s),
+# whereas the parquet audit read raw L2 updates (could hit hundreds). The shape of
+# the signal (refills high/low vs the absorber's defense) is preserved on either
+# scale; the rolling p25 within first 20 events recalibrates to live cadence.
 _BATTLE_COLD_DRIFT_P75 = 2.0     # ticks
 _BATTLE_COLD_F17_P75   = 2.0     # ticks
-_BATTLE_COLD_F12_P25   = 1       # refills
+_BATTLE_COLD_F12_P25   = 5       # T0-snapshot refills (≤5 = quiet, ≥6 = active)
 
 _NQ_TICK = 0.25                  # tick size — TODO: read from symbol config
 
@@ -2351,19 +2355,25 @@ def _enqueue_battle_state(symbol, tf, abs_event, candle):
 
 
 def _compute_battle_features(symbol, K, side, t_start, t_end):
-    """Aggregate trades + book activity in [t_start, t_end) at K ± BAND.
-    Returns {drift, f12, f17, n_trades} or None if insufficient data."""
+    """Aggregate trades + book activity in [t_start, t_end).
+    Returns {drift, f12, f17, n_trades} or None if insufficient data.
+
+    Per audit (v7_final):
+      drift  = max excursion in absorbed direction, computed over ALL trades
+               (no band filter) — captures full price drift during obs.
+      f17    = price range AT THE LEVEL only (K ± BAND_TICKS) — captures how
+               much activity continued at K vs broke away.
+      f12    = book-size refill count at K on the defender's side."""
     history = list(_DOM_HISTORY_T0.get(symbol, []))
     relevant = [s for s in history if t_start <= s[0] < t_end]
     if len(relevant) < 3:
         return None
 
-    # Aggregate trades during obs window (drift + range)
     band_lo = K - _BATTLE_BAND_TICKS * _NQ_TICK
     band_hi = K + _BATTLE_BAND_TICKS * _NQ_TICK
-    all_prices = []
+    all_prices = []     # for drift: every trade in obs window, no band filter
+    band_prices = []    # for f17: only trades within K ± BAND_TICKS
     for snap in relevant:
-        # snap = (now_ts, snap_bids, snap_asks, compact_trades, compact_abs)
         trades = snap[3] if len(snap) >= 4 else []
         for tr in trades:
             tp = tr.get('p')
@@ -2376,25 +2386,48 @@ def _compute_battle_features(symbol, K, side, t_start, t_end):
             ts_t = tr.get('t', snap[0])
             if ts_t < t_start or ts_t >= t_end:
                 continue
+            all_prices.append(tp_f)
             if band_lo <= tp_f <= band_hi:
-                all_prices.append(tp_f)
+                band_prices.append(tp_f)
 
+    # Genuinely-dead obs window: no trades anywhere. Skip.
     if len(all_prices) < 2:
         return None
 
-    max_p = max(all_prices)
-    min_p = min(all_prices)
-    max_up_t = (max_p - K) / _NQ_TICK
-    max_dn_t = (K - min_p) / _NQ_TICK
+    # Drift uses FULL price excursion during obs (no band filter)
+    max_up_t = (max(all_prices) - K) / _NQ_TICK
+    max_dn_t = (K - min(all_prices)) / _NQ_TICK
     if side == 'SELL_ABSORBED':
         drift = max_up_t - max_dn_t   # positive = absorbed direction = UP
     else:
         drift = max_dn_t - max_up_t   # positive = absorbed direction = DOWN
 
-    f17 = (max_p - min_p) / _NQ_TICK   # price range during obs (ticks)
+    # f17: range AT the level (band-filtered). When price flew past K and never
+    # came back (band_prices < 2), f17 = 0. That's a meaningful signal — clean
+    # breakaway, no churn at the level — and routes to Tier A correctly.
+    if len(band_prices) >= 2:
+        f17 = (max(band_prices) - min(band_prices)) / _NQ_TICK
+    else:
+        f17 = 0.0
 
-    # F12: refills at K — book size jumps on absorbed-side
-    K_str = str(round(float(K), 2))
+    # F12: refills at K — book size jumps on absorbed-side.
+    # DOM keys may be stored as either '28648' (int-style) or '28648.0'
+    # (float-style) depending on upstream source. Probe both formats so
+    # whole-tick prices don't silently key-miss (same gotcha as the
+    # _REFILL_TRACKER fix in 2026-05-05).
+    K_f = float(K)
+    K_keys = (str(round(K_f, 2)), str(int(K_f)) if K_f == int(K_f) else None,
+              f"{K_f:.2f}", str(K_f))
+    K_keys = tuple(k for k in K_keys if k)  # drop None
+    def _book_at_K(d):
+        for k in K_keys:
+            if k in d:
+                try:
+                    return float(d[k])
+                except (TypeError, ValueError):
+                    return 0.0
+        return 0.0
+
     book_seq = []
     for snap in relevant:
         bids = snap[1] if len(snap) >= 2 else {}
@@ -2402,9 +2435,9 @@ def _compute_battle_features(symbol, K, side, t_start, t_end):
         # SELL_ABSORBED → buyers providing bid liquidity → check bids
         # BUY_ABSORBED  → sellers providing ask liquidity → check asks
         if side == 'SELL_ABSORBED':
-            sz = float(bids.get(K_str, 0) or 0)
+            sz = _book_at_K(bids)
         else:
-            sz = float(asks.get(K_str, 0) or 0)
+            sz = _book_at_K(asks)
         book_seq.append(sz)
 
     f12 = 0
@@ -2461,7 +2494,9 @@ def _compute_and_emit_battle_state(ev):
     feats = _compute_battle_features(symbol, ev['K'], ev['side'],
                                       ev['t_detect_end'], ev['t_obs_end'])
     if feats is None:
-        return  # insufficient L2 data — skip silently
+        # Diagnostic — surface insufficient-data drops during initial deploy
+        log.info(f"[BATTLE] {symbol} {ev['tf']} K={ev['K']} skip: insufficient_data")
+        return
 
     drift = feats['drift']
     f12   = feats['f12']
@@ -2475,6 +2510,14 @@ def _compute_and_emit_battle_state(ev):
         _BATTLE_HISTORY[symbol].append({'drift': drift, 'f12': f12, 'f17': f17})
 
     if label == 'NO_SIGNAL':
+        # Diagnostic — visible during initial deploy so we can see verdicts even when no UI fires
+        log.info(
+            f"[BATTLE] {symbol} {ev['tf']} K={ev['K']} NO_SIGNAL  "
+            f"drift={drift:+.1f}t f12={f12} f17={f17:.1f}t  "
+            f"thr(d75={thresholds['drift_p75']:.1f} f17_75={thresholds['f17_p75']:.1f} "
+            f"f12_25={thresholds['f12_p25']} n={thresholds['history_n']}"
+            f"{' COLD' if thresholds['cold_start'] else ''})"
+        )
         return  # don't emit — the level is dead/chaotic
 
     if _socketio is None:

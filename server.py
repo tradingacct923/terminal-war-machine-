@@ -5858,18 +5858,27 @@ def _start_workers():
     print("[startup] L2 daemon thread spawned", flush=True)
 
     # Start Schwab WebSocket bridge (real-time GEX streaming)
-    def _start_schwab():
-        import time as _t
-        _t.sleep(5)  # Let server + Schwab auth settle
-        try:
-            from background_engine.schwab_bridge import set_socketio as sb_set_sio, start_schwab_bridge
-            sb_set_sio(socketio)
-            start_schwab_bridge()
-            print("[startup] Schwab bridge started — real-time GEX push active", flush=True)
-        except Exception as e:
-            print(f"[startup] Schwab bridge failed (non-fatal): {e}", flush=True)
-    _startup_threading.Thread(target=_start_schwab, daemon=True).start()
-    print("[startup] Schwab bridge daemon thread spawned", flush=True)
+    # 2026-05-07 (Phase 3 of multiprocess split): if BRIDGE_PROCESS=1 env
+    # var is set, SKIP starting the in-server schwab_bridge — expect a
+    # separate bridge.py process to be running instead. This lets us roll
+    # out the multiprocess architecture without forcing it. Default unset =
+    # current single-process behavior preserved.
+    if os.environ.get('BRIDGE_PROCESS', '').strip() in ('1', 'true', 'yes', 'on'):
+        print("[startup] BRIDGE_PROCESS env set — skipping in-server schwab_bridge", flush=True)
+        print("[startup] Expecting bridge.py to be running as a separate process", flush=True)
+    else:
+        def _start_schwab():
+            import time as _t
+            _t.sleep(5)  # Let server + Schwab auth settle
+            try:
+                from background_engine.schwab_bridge import set_socketio as sb_set_sio, start_schwab_bridge
+                sb_set_sio(socketio)
+                start_schwab_bridge()
+                print("[startup] Schwab bridge started — real-time GEX push active", flush=True)
+            except Exception as e:
+                print(f"[startup] Schwab bridge failed (non-fatal): {e}", flush=True)
+        _startup_threading.Thread(target=_start_schwab, daemon=True).start()
+        print("[startup] Schwab bridge daemon thread spawned", flush=True)
 
     # Store reference so /api/l2 can check it
     import builtins
@@ -6100,6 +6109,93 @@ def handle_mma_unwatch(_data=None):
         _mma.unwatch(sym)
     except Exception:
         pass
+
+
+# ════════════════════════════════════════════════════════════════════
+# BRIDGE RELAY (Phase 2 of multiprocess split, 2026-05-07)
+# ════════════════════════════════════════════════════════════════════
+# bridge.py runs in its own process and emits Socket.IO events with the
+# 'relay:' prefix. This catch-all relay handler re-broadcasts each one
+# to all connected browser clients as the original event name.
+#
+# Why a single catch-all instead of per-event handlers:
+# python-socketio supports a wildcard handler via @socketio.on('*'), but
+# the dispatch is per-namespace. Simpler: register one handler per known
+# bridge event. Easier to maintain — adds ~5 lines per new event.
+#
+# Backpressure: if browsers can't keep up with the firehose (50K+ events/min
+# at RTH peak), the server's emit() will buffer in Socket.IO's internal queue.
+# Worst case: chart appears stale, but server doesn't crash.
+
+# All event types emitted by bridge.py (from grep on schwab_bridge.py):
+_BRIDGE_RELAY_EVENTS = [
+    'acct_activity',
+    'big_print',
+    'book_microstructure',
+    'candle_enriched',
+    'candle_history',
+    'candle_update',
+    'chart_equity_update',
+    'dealer_session_flow',
+    'eq_book_update',
+    'eq_context',
+    'equity_tape',
+    'flow_alert',
+    'flow_update',
+    'intel:dealer_warehouse',
+    'intel:events',
+    'intel:gamma_skyline',
+    'intel:hedge_forecast',
+    'intel:pin_update',
+    'intel:spx_qqq_divergence',
+    'intel:sweep_alert',
+    'intel:vix_term',
+    'intel:wing_update',
+    'l2_update',
+    'mm_event_batch',
+    'ndx_wgc',
+    'option_mark_batch',
+    'option_trade_batch',
+    'screener_equity_update',
+    'screener_option_update',
+    'single_name_walls',
+    'spot_update',
+    'tape_alert',
+    'trade_tick',
+    'wall_signals_update',
+    'zone_update',
+]
+
+# Aggregate relay activity into a 30s rolling counter so we can verify
+# the relay path without printing every event (would be too noisy).
+_relay_counts: dict = {}
+_relay_last_log: list = [time.time()]
+
+def _make_relay_handler(event_name: str):
+    """Build a relay handler closure that re-broadcasts to all browsers."""
+    def _handler(data):
+        try:
+            socketio.emit(event_name, data)
+            _relay_counts[event_name] = _relay_counts.get(event_name, 0) + 1
+            now = time.time()
+            if now - _relay_last_log[0] >= 30.0:
+                ranked = sorted(_relay_counts.items(), key=lambda x: -x[1])
+                summary = ', '.join(f"{n}={c}" for n, c in ranked[:8])
+                total = sum(_relay_counts.values())
+                print(f"[RELAY] 30s: total={total} events | {summary}", flush=True)
+                _relay_counts.clear()
+                _relay_last_log[0] = now
+        except Exception as e:
+            print(f"[RELAY] {event_name} broadcast failed: {e}", flush=True)
+    return _handler
+
+# Register one relay handler per event type. The @socketio.on decorator
+# would conflict with our dynamic registration, so we use the lower-level
+# `on` API directly.
+for _ev_name in _BRIDGE_RELAY_EVENTS:
+    socketio.on_event(f'relay:{_ev_name}', _make_relay_handler(_ev_name))
+
+print(f"[RELAY] Registered {len(_BRIDGE_RELAY_EVENTS)} bridge relay handlers", flush=True)
 
 
 if __name__ == "__main__":

@@ -616,6 +616,7 @@ class BigPrintBubbleRenderer {
             const _seenBuckets = new Set();   // `${type}|${xBucket}` keys
             const MAX_BAR_BUBBLES = 30;
             const X_BUCKET_PX = 4;
+            const _battleMap = window._battleStateMap || {};
             for (const s of _flatSigs) {
                 if (_renderedSigs.length >= MAX_BAR_BUBBLES) break;
                 const y = priceConverter(s.price);
@@ -628,6 +629,37 @@ class BigPrintBubbleRenderer {
                                          barSpacing, settings.sizeScale);
                 _drawDiscOrEdgeMarker(ctx, s.x, y, r, s.color, s.label, mediaSize, s.borderW, s.extreme);
                 _renderedSigs.push({ type: s.type, x: s.x, y: y, r: r });
+
+                // ── BATTLE STATE DOT — adjacent to absorption bubbles only ──
+                // Look up battle verdict for this bar+price. Renders a small
+                // colored dot to the RIGHT of the absorption bubble:
+                //   tier A+ ABSORBER_WINS_HIGH → 2 green dots (highest conviction)
+                //   tier A  ABSORBER_WINS      → 1 green dot
+                //   tier B  AGGRESSOR_WINS     → 1 red dot (INVERSE direction trade)
+                if (s.type === 'absorption') {
+                    const bsKey = `${sym}:1m:${s.ts}`;
+                    const bs = _battleMap[bsKey];
+                    if (bs && bs.label && bs.label !== 'NO_SIGNAL') {
+                        // Match by price too — bar can have multiple absorption levels
+                        if (Math.abs((bs.K || 0) - s.price) <= 0.5) {
+                            const dotR = Math.max(2, Math.min(4, r * 0.25));
+                            const gap = r + dotR + 2;
+                            const dotColor = (bs.tier === 'B') ? '#ff4d4d' : '#28d97a';
+                            const isDouble = (bs.tier === 'A+');
+                            ctx.save();
+                            ctx.fillStyle = dotColor;
+                            ctx.beginPath();
+                            ctx.arc(s.x + gap, y, dotR, 0, Math.PI * 2);
+                            ctx.fill();
+                            if (isDouble) {
+                                ctx.beginPath();
+                                ctx.arc(s.x + gap + dotR * 2 + 1, y, dotR, 0, Math.PI * 2);
+                                ctx.fill();
+                            }
+                            ctx.restore();
+                        }
+                    }
+                }
             }
             // DEBUG: expose render trace for inspection from devtools console
             window._BUBBLE_TRACE = {

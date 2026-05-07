@@ -725,35 +725,51 @@ def _run_bridge():
         #                       + SPY 800 + IWM 200 + sector ETFs 200 = 2,894
         # Frees ~1,260 QQQ ATM ±$100 slots (BSM solver Phase 17 covers Greeks)
         # Adds:    SPY (restored), IWM, sector ETFs, Mag-7 wider radius
+        # ── BOOT-THROTTLING (added 2026-05-07) ──────────────────────────────
+        # Each option subscribe fires 100-1500 SUBS msgs; Schwab responds with
+        # initial state for every contract → inbound burst that drives CPU to
+        # 200%+ on a single core. Combined with parallel L2 tick backfill
+        # (~60K ticks across 5 chunks), the gevent hub starves and the OS
+        # kills the process. Solution: 1.5s sleep between heavy subscribes
+        # so each burst can drain before the next fires. Total added boot
+        # latency: ~10s. Peak CPU: <100% sustained.
+        _BOOT_THROTTLE_SEC = 1.5
         try:
             _subscribe_qqq_0dte_only()  # was _subscribe_qqq_options() — non-0DTE Greeks via BSM
         except Exception as e:
             log.warning(f"[SCHWAB-BRIDGE] QQQ 0DTE-only subscription error: {e}")
+        time.sleep(_BOOT_THROTTLE_SEC)
         try:
             _subscribe_index_options()
         except Exception as e:
             log.warning(f"[SCHWAB-BRIDGE] Index options subscription error: {e}")
+        time.sleep(_BOOT_THROTTLE_SEC)
         # Phase 17B — Mag-7 expanded (AVGO dropped, 7 names × 70 strikes)
         # Replaces Phase 13 Mag-8 (8 × 40). Captures ATM ±10% per stock.
         try:
             _subscribe_mag7_expanded()
         except Exception as e:
             log.warning(f"[SCHWAB-BRIDGE] Mag-7 expanded subscription error: {e}")
+        time.sleep(_BOOT_THROTTLE_SEC)
         # Phase 17B — SPY RESTORED to streaming (was dropped 2026-04-29)
         try:
             _subscribe_spy_options_full()
         except Exception as e:
             log.warning(f"[SCHWAB-BRIDGE] SPY options subscription error: {e}")
+        time.sleep(_BOOT_THROTTLE_SEC)
         # Phase 17B — IWM (Russell 2000) for small-cap risk detection
         try:
             _subscribe_iwm_options()
         except Exception as e:
             log.warning(f"[SCHWAB-BRIDGE] IWM options subscription error: {e}")
+        time.sleep(_BOOT_THROTTLE_SEC)
         # Phase 17B — Sector ETFs (XLK/XLE/XLF) for sector rotation
         try:
             _subscribe_sector_etf_options()
         except Exception as e:
             log.warning(f"[SCHWAB-BRIDGE] Sector ETF options subscription error: {e}")
+        time.sleep(_BOOT_THROTTLE_SEC)
+        log.info(f"[SCHWAB-BRIDGE] Option-subscribe phase complete (boot-throttled {_BOOT_THROTTLE_SEC}s/step)")
 
         # NASDAQ_BOOK — Level 2 NBBO depth on NASDAQ-listed names.
         # Cap is undocumented but community-reported 50+. Each key is free
@@ -4442,13 +4458,18 @@ def _start_tradier_streamer():
     _tradier_streamer.start()
     # Stagger conn opens by 4s each — gives Tradier time to register each
     # session before the next OAuth bind. Tested working at 5 concurrent.
+    # 2026-05-07: widened spacing 4s → 8s. Each WS init triggers a SUBS burst
+    # of 1500-1950 syms; at the original 4s cadence all 5 conns were burst-
+    # subscribing within a 16s window during which CPU was already saturated
+    # from the parallel Schwab option subscribe + L2 backfill. 8s cadence
+    # spreads the Tradier SUBS bursts across 32s instead of 16s.
     import threading as _th
-    _th.Timer(4.0,  _tradier_streamer_b.start).start()
-    _th.Timer(8.0,  _tradier_streamer_c.start).start()
-    _th.Timer(12.0, _tradier_streamer_d.start).start()
-    _th.Timer(16.0, _tradier_streamer_e.start).start()
+    _th.Timer(8.0,  _tradier_streamer_b.start).start()
+    _th.Timer(16.0, _tradier_streamer_c.start).start()
+    _th.Timer(24.0, _tradier_streamer_d.start).start()
+    _th.Timer(32.0, _tradier_streamer_e.start).start()
     log.info("[TRADIER] ▶️ Phase 15: 5-WS deployment initiated "
-             "(A=now, B=+4s, C=+8s, D=+12s, E=+16s)")
+             "(A=now, B=+8s, C=+16s, D=+24s, E=+32s; throttled 2026-05-07)")
 
     # ── Phase 14 (2026-04-30) — FULL alignment via dual WS ──────────────
     # Conn A: QQQ full chain (1,412) + equity tickers (15) = ~1,427 symbols
