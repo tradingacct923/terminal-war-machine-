@@ -90,7 +90,7 @@
 <script defer src="events_pane.js?v=1777526230"></script>
 <script defer src="volume_profile_overlay.js?v=1778400014"></script>
 <script defer src="vp_intel_pane.js?v=1777869196"></script>
-<script defer src="big_print_bubbles_v2.js?v=1777390028"></script>
+<script defer src="big_print_bubbles_v2.js?v=1778166755"></script>
 <style>
   /* ═════════════════════════════════════════════════════════════════
      ATRAX — TERMINAL DENSE
@@ -3940,6 +3940,60 @@ if (!popoutParam) initEditMode();
       const _stored = JSON.parse(localStorage.getItem('barSignalMap') || '{}');
       for (const k in _stored) window._barSignalMap[k] = _stored[k];
     } catch (_) {}
+
+    // ──────────────────────────────────────────────────────────────────
+    // BATTLE STATE — third bar-signal layer (added 2026-05-07)
+    // ──────────────────────────────────────────────────────────────────
+    // Source: l2_worker._compute_and_emit_battle_state fires 30s AFTER an
+    // absorption bar closes (after observation window completes).
+    //
+    // Stored in window._battleStateMap[`${symbol}:${tf}:${barT}`] = {label, tier, ...}
+    // Renderer reads this and adds a colored dot adjacent to the absorption bubble:
+    //   tier A+ ABSORBER_WINS_HIGH  → green double dot   (~86% hit)
+    //   tier A  ABSORBER_WINS       → green single dot   (~75% hit)
+    //   tier B  AGGRESSOR_WINS      → red dot            (~58% hit, INVERSE direction)
+    //
+    // Does NOT modify or replace the absorption bubble — adds context only.
+    if (!window._battleStateMap) window._battleStateMap = {};
+    _sio.on('battle_state_update', (ev) => {
+      try {
+        if (!ev || !ev.symbol) return;
+        const k = `${ev.symbol}:${ev.tf || '1m'}:${ev.bar_t}`;
+        window._battleStateMap[k] = {
+          event_id:    ev.event_id,
+          symbol:      ev.symbol,
+          tf:          ev.tf || '1m',
+          bar_t:       ev.bar_t,
+          K:           ev.K,
+          side:        ev.side,
+          label:       ev.label,
+          tier:        ev.tier,
+          drift:       ev.drift,
+          f12:         ev.f12,
+          f17:         ev.f17,
+          thresholds:  ev.thresholds || {},
+        };
+        // Cap retention — keep last 200 (~3.3 hours @ 1m)
+        const allKeys = Object.keys(window._battleStateMap);
+        if (allKeys.length > 200) {
+          const sorted = allKeys.sort();
+          for (const dk of sorted.slice(0, allKeys.length - 200)) {
+            delete window._battleStateMap[dk];
+          }
+        }
+        try { localStorage.setItem('battleStateMap', JSON.stringify(window._battleStateMap)); } catch (_) {}
+        // Force redraw so the dot appears immediately
+        if (window.AtraxLiveChart && window.AtraxLiveChart._chart) {
+          try { window.AtraxLiveChart._chart.applyOptions({}); } catch (_) {}
+        }
+        if (window.AltarisEvents) window.AltarisEvents.emit('data:battle_state', ev);
+      } catch (_) {}
+    });
+    // Hydrate from localStorage on reconnect
+    try {
+      const _storedBS = JSON.parse(localStorage.getItem('battleStateMap') || '{}');
+      for (const k in _storedBS) window._battleStateMap[k] = _storedBS[k];
+    } catch (_) {}
     // Hawkes ρ chip: pull from candle_enriched.hawkes.rho
     _sio.on('candle_enriched', (d) => {
       if (!d || !d.hawkes || !window.AtraxRibbon) return;
@@ -4104,7 +4158,23 @@ if (!popoutParam) initEditMode();
         }
       }
       this._histApplied = true;
-      if (this._chart) this._chart.timeScale().fitContent();
+      // 2026-05-07: don't fitContent() on full 5+day backfill — that compresses
+      // 7000+ minute bars into ~900px and renders most as sub-pixel dashes.
+      // Show only the most recent ~400 bars (≈6.5h) by default; user can
+      // scroll/zoom out to see older history.
+      if (this._chart) {
+        try {
+          const ts = this._chart.timeScale();
+          if (clean.length > 400) {
+            const fromIdx = clean.length - 400;
+            ts.setVisibleRange({ from: clean[fromIdx].time, to: clean[clean.length - 1].time });
+          } else {
+            ts.fitContent();
+          }
+        } catch (_) {
+          this._chart.timeScale().fitContent();
+        }
+      }
     },
 
     onUpdate(data) {
