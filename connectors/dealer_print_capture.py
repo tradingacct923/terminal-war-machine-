@@ -460,30 +460,54 @@ def persist_pending() -> int:
 
     Crash safety: write to .tmp + fsync + os.replace. Reader always sees old
     or new version, never partial.
+
+    2026-05-07 FIX: at peak RTH the pending queue grows to 200K+ entries.
+    json.dump on the full payload was a monolithic 6-8s blocking call that
+    froze the gevent event loop (no candle_updates, no Tradier reads, no
+    Socket.IO emits during the dump). Symptom: chart "lag building up,
+    candles not flowing" every 60s as persist fired.
+
+    Now: stream-write entries one at a time and call gevent.sleep(0) every
+    1000 entries to yield control back to the event loop. Total elapsed
+    persist time is about the same (the JSON work still happens) but the
+    main loop interleaves with it, so live data keeps flowing through.
     """
     global _last_persist_ts, _last_persist_n, _last_persist_dur_ms
+    try:
+        import gevent
+    except Exception:
+        gevent = None  # fallback to monolithic write
     t0 = time.time()
     with _pending_lock:
-        snapshot = [
-            {'row': p['row'], 'deadlines': p['deadlines']}
-            for p in _pending
-        ]
-    payload = {
-        'version': _STATE_VERSION,
-        'saved_at': t0,
-        'entries': snapshot,
-    }
+        # Tuple form is faster to copy than dict form
+        snapshot = [(p['row'], p['deadlines']) for p in _pending]
+    n = len(snapshot)
     try:
         os.makedirs(_STATE_DIR, exist_ok=True)
         with open(_STATE_TMP, 'w') as f:
-            json.dump(payload, f, default=str, separators=(',', ':'))
+            f.write('{"version":')
+            f.write(str(_STATE_VERSION))
+            f.write(',"saved_at":')
+            f.write(str(t0))
+            f.write(',"entries":[')
+            for i, (row, deadlines) in enumerate(snapshot):
+                if i > 0:
+                    f.write(',')
+                f.write(json.dumps(
+                    {'row': row, 'deadlines': deadlines},
+                    default=str, separators=(',', ':')
+                ))
+                # Yield to gevent every 1000 entries — keeps the event loop
+                # responsive so chart/Socket.IO traffic doesn't pile up.
+                if gevent is not None and (i & 1023) == 1023:
+                    gevent.sleep(0)
+            f.write(']}')
             f.flush()
             os.fsync(f.fileno())
         os.replace(_STATE_TMP, _STATE_FILE)
     except Exception as e:
         log.warning(f"[DPC-PERSIST] save failed: {e}")
         return 0
-    n = len(snapshot)
     _last_persist_ts = t0
     _last_persist_n = n
     _last_persist_dur_ms = round((time.time() - t0) * 1000, 1)
