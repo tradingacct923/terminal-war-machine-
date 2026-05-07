@@ -6536,7 +6536,13 @@ def _on_options_book(data):
                 _ob_log_fh.close()
         except Exception:
             pass
-        _ob_log_fh = open(_ob_log_path(), 'a', buffering=1)  # line-buffered
+        # 2026-05-07 FIX: was buffering=1 (line-buffered = flushes to disk on
+        # every newline). At RTH options activity (~67 OPTIONS_BOOK records/sec),
+        # that's 67 disk writes/sec blocking the gevent loop and producing
+        # sustained 100%+ CPU consumed by syscalls + I/O wait. Switch to 64KB
+        # buffer; lose at most 64KB on crash, which is acceptable for this
+        # historical-calibration log.
+        _ob_log_fh = open(_ob_log_path(), 'a', buffering=65536)
         _ob_log_date = today
 
     # Compact per-level shape: [price, size, mm_count, [mm_ids]].

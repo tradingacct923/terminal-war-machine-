@@ -98,7 +98,10 @@ def _get_log_fh_for_ts(ts: float):
         date_str = datetime.now().strftime('%Y%m%d')   # fallback if ts is bogus
     fh = _dp_log_fhs.get(date_str)
     if fh is None:
-        fh = open(_dp_log_path_for_date(date_str), 'a', buffering=1)
+        # 2026-05-07: 64KB buffer (was line-buffered=1). Tradier delivers
+        # 300-600 prints/sec at RTH; line-buffered = 300-600 disk syncs/sec
+        # blocking the gevent loop. 64KB ≈ 200 records before flush.
+        fh = open(_dp_log_path_for_date(date_str), 'a', buffering=65536)
         _dp_log_fhs[date_str] = fh
     return fh
 

@@ -226,7 +226,10 @@ def _ensure_log(ts: float) -> None:
                 _log_fh.close()
         except Exception:
             pass
-        _log_fh = open(_log_path(ts), 'a', buffering=1)
+        # 2026-05-07: 64KB buffer (was line-buffered). Each OPTIONS_BOOK
+        # update can trigger a log write; at 67 books/sec line-buffered
+        # = 67 disk syncs/sec contributing to gevent-loop CPU saturation.
+        _log_fh = open(_log_path(ts), 'a', buffering=65536)
         _log_date = today
 
 
