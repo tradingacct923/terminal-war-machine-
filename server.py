@@ -5981,6 +5981,9 @@ def handle_disconnect():
     # Floor at _PREFERRED_ENRICHED_TFS so disconnects don't strand the user's
     # default chart-TFs (30s/1m/3m/200s/5m) un-enriched.
     _client_active_tf.pop(sid, None)
+    # Clean up the candle_history dedupe tracker for this sid
+    for _k in [k for k in _subscribe_last_push if k[0] == sid]:
+        _subscribe_last_push.pop(_k, None)
     try:
         import background_engine.l2_worker as _l2w
         live = set(_client_active_tf.values()) | _l2w._PREFERRED_ENRICHED_TFS
@@ -5997,6 +6000,14 @@ def handle_disconnect():
             _mma.unwatch(sym)
         except Exception:
             pass
+
+# 2026-05-07: dedupe redundant candle_history pushes. Frontend bug: chart's
+# attach() function (called on every layout re-mount) resets _histApplied=false
+# and re-emits subscribe. Without dedupe the server pushes 5000 bars × N
+# re-mounts per session = 12-17MB redundant payload to the same browser tab.
+# Symptom: chart felt sluggish during page interactions (sidebar toggle, resize).
+_subscribe_last_push: dict = {}  # {(sid, sym, tf): last_push_ts}
+_SUBSCRIBE_DEDUPE_SEC = 10.0
 
 @socketio.on('subscribe')
 def handle_subscribe(data):
@@ -6026,6 +6037,16 @@ def handle_subscribe(data):
         _reset_v2_engines(symbol)
     except Exception:
         pass  # l2_worker not yet loaded on cold start
+    # Dedupe: skip the 5000-bar push if we just sent one to this sid/sym/tf
+    # in the last 10s. Frontend will keep getting live candle_update events;
+    # only the heavy history payload is suppressed.
+    _now_ts = time.time()
+    _key = (sid, symbol, tf)
+    _last_ts = _subscribe_last_push.get(_key, 0)
+    if _now_ts - _last_ts < _SUBSCRIBE_DEDUPE_SEC:
+        print(f"[Socket.IO] DEDUPE — skip candle_history push to {sid} ({_now_ts-_last_ts:.1f}s since last)")
+        return
+    _subscribe_last_push[_key] = _now_ts
     # Push candle history — retry if worker hasn't loaded yet
     if not _push_candle_history(sid, symbol, tf, max_candles=5000):
         print(f"[Socket.IO] No candles for {symbol}/{tf} yet, scheduling deferred push for {sid}...")
