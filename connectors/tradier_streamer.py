@@ -327,13 +327,36 @@ class TradierStreamer:
                 log.warning(f"[TRADIER] Session refresh failed: {e}")
 
     def _subscribe_watcher(self):
-        """Re-send the subscribe payload whenever the symbol set changes."""
+        """Re-send the subscribe payload whenever the symbol set changes.
+
+        2026-05-07 FIX: previously fired SUBS within 1s of any subscribe()/
+        unsubscribe() call. With chain rotation adding/removing contracts
+        every 30s, this hit Tradier with 50KB SUBS payloads multiple times
+        per minute → Tradier rate-limited us → forced disconnect → reconnect
+        → re-SUBS the full list → rinse/repeat. 83 SUBS in 26min observed,
+        causing 33 reconnects + 200% sustained CPU on the gevent loop.
+
+        Now: debounce dirty signals over a window so bursts of subscribe()
+        calls coalesce into one SUBS. Plus enforce a minimum interval between
+        consecutive SUBS sends.
+        """
+        DEBOUNCE_SEC = 3.0          # wait this long after a dirty signal
+        MIN_SUBS_INTERVAL_SEC = 8.0 # at least this long between SUBS sends
+        last_subs_ts = 0.0
         while self._running:
-            # wait for a dirty signal with 1s tick so stop() is responsive
             if self._symbols_dirty.wait(timeout=1.0):
+                # Debounce: hold dirty for a window to coalesce a burst of
+                # subscribe()/unsubscribe() calls into a single SUBS.
+                time.sleep(DEBOUNCE_SEC)
                 self._symbols_dirty.clear()
+                # Rate-limit: don't hammer Tradier
+                now = time.time()
+                wait = MIN_SUBS_INTERVAL_SEC - (now - last_subs_ts)
+                if wait > 0:
+                    time.sleep(wait)
                 if self._ws_connected.is_set():
                     self._send_subscribe()
+                    last_subs_ts = time.time()
 
     def _data_watchdog(self):
         """Force reconnect if no messages have arrived for DATA_SILENCE_SEC.
