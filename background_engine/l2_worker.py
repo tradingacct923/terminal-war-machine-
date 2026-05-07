@@ -1269,6 +1269,40 @@ def _feed_candle(symbol: str, price: float, volume: int, timestamp: float,
             boundary = _candle_boundary(timestamp, seconds)
             cur = _CURRENT_CANDLE[symbol].get(tf)
 
+            # 2026-05-07 FIX: late-tick guard. TopStepX delivers trades in
+            # batches; within a batch ticks can arrive out-of-order. Pre-fix:
+            # a tick with boundary < cur["t"] would unconditionally close the
+            # current candle and start a fresh one at the older boundary with
+            # v=volume. The next forward tick reversed it. Result: ping-pong
+            # of tiny-volume bars overwriting correct bars on the chart.
+            # Fix: apply late ticks to the matching historical candle in the
+            # deque (preserving volume) and skip _CURRENT_CANDLE / emit logic
+            # for this TF so no candle_update with tiny volume is broadcast.
+            if cur is not None and boundary < cur["t"]:
+                hist = _CANDLES[symbol].get(tf)
+                if hist and len(hist) > 0 and hist[-1].get("t") == boundary:
+                    h = hist[-1]
+                    h["h"] = max(h.get("h", price), price)
+                    h["l"] = min(h.get("l", price), price)
+                    h["c"] = price
+                    h["v"] = h.get("v", 0) + volume
+                    bp_h = h.get("bp")
+                    if bp_h is not None:
+                        entry = bp_h.get(qp)
+                        if entry:
+                            if side == "b":
+                                entry[0] += volume
+                            elif side == "s":
+                                entry[1] += volume
+                        else:
+                            bp_h[qp] = [volume if side == "b" else 0,
+                                        volume if side == "s" else 0,
+                                        None, None,
+                                        _book_sz]
+                # Either applied to history or dropped (too old) — skip the
+                # rest of this TF's processing to avoid resetting cur.
+                continue
+
             if cur is None or cur["t"] != boundary:
                 # Close previous candle if it exists
                 if cur is not None:
