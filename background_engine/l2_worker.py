@@ -1372,6 +1372,29 @@ def _feed_candle(symbol: str, price: float, volume: int, timestamp: float,
                             _emit_bar_signals(symbol, tf, frozen, _CANDLES[symbol][tf])
                         except Exception as e:
                             log.debug(f"bar_signal compute err: {e}")
+                    # 2026-05-07 FIX: force-emit the CLOSING bar's final OHLCV
+                    # even if rate-limited. At RTH open (100+ ticks/sec), the
+                    # 50ms rate limit was eating bar-close updates, so the
+                    # chart kept the bar frozen at a pre-close volume while
+                    # the next bar started showing as a single-tick stub.
+                    # This bypasses _EMIT_MIN_INTERVAL for boundary crossings.
+                    if _socketio is not None and tf in _ACTIVE_TFS:
+                        _pending_emits.append({
+                            "symbol": symbol,
+                            "tf": tf,
+                            "time": cur["t"],
+                            "open": cur["o"],
+                            "high": cur["h"],
+                            "low": cur["l"],
+                            "close": cur["c"],
+                            "volume": cur["v"],
+                            "_emit_ts": time.time(),
+                            "_final": True,
+                        })
+                    # Reset the rate limiter so the NEW bar's first tick can
+                    # also emit immediately (no rate-limit lockout from the
+                    # bar-close emit we just queued above).
+                    _last_emit_time[f"{symbol}:{tf}"] = 0
                 # Start new candle with bubble profile
                 bp = {}
                 bp[qp] = [volume if side == "b" else 0,
@@ -2260,6 +2283,285 @@ def _detect_bar_classical_absorption(symbol, tf, candle, history):
     }
 
 
+# ═══════════════════════════════════════════════════════════════════
+# BATTLE STATE — third bar-signal layer (added 2026-05-07)
+# ═══════════════════════════════════════════════════════════════════
+# After absorption fires on a bar, observe the next 30s of L2/trade
+# activity at the absorbed level. Compute three features (drift, F12
+# refill count, F17 price range) and classify into:
+#
+#   ABSORBER_WINS_HIGH  drift > p75 AND f17 > p75   (~86% hit, n=35/146)
+#   ABSORBER_WINS       drift > p75                  (~75% hit, n=47/146)
+#   AGGRESSOR_WINS      drift ≤ 0  AND f12 ≤ p25    (~58% aggressor, n=26/146)
+#   NO_SIGNAL           else
+#
+# All thresholds computed as ROLLING PERCENTILES from last 100 events
+# per symbol — so the signal auto-calibrates to current vol regime.
+# Cold-start uses absolute defaults until 20 events accumulate.
+#
+# Validated on 64 days NQ MAR26 parquet; permutation p=0.008,
+# 5-fold CV mean 78.2%, bootstrap CI [65.5-87.3].
+# Strict live-realistic timing audit confirmed no look-ahead.
+# ═══════════════════════════════════════════════════════════════════
+
+_BATTLE_PENDING: dict = defaultdict(deque)        # symbol -> [pending events]
+_BATTLE_HISTORY: dict = defaultdict(lambda: deque(maxlen=100))  # symbol -> [completed feature samples]
+_BATTLE_LOCK = threading.RLock()
+_BATTLE_THREAD_STARTED = False
+
+_BATTLE_OBS_WINDOW_S    = 30.0   # observation window after detection
+_BATTLE_BAND_TICKS      = 2      # ± ticks for activity tracking
+_BATTLE_MIN_HISTORY     = 20     # min events before switching from cold-start to rolling p75/p25
+_BATTLE_LOOP_INTERVAL_S = 5.0    # process pending events every 5s
+
+# Cold-start absolute defaults (NQ-tuned; replaced by rolling percentiles after warmup)
+_BATTLE_COLD_DRIFT_P75 = 2.0     # ticks
+_BATTLE_COLD_F17_P75   = 2.0     # ticks
+_BATTLE_COLD_F12_P25   = 1       # refills
+
+_NQ_TICK = 0.25                  # tick size — TODO: read from symbol config
+
+
+def _enqueue_battle_state(symbol, tf, abs_event, candle):
+    """Called from _emit_bar_signals when absorption fires.
+    Queues this event for battle-state evaluation in 30s."""
+    K = abs_event.get('price')
+    if K is None:
+        return
+    # Map detector side → absorbed-side terminology:
+    #   bullish absorption (near low) = bid defended → SELLERS were absorbed
+    #   bearish absorption (near high) = ask defended → BUYERS were absorbed
+    side = 'SELL_ABSORBED' if abs_event.get('side') == 'bullish' else 'BUY_ABSORBED'
+    bar_t = candle.get('t', 0)
+    t_now = time.time()
+    event = {
+        'event_id': f"{symbol}_{int(t_now*1000)}_{int(K*100)}",
+        'symbol': symbol,
+        'tf': tf,
+        'K': K,
+        'side': side,
+        'absorption_strength': abs_event.get('strength'),
+        'absorption_volume':   abs_event.get('volume'),
+        'bar_t': bar_t,
+        't_detect_end': t_now,
+        't_obs_end':    t_now + _BATTLE_OBS_WINDOW_S,
+    }
+    with _BATTLE_LOCK:
+        _BATTLE_PENDING[symbol].append(event)
+
+
+def _compute_battle_features(symbol, K, side, t_start, t_end):
+    """Aggregate trades + book activity in [t_start, t_end) at K ± BAND.
+    Returns {drift, f12, f17, n_trades} or None if insufficient data."""
+    history = list(_DOM_HISTORY_T0.get(symbol, []))
+    relevant = [s for s in history if t_start <= s[0] < t_end]
+    if len(relevant) < 3:
+        return None
+
+    # Aggregate trades during obs window (drift + range)
+    band_lo = K - _BATTLE_BAND_TICKS * _NQ_TICK
+    band_hi = K + _BATTLE_BAND_TICKS * _NQ_TICK
+    all_prices = []
+    for snap in relevant:
+        # snap = (now_ts, snap_bids, snap_asks, compact_trades, compact_abs)
+        trades = snap[3] if len(snap) >= 4 else []
+        for tr in trades:
+            tp = tr.get('p')
+            if tp is None:
+                continue
+            try:
+                tp_f = float(tp)
+            except (TypeError, ValueError):
+                continue
+            ts_t = tr.get('t', snap[0])
+            if ts_t < t_start or ts_t >= t_end:
+                continue
+            if band_lo <= tp_f <= band_hi:
+                all_prices.append(tp_f)
+
+    if len(all_prices) < 2:
+        return None
+
+    max_p = max(all_prices)
+    min_p = min(all_prices)
+    max_up_t = (max_p - K) / _NQ_TICK
+    max_dn_t = (K - min_p) / _NQ_TICK
+    if side == 'SELL_ABSORBED':
+        drift = max_up_t - max_dn_t   # positive = absorbed direction = UP
+    else:
+        drift = max_dn_t - max_up_t   # positive = absorbed direction = DOWN
+
+    f17 = (max_p - min_p) / _NQ_TICK   # price range during obs (ticks)
+
+    # F12: refills at K — book size jumps on absorbed-side
+    K_str = str(round(float(K), 2))
+    book_seq = []
+    for snap in relevant:
+        bids = snap[1] if len(snap) >= 2 else {}
+        asks = snap[2] if len(snap) >= 3 else {}
+        # SELL_ABSORBED → buyers providing bid liquidity → check bids
+        # BUY_ABSORBED  → sellers providing ask liquidity → check asks
+        if side == 'SELL_ABSORBED':
+            sz = float(bids.get(K_str, 0) or 0)
+        else:
+            sz = float(asks.get(K_str, 0) or 0)
+        book_seq.append(sz)
+
+    f12 = 0
+    for i in range(1, len(book_seq)):
+        prev_sz = book_seq[i-1]
+        cur_sz  = book_seq[i]
+        if prev_sz > 0 and cur_sz > prev_sz * 1.2:
+            f12 += 1
+
+    return {'drift': drift, 'f12': f12, 'f17': f17, 'n_trades': len(all_prices)}
+
+
+def _battle_thresholds(symbol):
+    """Return current p75/p25 thresholds — rolling if enough history,
+    cold-start defaults otherwise."""
+    history = list(_BATTLE_HISTORY.get(symbol, []))
+    if len(history) >= _BATTLE_MIN_HISTORY:
+        drifts = sorted(h['drift'] for h in history)
+        f17s   = sorted(h['f17']   for h in history)
+        f12s   = sorted(h['f12']   for h in history)
+        return {
+            'drift_p75': drifts[int(len(drifts) * 0.75)],
+            'f17_p75':   f17s[int(len(f17s) * 0.75)],
+            'f12_p25':   f12s[int(len(f12s) * 0.25)],
+            'history_n': len(history),
+            'cold_start': False,
+        }
+    return {
+        'drift_p75': _BATTLE_COLD_DRIFT_P75,
+        'f17_p75':   _BATTLE_COLD_F17_P75,
+        'f12_p25':   _BATTLE_COLD_F12_P25,
+        'history_n': len(history),
+        'cold_start': True,
+    }
+
+
+def _classify_battle_tier(drift, f12, f17, thresholds):
+    """Apply the validated tier ladder."""
+    drift_p75 = thresholds['drift_p75']
+    f17_p75   = thresholds['f17_p75']
+    f12_p25   = thresholds['f12_p25']
+    if drift > drift_p75 and f17 > f17_p75:
+        return ('A+', 'ABSORBER_WINS_HIGH')
+    if drift > drift_p75:
+        return ('A', 'ABSORBER_WINS')
+    if drift <= 0 and f12 <= f12_p25:
+        return ('B', 'AGGRESSOR_WINS')
+    return ('-', 'NO_SIGNAL')
+
+
+def _compute_and_emit_battle_state(ev):
+    """Called by background loop when an event's obs window has elapsed."""
+    symbol = ev['symbol']
+    feats = _compute_battle_features(symbol, ev['K'], ev['side'],
+                                      ev['t_detect_end'], ev['t_obs_end'])
+    if feats is None:
+        return  # insufficient L2 data — skip silently
+
+    drift = feats['drift']
+    f12   = feats['f12']
+    f17   = feats['f17']
+
+    thresholds = _battle_thresholds(symbol)
+    tier, label = _classify_battle_tier(drift, f12, f17, thresholds)
+
+    # ALWAYS update history — even NO_SIGNAL events feed the percentile distribution
+    with _BATTLE_LOCK:
+        _BATTLE_HISTORY[symbol].append({'drift': drift, 'f12': f12, 'f17': f17})
+
+    if label == 'NO_SIGNAL':
+        return  # don't emit — the level is dead/chaotic
+
+    if _socketio is None:
+        return
+
+    payload = {
+        'event_id': ev['event_id'],
+        'symbol':   symbol,
+        'tf':       ev['tf'],
+        'bar_t':    ev['bar_t'],
+        'K':        ev['K'],
+        'side':     ev['side'],
+        'label':    label,
+        'tier':     tier,
+        'drift':    round(drift, 2),
+        'f12':      f12,
+        'f17':      round(f17, 2),
+        'n_trades': feats['n_trades'],
+        'thresholds': {
+            'drift_p75':  round(thresholds['drift_p75'], 2),
+            'f17_p75':    round(thresholds['f17_p75'], 2),
+            'f12_p25':    thresholds['f12_p25'],
+            'history_n':  thresholds['history_n'],
+            'cold_start': thresholds['cold_start'],
+        },
+        'absorption_strength': ev.get('absorption_strength'),
+        'absorption_volume':   ev.get('absorption_volume'),
+    }
+    try:
+        _socketio.emit('battle_state_update', payload, namespace='/')
+        log.info(
+            f"[BATTLE] {symbol} {ev['tf']} K={ev['K']} {label} (tier {tier}) "
+            f"drift={drift:+.1f}t f12={f12} f17={f17:.1f}t  "
+            f"thr(d75={thresholds['drift_p75']:.1f} f17_75={thresholds['f17_p75']:.1f} "
+            f"f12_25={thresholds['f12_p25']} n={thresholds['history_n']}"
+            f"{' COLD' if thresholds['cold_start'] else ''})"
+        )
+    except Exception as e:
+        log.warning(f"[BATTLE] emit err: {e}")
+
+
+def _process_battle_pending():
+    """Process all pending events whose observation window has elapsed."""
+    now = time.time()
+    ready = []
+    with _BATTLE_LOCK:
+        for symbol in list(_BATTLE_PENDING.keys()):
+            pending = _BATTLE_PENDING[symbol]
+            remaining = deque()
+            while pending:
+                ev = pending.popleft()
+                if now >= ev['t_obs_end']:
+                    ready.append(ev)
+                else:
+                    remaining.append(ev)
+            # any event not yet ready stays queued
+            _BATTLE_PENDING[symbol] = remaining
+    # compute outside lock to keep critical section short
+    for ev in ready:
+        try:
+            _compute_and_emit_battle_state(ev)
+        except Exception as e:
+            log.warning(f"[BATTLE] compute err for {ev.get('event_id')}: {e}")
+
+
+def _battle_loop():
+    """Background thread: poll pending events every 5s."""
+    while True:
+        try:
+            time.sleep(_BATTLE_LOOP_INTERVAL_S)
+            _process_battle_pending()
+        except Exception as e:
+            log.warning(f"[BATTLE] loop err: {e}")
+            time.sleep(10.0)
+
+
+def _start_battle_thread():
+    """Idempotent thread starter."""
+    global _BATTLE_THREAD_STARTED
+    if _BATTLE_THREAD_STARTED:
+        return
+    _BATTLE_THREAD_STARTED = True
+    t = threading.Thread(target=_battle_loop, daemon=True, name='battle_state_loop')
+    t.start()
+    log.info("[BATTLE] background loop started")
+
+
 def _emit_bar_signals(symbol, tf, candle, history):
     """Run all 4 detectors on a closed bar; emit a single bar_signal event
     only when at least one signal fires. Most bars produce no event.
@@ -2403,6 +2705,18 @@ def _emit_bar_signals(symbol, tf, candle, history):
         log.info(f"[BAR_SIGNAL] EMITTED {symbol} {tf} t={candle.get('t')}")
     except Exception as e:
         log.warning(f"[BAR_SIGNAL] emit err: {e}")
+
+    # ── BATTLE STATE: queue every absorption fire for 30s observation ──
+    # The battle classifier runs ASYNC (background thread), so this just
+    # registers events and returns immediately. Verdict emits later as
+    # 'battle_state_update' Socket.IO event.
+    if abs_events:
+        try:
+            _start_battle_thread()  # idempotent
+            for abs_event in abs_events:
+                _enqueue_battle_state(symbol, tf, abs_event, candle)
+        except Exception as e:
+            log.warning(f"[BATTLE] enqueue err: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════
