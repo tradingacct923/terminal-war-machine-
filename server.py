@@ -976,7 +976,12 @@ _FUNDAMENTALS_TTL = 3600        # 1 hr
 # polls within 3s return cached body. Profile changes ~once per minute on
 # new bar close, so 3s staleness is invisible to the user.
 _vprofile_cache: dict = {}       # {(query_string,): (response_body_bytes, ts)}
-_VPROFILE_TTL = 3.0              # seconds
+_VPROFILE_TTL = 15.0             # seconds (was 3.0 — frontend polls every
+                                 # ~2.5s, so 3.0s TTL had borderline misses
+                                 # producing 0.4-0.5s gevent blocks on the
+                                 # 1MB mode=weekly response. Profile data
+                                 # only changes on bar close — 15s staleness
+                                 # is invisible.)
 
 
 @app.route("/api/movers")
