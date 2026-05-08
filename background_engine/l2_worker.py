@@ -2306,13 +2306,17 @@ def _detect_bar_classical_absorption(symbol, tf, candle, history):
 
 _BATTLE_PENDING: dict = defaultdict(deque)        # symbol -> [pending events]
 _BATTLE_HISTORY: dict = defaultdict(lambda: deque(maxlen=100))  # symbol -> [completed feature samples]
+_BATTLE_OUTCOME_PENDING: dict = defaultdict(deque)              # symbol -> [verdicts awaiting outcome check]
+_BATTLE_STATS: dict = defaultdict(lambda: {'A+':[0,0], 'A':[0,0], 'B':[0,0]})  # symbol -> {tier:[hits,total]}
 _BATTLE_LOCK = threading.RLock()
 _BATTLE_THREAD_STARTED = False
 
-_BATTLE_OBS_WINDOW_S    = 30.0   # observation window after detection
-_BATTLE_BAND_TICKS      = 2      # ± ticks for activity tracking
-_BATTLE_MIN_HISTORY     = 20     # min events before switching from cold-start to rolling p75/p25
-_BATTLE_LOOP_INTERVAL_S = 5.0    # process pending events every 5s
+_BATTLE_OBS_WINDOW_S         = 30.0   # observation window after detection
+_BATTLE_OUTCOME_HORIZON_S    = 60.0   # forward window for outcome verification
+_BATTLE_HIT_THRESHOLD_TICKS  = 5      # min move (in ticks) to count as a hit
+_BATTLE_BAND_TICKS           = 2      # ± ticks for activity tracking
+_BATTLE_MIN_HISTORY          = 20     # min events before switching from cold-start to rolling p75/p25
+_BATTLE_LOOP_INTERVAL_S      = 5.0    # process pending events every 5s
 
 # Cold-start absolute defaults (NQ-tuned; replaced by rolling percentiles after warmup).
 # Note: live F12 is computed from T0 DOM snapshots (~500ms throttle = max ~60/30s),
@@ -2558,11 +2562,80 @@ def _compute_and_emit_battle_state(ev):
     except Exception as e:
         log.warning(f"[BATTLE] emit err: {e}")
 
+    # Queue outcome verification (60s after obs window)
+    try:
+        with _BATTLE_LOCK:
+            _BATTLE_OUTCOME_PENDING[symbol].append({
+                'symbol':    symbol,
+                'tier':      tier,
+                'side':      ev['side'],
+                'K':         ev['K'],
+                'event_id':  ev['event_id'],
+                't_obs_end': ev['t_obs_end'],
+                't_outcome': ev['t_obs_end'] + _BATTLE_OUTCOME_HORIZON_S,
+            })
+    except Exception as e:
+        log.warning(f"[BATTLE-OUT] enqueue err: {e}")
+
+
+def _check_outcome(ev):
+    """Compute forward-60s outcome from DOM_HISTORY_T0. Returns hit/miss + diagnostics."""
+    K = ev['K']
+    side = ev['side']
+    tier = ev['tier']
+    history = list(_DOM_HISTORY_T0.get(ev['symbol'], []))
+    relevant = [s for s in history if ev['t_obs_end'] <= s[0] < ev['t_outcome']]
+    if not relevant:
+        return None
+
+    prices = []
+    for snap in relevant:
+        trades = snap[3] if len(snap) >= 4 else []
+        for tr in trades:
+            tp = tr.get('p')
+            if tp is None: continue
+            ts_t = tr.get('t', snap[0])
+            if ts_t < ev['t_obs_end'] or ts_t >= ev['t_outcome']:
+                continue
+            try:
+                prices.append(float(tp))
+            except (TypeError, ValueError):
+                pass
+    if len(prices) < 2:
+        return None
+
+    max_up_t = (max(prices) - K) / _NQ_TICK
+    max_dn_t = (K - min(prices)) / _NQ_TICK
+
+    if side == 'SELL_ABSORBED':
+        absorbed_hit  = max_up_t >= _BATTLE_HIT_THRESHOLD_TICKS
+        aggressor_hit = max_dn_t >= _BATTLE_HIT_THRESHOLD_TICKS
+    else:  # BUY_ABSORBED
+        absorbed_hit  = max_dn_t >= _BATTLE_HIT_THRESHOLD_TICKS
+        aggressor_hit = max_up_t >= _BATTLE_HIT_THRESHOLD_TICKS
+
+    if tier in ('A+', 'A'):
+        hit = absorbed_hit
+    elif tier == 'B':
+        hit = aggressor_hit
+    else:
+        return None
+
+    return {
+        'hit': hit,
+        'absorbed_hit':  absorbed_hit,
+        'aggressor_hit': aggressor_hit,
+        'max_up_t':      max_up_t,
+        'max_dn_t':      max_dn_t,
+    }
+
 
 def _process_battle_pending():
-    """Process all pending events whose observation window has elapsed."""
+    """Process all pending events whose observation window has elapsed,
+    plus any verdicts whose forward-outcome window is complete."""
     now = time.time()
     ready = []
+    ready_outcomes = []
     with _BATTLE_LOCK:
         for symbol in list(_BATTLE_PENDING.keys()):
             pending = _BATTLE_PENDING[symbol]
@@ -2573,14 +2646,43 @@ def _process_battle_pending():
                     ready.append(ev)
                 else:
                     remaining.append(ev)
-            # any event not yet ready stays queued
             _BATTLE_PENDING[symbol] = remaining
+        # Outcome pending — same pattern
+        for symbol in list(_BATTLE_OUTCOME_PENDING.keys()):
+            pending = _BATTLE_OUTCOME_PENDING[symbol]
+            remaining = deque()
+            while pending:
+                ev = pending.popleft()
+                if now >= ev['t_outcome']:
+                    ready_outcomes.append(ev)
+                else:
+                    remaining.append(ev)
+            _BATTLE_OUTCOME_PENDING[symbol] = remaining
     # compute outside lock to keep critical section short
     for ev in ready:
         try:
             _compute_and_emit_battle_state(ev)
         except Exception as e:
             log.warning(f"[BATTLE] compute err for {ev.get('event_id')}: {e}")
+    for ev in ready_outcomes:
+        try:
+            result = _check_outcome(ev)
+            if result is None:
+                continue
+            with _BATTLE_LOCK:
+                stats = _BATTLE_STATS[ev['symbol']][ev['tier']]
+                stats[1] += 1
+                if result['hit']:
+                    stats[0] += 1
+                running_pct = stats[0] / max(stats[1], 1) * 100
+            log.info(
+                f"[BATTLE-OUT] {ev['symbol']} K={ev['K']} {ev['tier']} {ev['side']}  "
+                f"{'HIT ✓' if result['hit'] else 'MISS ✗'}  "
+                f"max_up={result['max_up_t']:.0f}t max_dn={result['max_dn_t']:.0f}t  "
+                f"{ev['tier']} running: {stats[0]}/{stats[1]} = {running_pct:.1f}%"
+            )
+        except Exception as e:
+            log.warning(f"[BATTLE-OUT] err for {ev.get('event_id')}: {e}")
 
 
 def _battle_loop():

@@ -871,6 +871,9 @@ def _run_bridge():
             # silently no-op'd because tickers=['QQQ'] left _vol_history
             # without a 'SPY' deque so the early-return at the top of
             # feed_equity_print fired on every SPY tick.
+            # 2026-05-08: SPY scoring is INTERNALLY GATED inside ConvictionScorer
+            # (greek_surface is QQQ-only, so SPY hedge_pressure can't be
+            # computed). Volume tracking still flows for cross-asset use.
             init_scorer(socketio=_socketio, tickers=['QQQ', 'SPY'])
             log.info("[SCHWAB-BRIDGE] ConvictionScorer initialised (emits 'conviction_update')")
         except Exception as e:
