@@ -1354,19 +1354,18 @@ class FlowAccumulator:
                     st.cum_signed_all     = float(last.get('sa', 0) or 0)
                     st.cum_unsigned_0dte  = float(last.get('u0', 0) or 0)
                     st.cum_unsigned_all   = float(last.get('ua', 0) or 0)
-                    # 2026-05-08: do NOT restore cum_call_buy/sell/put_buy/sell.
-                    # Pre-fix (commit be97bc2 → ed?), the OCC parse skipped
-                    # un-padded symbols, so these atomic counters undercounted
-                    # by ~70%. Persisted history files written before the parse
-                    # fix carry that bug forward indefinitely if we restore.
-                    # Letting them rebuild from 0 each restart means the atomic
-                    # breakdown reflects "since-restart" while cum_signed_all
-                    # is "all-day" — they won't match exactly until the bug
-                    # period falls out of the day, but new trades are correct.
-                    st.cum_call_buy       = 0.0
-                    st.cum_call_sell      = 0.0
-                    st.cum_put_buy        = 0.0
-                    st.cum_put_sell       = 0.0
+                    # 2026-05-08: restore atomic counters from buffer to keep
+                    # the flow chart's call_buy/sell/put_buy/sell lines
+                    # CONTINUOUS across bridge restarts. Pre-OCC-fix buffers
+                    # carry slight undercounts (un-padded symbols were
+                    # skipped), but visually-stable chart > slightly-off
+                    # absolute values. New trades after restart accumulate
+                    # correctly via the post-fix parser, so the absolute
+                    # values self-correct as the day progresses.
+                    st.cum_call_buy       = float(last.get('cb', 0) or 0)
+                    st.cum_call_sell      = float(last.get('cs', 0) or 0)
+                    st.cum_put_buy        = float(last.get('pb', 0) or 0)
+                    st.cum_put_sell       = float(last.get('ps', 0) or 0)
                     st.cohort_0dte_am_signed = float(last.get('c_0am', 0) or 0)
                     st.cohort_0dte_pm_signed = float(last.get('c_0pm', 0) or 0)
                     st.cohort_weekly_signed   = float(last.get('c_wk', 0) or 0)
