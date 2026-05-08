@@ -318,8 +318,22 @@ class ConvictionScorer:
 
         # ── 1. Hedge pressure → amplification factor (master variable) ─────
         gs = getattr(_sb, '_greek_surface', None)
-        spot = float(getattr(_sb, '_latest_qqq', 0.0) or 0.0)
+        # 2026-05-08 FIX: read per-ticker spot, not the QQQ-only legacy global.
+        # Pre-fix: SPY's conviction state was scored using QQQ's spot price
+        # because both tickers fell through to _latest_qqq. Now: prefer the
+        # per-ticker dict; fall back to _latest_qqq only for QQQ itself.
+        spots = getattr(_sb, '_latest_spot_by_ticker', {}) or {}
+        spot = float(spots.get(ticker, 0.0) or 0.0)
+        if spot <= 0 and ticker == 'QQQ':
+            spot = float(getattr(_sb, '_latest_qqq', 0.0) or 0.0)
         if gs is None or spot <= 0:
+            return
+        # 2026-05-08 GATE: greek_surface is QQQ-only (only QQQ option quotes
+        # feed into it). Skip the score path for any other ticker until a
+        # per-ticker greek_surface system exists. Volume ingestion via
+        # feed_equity_print() still works for those tickers — that's why
+        # they're in self._tickers; cross-asset signals can use that data.
+        if ticker != 'QQQ':
             return
 
         try:
