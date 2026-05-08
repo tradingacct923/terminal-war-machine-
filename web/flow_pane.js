@@ -221,6 +221,29 @@
                 if (_series[ticker].length > _SERIES_MAX) {
                     _series[ticker].splice(0, _series[ticker].length - _SERIES_MAX);
                 }
+                // 2026-05-08: heal cb/cs/pb/ps discontinuities at render time.
+                // Backend has occasional reset-to-near-zero in these atomic
+                // counters (bridge restarts during the OCC-parse fix rollout
+                // baked drops into the history buffer). Detect drops > $50M
+                // between consecutive snapshots — those represent process
+                // restarts, not real flow — and add a per-field offset so
+                // subsequent samples connect smoothly to pre-drop. Pure
+                // visual fix; raw fields stay readable for debugging.
+                const HEAL_THRESHOLD = 50e6;  // $50M
+                const HEAL_FIELDS = ['cb', 'cs', 'pb', 'ps'];
+                const healOffsets = {cb: 0, cs: 0, pb: 0, ps: 0};
+                const healLast = {cb: 0, cs: 0, pb: 0, ps: 0};
+                for (let i = 0; i < _series[ticker].length; i++) {
+                    const e = _series[ticker][i];
+                    for (const f of HEAL_FIELDS) {
+                        const cur = +e[f] || 0;
+                        if (i > 0 && cur < healLast[f] - HEAL_THRESHOLD) {
+                            healOffsets[f] += healLast[f];
+                        }
+                        healLast[f] = cur;
+                        e[f] = cur + healOffsets[f];
+                    }
+                }
                 _dirty = true;
                 console.log(`[flow_pane] Hydrated ${d.snapshots.length} history snapshots for ${ticker}; series now ${_series[ticker].length}`);
             })
