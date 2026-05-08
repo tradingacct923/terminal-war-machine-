@@ -5964,6 +5964,48 @@ def _deferred_candle_push(sid, symbol='NQ', tf='1m'):
     if _client_active_tf.get(sid) == tf:
         _push_candle_history(sid, symbol, tf)
 
+# ─── BRIDGE-RELAY HANDLERS (Phase 2 of multiprocess split, 2026-05-07) ───
+# When BRIDGE_PROCESS=1 is set, the schwab_bridge runs in bridge.py (separate
+# Python process) and connects HERE as a Socket.IO client. Every event the
+# bridge wants to broadcast is sent as 'relay:<event>' to this server, where
+# the handlers below re-emit it under the original name so browser clients
+# receive it identically to the in-process path.
+#
+# Status: handlers ALWAYS active so they're harmless in single-process mode
+# (relay events simply never arrive). Wildcard catch-all via the underlying
+# python-socketio Server avoids enumerating ~33 event names. Specific
+# handlers for 'connect'/'disconnect' below take priority over the catch-all.
+def _relay_event(event_name: str, data):
+    """Re-emit a bridge-originated event to all browser clients."""
+    try:
+        if not isinstance(event_name, str) or not event_name.startswith('relay:'):
+            return
+        actual = event_name[len('relay:'):]
+        if not actual:
+            return
+        socketio.emit(actual, data)
+    except Exception as e:
+        try:
+            log.debug(f"[BRIDGE-RELAY] re-emit failed for {event_name}: {e}")
+        except Exception:
+            pass
+
+try:
+    @socketio.server.on('*', namespace='/')
+    def _bridge_relay_catch_all(event, sid, *args):
+        # python-socketio catch-all signature: (event, sid, *data). Specific
+        # handlers (connect/disconnect/subscribe/etc.) bypass this.
+        if not isinstance(event, str) or not event.startswith('relay:'):
+            return
+        data = args[0] if args else None
+        _relay_event(event, data)
+except Exception as _re:
+    # Defensive — if the underlying server doesn't expose the catch-all in
+    # this version of flask-socketio/python-socketio, log and move on.
+    print(f"[BRIDGE-RELAY] catch-all handler not registered: {_re}", flush=True)
+# ─── end bridge-relay handlers ───────────────────────────────────────────
+
+
 @socketio.on('connect')
 def handle_connect():
     sid = request.sid
