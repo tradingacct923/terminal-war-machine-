@@ -714,13 +714,31 @@ class FlowAccumulator:
             # with OSI fallback. Magnitude = abs(signed) so each bucket is
             # always ≥0; the SIGN of intent is encoded in WHICH bucket
             # gets the increment.
+            #
+            # 2026-05-08 FIX: prior parse used symbol[12] which assumes the
+            # underlying is space-padded to 6 chars (standard OSI). Tradier
+            # often delivers unpadded symbols ('AAPL240517C00100000') for
+            # which position 12 lands on the year, not the type — those
+            # trades hit the `_is_call = None` branch and were silently
+            # dropped from cum_call_buy/_sell/_put_buy/_sell. Result:
+            # atomic breakdown sum was 76% off vs cum_signed_all (live
+            # measurement on 2026-05-08).
+            #
+            # The strike is ALWAYS the last 8 digits and the contract type
+            # is ALWAYS the char immediately before it (position -9 from
+            # the end), regardless of underlying length or padding. Parse
+            # from the end to handle both formats.
             if side != 0:
                 _ct = data.get('contract_type') or ''
                 if _ct in ('C', 'CALL', 'call'):
                     _is_call = True
                 elif _ct in ('P', 'PUT', 'put'):
                     _is_call = False
-                elif len(symbol) >= 13:
+                elif len(symbol) >= 9 and symbol[-9] in ('C', 'P') and symbol[-8:].isdigit():
+                    # OSI-from-end: <underlying><YYMMDD><C|P><STRIKE×1000_8_digit>
+                    _is_call = (symbol[-9] == 'C')
+                elif len(symbol) >= 13 and symbol[12] in ('C', 'P'):
+                    # Legacy fallback for fixed 6-char-padded underlyings
                     _is_call = (symbol[12] == 'C')
                 else:
                     _is_call = None  # unknown — skip rather than miscount
@@ -1336,10 +1354,19 @@ class FlowAccumulator:
                     st.cum_signed_all     = float(last.get('sa', 0) or 0)
                     st.cum_unsigned_0dte  = float(last.get('u0', 0) or 0)
                     st.cum_unsigned_all   = float(last.get('ua', 0) or 0)
-                    st.cum_call_buy       = float(last.get('cb', 0) or 0)
-                    st.cum_call_sell      = float(last.get('cs', 0) or 0)
-                    st.cum_put_buy        = float(last.get('pb', 0) or 0)
-                    st.cum_put_sell       = float(last.get('ps', 0) or 0)
+                    # 2026-05-08: do NOT restore cum_call_buy/sell/put_buy/sell.
+                    # Pre-fix (commit be97bc2 → ed?), the OCC parse skipped
+                    # un-padded symbols, so these atomic counters undercounted
+                    # by ~70%. Persisted history files written before the parse
+                    # fix carry that bug forward indefinitely if we restore.
+                    # Letting them rebuild from 0 each restart means the atomic
+                    # breakdown reflects "since-restart" while cum_signed_all
+                    # is "all-day" — they won't match exactly until the bug
+                    # period falls out of the day, but new trades are correct.
+                    st.cum_call_buy       = 0.0
+                    st.cum_call_sell      = 0.0
+                    st.cum_put_buy        = 0.0
+                    st.cum_put_sell       = 0.0
                     st.cohort_0dte_am_signed = float(last.get('c_0am', 0) or 0)
                     st.cohort_0dte_pm_signed = float(last.get('c_0pm', 0) or 0)
                     st.cohort_weekly_signed   = float(last.get('c_wk', 0) or 0)
