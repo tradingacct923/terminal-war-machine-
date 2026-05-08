@@ -1325,10 +1325,24 @@ def api_debug_walls_audit():
 def api_ndx_wgc():
     """Last emitted NDX Weighted Gamma Composite payload. Used by AI panel
     to hydrate the NDX regime cell on init so it's not blank until the next
-    socket emit."""
+    socket emit.
+
+    2026-05-08 multiproc: when the WGC computer runs in bridge.py,
+    server's _sb.get_latest_wgc() returns empty. Fall through to disk.
+    """
     try:
         from background_engine import schwab_bridge as _sb
-        return jsonify(_sb.get_latest_wgc())
+        wgc = _sb.get_latest_wgc()
+        if wgc:
+            return jsonify(wgc)
+        try:
+            from connectors._bridge_state import fetch as _bs_fetch
+            disk = _bs_fetch('ndx_wgc', 'latest')
+            if disk:
+                return jsonify(disk)
+        except Exception:
+            pass
+        return jsonify(wgc)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1958,10 +1972,19 @@ def api_option_flow_by_exchange(ticker):
     try:
         from connectors.flow_accumulator import get_accumulator
         acc = get_accumulator()
-        if acc is None:
-            return jsonify({'error': 'flow_accumulator not initialized'}), 503
         top_n = max(1, min(50, int(request.args.get('top_n', 10))))
-        return jsonify(acc.get_by_exchange(ticker.upper(), top_n=top_n))
+        if acc is not None:
+            return jsonify(acc.get_by_exchange(ticker.upper(), top_n=top_n))
+        # 2026-05-08 multiproc fallback — bridge publishes per-ticker
+        # by_exchange snapshots every 2s.
+        try:
+            from connectors._bridge_state import fetch as _bs_fetch
+            disk = _bs_fetch('flow_by_exchange', ticker.upper())
+            if disk:
+                return jsonify(disk)
+        except Exception:
+            pass
+        return jsonify({'error': 'flow_accumulator not initialized'}), 503
     except Exception as e:
         import traceback
         return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
@@ -2407,17 +2430,30 @@ def api_debug_alert_samples():
 def api_alerts_state():
     """Per-ticker current-state matrix for the AI Panel 4×3 UI.
     Returns {'flow_cross','flow_divergence','key_level','spike_dump'} →
-    'bullish'|'bearish'|'none' for every ticker the engine is tracking."""
+    'bullish'|'bearish'|'none' for every ticker the engine is tracking.
+
+    2026-05-08 multiproc: alert engine runs in bridge.py — server's
+    get_engine() returns None. Fall through to bridge's published
+    state_matrix on disk.
+    """
     try:
         from connectors.alert_engine import get_engine
         eng = get_engine()
-        if eng is None:
-            return jsonify({"ready": False, "tickers": {}})
-        return jsonify({
-            "ready": True,
-            "server_time": time.time(),
-            "tickers": eng.get_state_matrix(),
-        })
+        if eng is not None:
+            return jsonify({
+                "ready": True,
+                "server_time": time.time(),
+                "tickers": eng.get_state_matrix(),
+            })
+        # Multiproc fallback
+        try:
+            from connectors._bridge_state import fetch as _bs_fetch
+            disk = _bs_fetch('alerts', 'state_matrix')
+            if disk:
+                return jsonify(disk)
+        except Exception:
+            pass
+        return jsonify({"ready": False, "tickers": {}})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -3214,14 +3250,26 @@ def api_option_flow():
     Powers initial hydration when the flow pane mounts. Live updates
     after hydration arrive via the 'flow_update' socketio event.
     Separate from /api/flow (which is FlowClassifier's L2-book scores).
+
+    2026-05-08 multiproc: when BRIDGE_PROCESS=1, the FlowAccumulator
+    runs in bridge.py — server's get_accumulator() returns None.
+    Fall through to bridge's published snapshot in state/intel/.
     """
     try:
         from connectors.flow_accumulator import get_accumulator
         acc = get_accumulator()
-        if acc is None:
-            return jsonify({"tickers": [], "ready": False})
-        states = acc.get_all_states()
-        return jsonify({"tickers": list(states.values()), "ready": True})
+        if acc is not None:
+            states = acc.get_all_states()
+            return jsonify({"tickers": list(states.values()), "ready": True})
+        # Multiproc fallback — read bridge's published snapshot
+        try:
+            from connectors._bridge_state import fetch as _bs_fetch
+            disk = _bs_fetch('flow_accumulator', '_all_tickers')
+            if disk and disk.get('ready'):
+                return jsonify(disk)
+        except Exception:
+            pass
+        return jsonify({"tickers": [], "ready": False})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -3274,9 +3322,28 @@ def api_option_flow_history():
         except Exception:
             since_ms = 0
         acc = get_accumulator()
-        if acc is None:
+        snapshots = None
+        if acc is not None:
+            snapshots = acc.get_history(ticker, since_ts_ms=since_ms)
+        else:
+            # 2026-05-08 multiproc fallback: flow_history_buffer.json is
+            # written by bridge.py's accumulator (~30s cadence). Read it
+            # directly when the in-process accumulator is unavailable.
+            try:
+                import os as _os, json as _json
+                _path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                                      'logs', 'flow_history_buffer.json')
+                if _os.path.exists(_path):
+                    with open(_path) as _f:
+                        _data = _json.load(_f)
+                    _buf = (_data.get('tickers') or {}).get(ticker, [])
+                    if since_ms > 0:
+                        _buf = [s for s in _buf if s.get('t', 0) > since_ms]
+                    snapshots = _buf
+            except Exception:
+                pass
+        if snapshots is None:
             return jsonify({"ticker": ticker, "snapshots": [], "ready": False})
-        snapshots = acc.get_history(ticker, since_ts_ms=since_ms)
         return jsonify({
             "ticker": ticker,
             "snapshots": snapshots,

@@ -209,11 +209,10 @@ def main():
     start_schwab_bridge()
     log.info("✅ schwab_bridge.start_schwab_bridge() returned — bridge running")
 
-    # 3a. Periodic capture_rate publisher — makes /api/_debug/capture_rate
-    #     work in multiproc mode. capture_rate() in dealer_print_capture
-    #     publishes its result to state/intel/capture_rate__snapshot.json on
-    #     each call. Server reads from disk when its own state is empty.
-    #     Also publishes Tradier per-conn stats from get_tradier_conn_stats.
+    # 3a. Periodic publishers — make REST endpoints in server.py work in
+    #     multiproc mode by writing module state to disk every few seconds.
+    #     Server reads via _bridge_state.fetch when its own in-process copy
+    #     is empty (BRIDGE_PROCESS=1 case).
     import threading
     def _capture_rate_publisher():
         from connectors import dealer_print_capture as _dpc
@@ -236,6 +235,72 @@ def main():
     threading.Thread(target=_capture_rate_publisher, daemon=True,
                      name='CaptureRatePublisher').start()
     log.info("capture_rate publisher thread started (5s cadence)")
+
+    # 3b. Flow accumulator publisher — same disk-state pattern. The flow
+    #     pane hits /api/option_flow + /api/option_flow/history at hydration
+    #     time; without this the pane shows empty.
+    def _flow_accumulator_publisher():
+        from connectors._bridge_state import publish as _bs_publish
+        from connectors.flow_accumulator import get_accumulator
+        import time as _t
+        while True:
+            try:
+                _t.sleep(2.0)   # 2s cadence — flow pane polls every ~5s
+                acc = get_accumulator()
+                if acc is None:
+                    continue
+                states = acc.get_all_states()
+                _bs_publish('flow_accumulator', '_all_tickers', {
+                    'tickers': list(states.values()),
+                    'ready':   True,
+                })
+                # Per-ticker by_exchange snapshots — powers the
+                # /api/option_flow/by_exchange/<ticker> endpoint.
+                for tk in states.keys():
+                    try:
+                        _bs_publish('flow_by_exchange', tk,
+                                    acc.get_by_exchange(tk, top_n=10))
+                    except Exception as _be:
+                        log.debug(f"by_exchange publish {tk} err: {_be}")
+            except Exception as _e:
+                log.debug(f"flow_accumulator publisher err: {_e}")
+    threading.Thread(target=_flow_accumulator_publisher, daemon=True,
+                     name='FlowAccumulatorPublisher').start()
+    log.info("flow_accumulator publisher thread started (2s cadence)")
+
+    # 3c. AI panel publishers — alert engine state-matrix + ndx_wgc.
+    #     /api/alerts/state and /api/ndx_wgc hydrate the AI panel on mount.
+    def _ai_panel_publisher():
+        from connectors._bridge_state import publish as _bs_publish
+        from connectors.alert_engine import get_engine
+        from background_engine import schwab_bridge as _sb
+        import time as _t
+        while True:
+            try:
+                _t.sleep(2.0)
+                # Alerts state matrix
+                eng = get_engine()
+                if eng is not None:
+                    try:
+                        _bs_publish('alerts', 'state_matrix', {
+                            'ready':       True,
+                            'server_time': _t.time(),
+                            'tickers':     eng.get_state_matrix(),
+                        })
+                    except Exception as _ae:
+                        log.debug(f"alerts state_matrix publish err: {_ae}")
+                # NDX WGC composite
+                try:
+                    wgc = _sb.get_latest_wgc()
+                    if wgc:
+                        _bs_publish('ndx_wgc', 'latest', wgc)
+                except Exception as _we:
+                    log.debug(f"ndx_wgc publish err: {_we}")
+            except Exception as _e:
+                log.debug(f"ai_panel publisher err: {_e}")
+    threading.Thread(target=_ai_panel_publisher, daemon=True,
+                     name='AIPanelPublisher').start()
+    log.info("ai_panel publisher thread started (2s cadence)")
 
     # 4. Keep the main thread alive. start_schwab_bridge() spawns daemon
     #    threads, so without this the process would exit immediately.
