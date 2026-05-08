@@ -2346,6 +2346,12 @@ def api_debug_capture_rate():
 
     2026-05-05 — added `tradier_conns` array. Each entry exposes per-conn
     uptime/disconnect history so reconnects are visible without log-grep.
+
+    2026-05-08 multiproc: bridge.py publishes its real state every 5s to
+    state/intel/capture_rate__snapshot.json. If our local in-memory state
+    is empty (in_total=0 — happens under BRIDGE_PROCESS=1), fall through
+    to the disk view so the endpoint reflects bridge's reality, not
+    server's empty stub.
     """
     try:
         from connectors import dealer_print_capture as _dpc
@@ -2355,6 +2361,18 @@ def api_debug_capture_rate():
             out['tradier_conns'] = _sb.get_tradier_conn_stats()
         except Exception as e:
             out['tradier_conns'] = {'error': str(e)[:120]}
+        # Multiproc fallback — when the dealer-print pipeline isn't running
+        # in this process (BRIDGE_PROCESS=1), in_total stays 0. Read bridge's
+        # published snapshot from disk instead.
+        if out.get('in_total', 0) == 0:
+            try:
+                from connectors._bridge_state import fetch as _bs_fetch
+                disk_snap = _bs_fetch('capture_rate', '_snapshot')
+                if disk_snap and disk_snap.get('in_total', 0) > 0:
+                    disk_snap['_source'] = 'bridge_disk_snapshot'
+                    return jsonify(disk_snap)
+            except Exception:
+                pass
         return jsonify(out)
     except Exception as e:
         import traceback

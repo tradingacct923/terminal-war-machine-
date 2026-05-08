@@ -426,7 +426,7 @@ def capture_rate() -> dict:
         )
     rate = (n_out / n_in) if n_in > 0 else 1.0
     expected_rate = (1.0 - n_pend / n_in) if n_in > 0 else 1.0
-    return {
+    out = {
         'in_total':       n_in,
         'out_total':      n_out,
         'pending':        n_pend,
@@ -440,6 +440,17 @@ def capture_rate() -> dict:
         'persist_last_count':   _last_persist_n,
         'persist_last_dur_ms':  _last_persist_dur_ms,
     }
+    # 2026-05-08 multiproc: publish to disk so server-process /api/_debug/capture_rate
+    # can read bridge's real state (server's own dealer_print_capture is unused
+    # under BRIDGE_PROCESS=1). Only writes if we have anything meaningful to share —
+    # in_total > 0 means this process actually has the dealer-print pipeline running.
+    if n_in > 0:
+        try:
+            from connectors._bridge_state import publish as _bs_publish
+            _bs_publish('capture_rate', '_snapshot', out)
+        except Exception:
+            pass
+    return out
 
 
 # ── Pending-queue persistence (Improvement #1, added 2026-05-04) ────────────

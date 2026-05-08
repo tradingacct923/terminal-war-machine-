@@ -209,6 +209,34 @@ def main():
     start_schwab_bridge()
     log.info("✅ schwab_bridge.start_schwab_bridge() returned — bridge running")
 
+    # 3a. Periodic capture_rate publisher — makes /api/_debug/capture_rate
+    #     work in multiproc mode. capture_rate() in dealer_print_capture
+    #     publishes its result to state/intel/capture_rate__snapshot.json on
+    #     each call. Server reads from disk when its own state is empty.
+    #     Also publishes Tradier per-conn stats from get_tradier_conn_stats.
+    import threading
+    def _capture_rate_publisher():
+        from connectors import dealer_print_capture as _dpc
+        from connectors._bridge_state import publish as _bs_publish
+        from background_engine import schwab_bridge as _sb
+        import time as _t
+        while True:
+            try:
+                _t.sleep(5.0)
+                # capture_rate() self-publishes the dealer-pipeline stats
+                base = _dpc.capture_rate()
+                # Now augment with Tradier per-conn stats and publish the combined view
+                try:
+                    base['tradier_conns'] = _sb.get_tradier_conn_stats()
+                except Exception as _e:
+                    base['tradier_conns'] = [{'error': str(_e)[:120]}]
+                _bs_publish('capture_rate', '_snapshot', base)
+            except Exception as _e:
+                log.debug(f"capture_rate publisher err: {_e}")
+    threading.Thread(target=_capture_rate_publisher, daemon=True,
+                     name='CaptureRatePublisher').start()
+    log.info("capture_rate publisher thread started (5s cadence)")
+
     # 4. Keep the main thread alive. start_schwab_bridge() spawns daemon
     #    threads, so without this the process would exit immediately.
     log.info("Bridge main loop entering wait state — Ctrl-C to stop")
