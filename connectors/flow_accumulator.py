@@ -742,6 +742,23 @@ class FlowAccumulator:
                     _is_call = (symbol[12] == 'C')
                 else:
                     _is_call = None  # unknown — skip rather than miscount
+                    # 2026-05-08 audit instrumentation: track unparseable
+                    # symbols so we can see what's escaping the atomic buckets.
+                    # Aggregated counter logged every 1000 misses.
+                    if not hasattr(self, '_isCall_unknown_count'):
+                        self._isCall_unknown_count = 0
+                        self._isCall_unknown_samples = []
+                    self._isCall_unknown_count += 1
+                    if len(self._isCall_unknown_samples) < 5:
+                        self._isCall_unknown_samples.append({
+                            'sym': symbol,
+                            'ct':  _ct,
+                            'len': len(symbol or ''),
+                        })
+                    if self._isCall_unknown_count % 1000 == 0:
+                        log.warning(f"[FLOW-ACC] is_call=None count={self._isCall_unknown_count} "
+                                    f"samples={self._isCall_unknown_samples}")
+                        self._isCall_unknown_samples = []
 
                 if _is_call is not None:
                     abs_signed = abs(signed)

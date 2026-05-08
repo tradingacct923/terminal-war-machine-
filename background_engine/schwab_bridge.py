@@ -7130,18 +7130,29 @@ def get_hedge_pressure_state(ticker: str) -> dict:
     empty dict when the surface has not been populated or when the
     requested ticker is not QQQ (the only ticker the greek surface
     currently tracks in live streams).
+
+    2026-05-08 FIX: stamp `ticker` and `data_age_sec` onto the response
+    so frontend hydration can render the correct symbol header (was
+    showing 'None' / undefined ticker label) and tell stale snapshots
+    from fresh ones.
     """
     try:
         if _greek_surface is None:
-            return {}
+            return {'ticker': (ticker or '').upper(), 'strikes': []}
         t = (ticker or '').upper()
         if t != 'QQQ':
-            return {}
+            return {'ticker': t, 'strikes': []}
         spot = _tape_spot_for(t) or _latest_qqq
-        return _greek_surface.export_hedge_pressure(float(spot or 0))
+        out = _greek_surface.export_hedge_pressure(float(spot or 0))
+        if isinstance(out, dict):
+            out.setdefault('ticker', t)
+            ts = out.get('ts') or 0
+            if ts:
+                out.setdefault('data_age_sec', round(time.time() - float(ts), 2))
+        return out
     except Exception as _e:  # defensive — never crash the REST layer
         log.warning(f"[HP] get_hedge_pressure_state error: {_e}")
-        return {}
+        return {'ticker': (ticker or '').upper(), 'error': str(_e)[:120]}
 
 
 def get_alignment_for_contract(contract_sym: str) -> dict:

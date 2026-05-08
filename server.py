@@ -6267,7 +6267,17 @@ def handle_mma_unwatch(_data=None):
 # at RTH peak), the server's emit() will buffer in Socket.IO's internal queue.
 # Worst case: chart appears stale, but server doesn't crash.
 
-# All event types emitted by bridge.py (from grep on schwab_bridge.py):
+# All event types emitted by bridge.py (from grep on schwab_bridge.py).
+# 2026-05-08 audit added 3 events the frontend expects but were missing:
+#   edge_signal       — EdgeDetector cross-asset conviction (emit from
+#                       connectors/edge_detector.py:1563,1683)
+#   mm_contract_state — per-contract MM aggregate snapshot, pushed on
+#                       mm_attribution:watch (emit from mm_attribution.py:860).
+#                       Originally emitted with to=room; the relay adapter
+#                       drops the room kwarg so it broadcasts to all clients
+#                       — browsers filter their own watch sets.
+#   regime_update     — vol_surface regime transitions (emit from
+#                       connectors/vol_surface.py:1460)
 _BRIDGE_RELAY_EVENTS = [
     'acct_activity',
     'big_print',
@@ -6277,6 +6287,7 @@ _BRIDGE_RELAY_EVENTS = [
     'candle_update',
     'chart_equity_update',
     'dealer_session_flow',
+    'edge_signal',
     'eq_book_update',
     'eq_context',
     'equity_tape',
@@ -6292,10 +6303,12 @@ _BRIDGE_RELAY_EVENTS = [
     'intel:vix_term',
     'intel:wing_update',
     'l2_update',
+    'mm_contract_state',
     'mm_event_batch',
     'ndx_wgc',
     'option_mark_batch',
     'option_trade_batch',
+    'regime_update',
     'screener_equity_update',
     'screener_option_update',
     'single_name_walls',
