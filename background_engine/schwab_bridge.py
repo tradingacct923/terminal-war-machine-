@@ -2885,7 +2885,16 @@ def _on_tradier_timesale(evt: dict):
         if occ.startswith('QQQ'):
             _tradier_timesale_stats['qqq'] += 1
 
-        trade_time_ms = int(evt.get('timestamp_ms') or int(time.time() * 1000))
+        # 2026-05-08 FIX: clamp stale Tradier timestamps to "now" if more than
+        # 60s in the past. Tradier sometimes replays prints from previous days
+        # (subscription handoff / reconnect cache), and the stale ts routes
+        # mm_events into wrong-date files (mm_events_20260507.jsonl on 05/08).
+        # Live prints don't legitimately arrive >60s late.
+        _now_ms_t = int(time.time() * 1000)
+        _ev_ts = int(evt.get('timestamp_ms') or 0)
+        if not _ev_ts or _ev_ts < _now_ms_t - 60_000:
+            _ev_ts = _now_ms_t
+        trade_time_ms = _ev_ts
         t_bid = float(evt.get('bid') or 0.0)
         t_ask = float(evt.get('ask') or 0.0)
 
@@ -6582,8 +6591,18 @@ def _on_options_book(data):
             ])
         return out
 
+    # 2026-05-08 FIX: same stale-ts clamp as the mm_attribution call below.
+    # Schwab's data['timestamp'] for OPTIONS_BOOK is the order's post-time,
+    # which can be days old for long-resting quotes. Without clamping, the
+    # raw options_book disk log lands old-dated rows in today's file (less
+    # destructive than mm_events because it's keyed by date in filename via
+    # _ob_log_path() at file-rotation time, but still inaccurate for analysis).
+    _now_ms = int(time.time() * 1000)
+    _ts_ms = data.get('timestamp') or 0
+    if not _ts_ms or _ts_ms < _now_ms - 60_000:
+        _ts_ms = _now_ms
     rec = {
-        'ts': data.get('timestamp', int(time.time() * 1000)),
+        'ts': _ts_ms,
         'sym': symbol,
         'b': _pack(bids),
         'a': _pack(asks),
@@ -6603,13 +6622,25 @@ def _on_options_book(data):
         pass
 
     # MM Attribution — per-exchange structural differ.
+    # 2026-05-08 FIX: clamp event ts to "now" when Schwab's reported
+    # timestamp (data['timestamp']) is more than 60s in the past. Schwab's
+    # OPTIONS_BOOK field 1 is the order's original-post time, not the
+    # snapshot delivery time. For long-resting quotes (some posted days
+    # ago) this routed mm_events into wrong-date files — discovered when
+    # mm_events_20260429.jsonl grew to 6.2GB on 2026-05-08 because new
+    # subscriptions surfaced long-resting orders with 04/29 timestamps.
     try:
         from connectors import mm_attribution as _mma
+        _now_ms = int(time.time() * 1000)
+        _ts_ms = data.get('timestamp') or 0
+        # Treat as stale if > 60s in the past (max realistic WS delivery jitter)
+        if not _ts_ms or _ts_ms < _now_ms - 60_000:
+            _ts_ms = _now_ms
         _mma.on_book_update(
             symbol,
             bids,
             asks,
-            data.get('timestamp', int(time.time() * 1000)) / 1000.0,
+            _ts_ms / 1000.0,
         )
     except Exception:
         pass
