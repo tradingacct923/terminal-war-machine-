@@ -933,6 +933,14 @@ class ConvictionScorer:
             else:
                 prev_size_rec = prev_score = prev_dir = prev_ts = None
             self._state[ticker] = new_state
+        # 2026-05-08 multiproc: publish to disk for server-process REST.
+        # Conviction state is per-ticker; publish each ticker's state to its
+        # own file so /api/conviction/<ticker> can read directly.
+        try:
+            from connectors._bridge_state import publish as _bs_publish
+            _bs_publish('conviction', ticker, self._serialize(new_state))
+        except Exception:
+            pass
         emit_now = True
         if prev_size_rec is not None:
             if (prev_size_rec == new_state.size_recommendation

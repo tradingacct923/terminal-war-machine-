@@ -224,6 +224,22 @@ def main():
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
+    # 2026-05-08: daily self-exit at BRIDGE_RESTART_HOUR:BRIDGE_RESTART_MINUTE
+    # to mitigate slow memory growth (~50 MB/hr observed). launchd's
+    # KeepAlive=true auto-restarts within ThrottleInterval (20s). Disk-
+    # persisted state survives the restart so we lose nothing.
+    # Disabled if either env is unset/invalid (single-process or manual mode).
+    try:
+        _restart_h = int(os.environ.get('BRIDGE_RESTART_HOUR', ''))
+        _restart_m = int(os.environ.get('BRIDGE_RESTART_MINUTE', '0'))
+        _restart_enabled = 0 <= _restart_h < 24 and 0 <= _restart_m < 60
+    except (ValueError, TypeError):
+        _restart_enabled = False
+        _restart_h, _restart_m = -1, -1
+    if _restart_enabled:
+        log.info(f"Daily self-exit armed for {_restart_h:02d}:{_restart_m:02d} (memory-leak mitigation)")
+    _last_restart_check_day = -1   # which date we last triggered on (don't double-fire)
+
     # gevent-friendly main loop. We just sleep forever; the daemon threads
     # (running as gevent greenlets) keep the bridge alive.
     while True:
@@ -233,6 +249,22 @@ def main():
             log.debug("bridge heartbeat — sio connected")
         else:
             log.warning("bridge heartbeat — sio NOT connected (auto-reconnecting)")
+        # Daily-restart check
+        if _restart_enabled:
+            from datetime import datetime as _dt
+            now = _dt.now()
+            today_int = now.year * 10000 + now.month * 100 + now.day
+            if (now.hour == _restart_h
+                    and now.minute >= _restart_m
+                    and today_int != _last_restart_check_day):
+                _last_restart_check_day = today_int
+                log.info(f"Daily restart triggered at {now:%H:%M} — exiting (launchd will restart)")
+                try:
+                    _sio_client.disconnect()
+                except Exception:
+                    pass
+                # Exit code 0 so launchd treats this as a clean exit (vs crash)
+                sys.exit(0)
 
 
 if __name__ == '__main__':

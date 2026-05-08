@@ -241,6 +241,16 @@ def on_print(underlying: str,
         _sweep_id_counter += 1
         _completed_sweeps.append(sweep)
         _stats['sweeps_detected'] += 1
+        # 2026-05-08 multiproc: publish recent-sweeps snapshot to disk so
+        # server-process REST endpoint can read it.
+        try:
+            from connectors._bridge_state import publish as _bs_publish
+            _bs_publish('sweeps', 'recent', {
+                'sweeps': list(_completed_sweeps),
+                'stats':  dict(_stats),
+            })
+        except Exception:
+            pass
 
         # Persist to outcome ledger (file write under separate lock so the
         # state lock isn't held during disk I/O)
@@ -528,9 +538,23 @@ def _write_ledger(record: dict) -> None:
 # ── Public read API ──────────────────────────────────────────────────────────
 
 def get_recent_sweeps(limit: int = 50) -> list:
-    """Return last N completed sweeps (newest last)."""
+    """Return last N completed sweeps (newest last).
+
+    2026-05-08 multiproc fallback: in server.py the in-process
+    _completed_sweeps deque is empty because detection runs in bridge.py.
+    Read bridge's published snapshot from disk first.
+    """
     with _state_lock:
-        return list(_completed_sweeps)[-limit:]
+        if _completed_sweeps:
+            return list(_completed_sweeps)[-limit:]
+    try:
+        from connectors._bridge_state import fetch as _bs_fetch
+        snap = _bs_fetch('sweeps', 'recent')
+        if snap and isinstance(snap.get('sweeps'), list):
+            return snap['sweeps'][-limit:]
+    except Exception:
+        pass
+    return []
 
 
 def get_stats() -> dict:

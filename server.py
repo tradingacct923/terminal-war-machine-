@@ -1860,13 +1860,26 @@ def api_conviction(ticker):
     Synthesizes regime, hedge pressure, options flow, MM attribution, time-of-day
     and cross-asset confirm into a single 0–100 score with direction + size
     recommendation. Source: connectors/conviction_score.py. Live cadence 5s.
+
+    2026-05-08 multiproc: when bridge.py runs the scorer in its own process,
+    server.py's get_scorer() returns None. Fall through to the disk-based
+    bridge-state cache, which conviction_score.py publishes after each update.
     """
     try:
         from connectors.conviction_score import get_scorer
+        ticker = ticker.upper()
         s = get_scorer()
-        if s is None:
-            return jsonify({'error': 'scorer not initialized'}), 503
-        return jsonify(s.get_state(ticker.upper()))
+        if s is not None:
+            return jsonify(s.get_state(ticker))
+        # Multiproc fallback — read bridge's published state
+        try:
+            from connectors._bridge_state import fetch as _bs_fetch
+            disk_state = _bs_fetch('conviction', ticker)
+            if disk_state:
+                return jsonify(disk_state)
+        except Exception:
+            pass
+        return jsonify({'error': 'scorer not initialized'}), 503
     except Exception as e:
         import traceback
         return jsonify({'error': str(e), 'tb': traceback.format_exc()}), 500
