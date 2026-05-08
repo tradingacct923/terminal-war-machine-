@@ -428,6 +428,12 @@ def compute_state() -> dict:
     with _state_lock:
         _state_cache['latest'] = state
         _history.append(sample)
+        # 2026-05-08 multiproc: publish to disk for server-process REST.
+        try:
+            from connectors._bridge_state import publish as _bs_publish
+            _bs_publish('spx_qqq_div', 'latest', {**state, 'history': list(_history)})
+        except Exception:
+            pass
 
     # Outcome ledger
     _write_ledger(sample)
@@ -436,13 +442,24 @@ def compute_state() -> dict:
 
 
 def get_state() -> dict:
-    """REST handler — return cached state with attached history."""
+    """REST handler — return cached state with attached history.
+
+    2026-05-08 multiproc fallback: read bridge's published state from disk
+    if our in-process cache is empty (because compute runs in bridge.py).
+    """
     with _state_lock:
         cached = _state_cache.get('latest')
         if cached:
             out = dict(cached)
             out['history'] = list(_history)
             return out
+    try:
+        from connectors._bridge_state import fetch as _bs_fetch
+        disk_state = _bs_fetch('spx_qqq_div', 'latest')
+        if disk_state:
+            return disk_state
+    except Exception:
+        pass
     state = compute_state()
     with _state_lock:
         state['history'] = list(_history)

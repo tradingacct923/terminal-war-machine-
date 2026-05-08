@@ -320,6 +320,12 @@ def compute_forecast(ticker: str) -> dict:
 
     with _state_lock:
         _state_cache[ticker] = state
+        # 2026-05-08 multiproc: publish to disk for server-process REST.
+        try:
+            from connectors._bridge_state import publish as _bs_publish
+            _bs_publish('hedge_fc', ticker, state)
+        except Exception:
+            pass
 
     # 9) Outcome ledger (legacy — same-ts forecast+backward-observed)
     _write_ledger({
@@ -352,12 +358,24 @@ def compute_forecast(ticker: str) -> dict:
 
 
 def get_state(ticker: str) -> dict:
-    """REST handler — return cached state (or compute fresh if cache empty)."""
+    """REST handler — return cached state (or compute fresh if cache empty).
+
+    2026-05-08 multiproc fallback: in server.py the in-process _state_cache
+    stays empty because compute runs in bridge.py. Read bridge's published
+    state from disk before falling through to a local recompute.
+    """
     ticker = (ticker or '').upper()
     with _state_lock:
         cached = _state_cache.get(ticker)
         if cached:
             return cached
+    try:
+        from connectors._bridge_state import fetch as _bs_fetch
+        disk_state = _bs_fetch('hedge_fc', ticker)
+        if disk_state:
+            return disk_state
+    except Exception:
+        pass
     return compute_forecast(ticker)
 
 

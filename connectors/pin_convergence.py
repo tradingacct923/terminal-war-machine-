@@ -114,7 +114,7 @@ def seconds_until_session_close(now_ts: Optional[float] = None) -> float:
 def _empty_state(ticker: str, reason: str = '') -> dict:
     """Return a structured 'no data' state. Caller still gets a valid envelope
     so frontend can render an empty/awaiting-data view (not a 500 error)."""
-    return {
+    state = {
         'ticker':              ticker,
         'spot':                0.0,
         'time_remaining_sec':  seconds_until_session_close(),
@@ -130,6 +130,16 @@ def _empty_state(ticker: str, reason: str = '') -> dict:
         'reason':              reason,
         'history':             [],
     }
+    # 2026-05-08 multiproc: publish even empty states so server-process
+    # REST endpoints get the *current* compute attempt's reason rather than
+    # a stale state. Without this, server would see a 'no_spot' state from
+    # 30s ago even after bridge transitions to 'hp_empty' or success.
+    try:
+        from connectors._bridge_state import publish as _bs_publish
+        _bs_publish('pin', ticker, state)
+    except Exception:
+        pass
+    return state
 
 
 def compute_pin_state(ticker: str) -> dict:
@@ -324,6 +334,13 @@ def compute_pin_state(ticker: str) -> dict:
 
     with _state_lock:
         _state_cache[ticker] = state
+        # 2026-05-08 multiproc: also publish to disk so server-process REST
+        # endpoints can read the bridge-process compute output.
+        try:
+            from connectors._bridge_state import publish as _bs_publish
+            _bs_publish('pin', ticker, {**state, 'history': list(_pin_history.get(ticker, []))})
+        except Exception:
+            pass
         # Append history sample
         _pin_history[ticker].append({
             'ts':              state['server_time'],
@@ -353,6 +370,11 @@ def get_state(ticker: str) -> dict:
     """REST handler — returns cached state (or computes fresh if cache empty).
 
     Includes time-evolution history for pin trajectory rendering.
+
+    2026-05-08 multiproc: in server.py the in-process _state_cache stays
+    empty because compute runs in bridge.py. Fall through to the disk-based
+    bridge_state cache before recomputing locally (which would also fail
+    since bridge holds the spot/wall data).
     """
     ticker = (ticker or '').upper()
     with _state_lock:
@@ -361,7 +383,16 @@ def get_state(ticker: str) -> dict:
             out = dict(cached)
             out['history'] = list(_pin_history.get(ticker, []))
             return out
-    # No cache yet — compute on-demand
+    # Multiproc fallback: read bridge's published state from disk.
+    try:
+        from connectors._bridge_state import fetch as _bs_fetch
+        disk_state = _bs_fetch('pin', ticker)
+        if disk_state:
+            return disk_state
+    except Exception:
+        pass
+    # No cache anywhere — compute on-demand (works only if all dependencies
+    # — spot, walls, OI — are reachable from this process).
     state = compute_pin_state(ticker)
     with _state_lock:
         state['history'] = list(_pin_history.get(ticker, []))
