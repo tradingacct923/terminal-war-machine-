@@ -161,15 +161,48 @@ def compute_state() -> dict:
     except Exception as e:
         return _empty_state(reason=f'mma_import_err:{e}')
 
+    # 2026-05-08 PERF FIX: prune the snapshot under-lock.
+    # Pre-fix: copied EVERY OSI's per-exchange dict deep — at peak RTH
+    # _capture has 30K+ contracts × ~16 exchanges = ~500K nested dicts to
+    # copy under _mma._state_lock. Resulted in 296-1079ms compute times.
+    # Now: filter at snapshot time to only QQQ contracts whose strike is
+    # within ATM ±$30 (covers all relevant wings for the warehouse view).
+    # Far-wing contracts contribute commitment_score < cutoff anyway and
+    # never appear in top_committed/top_phantom rankings.
+    SNAPSHOT_BAND_DOLLARS = 30.0   # ATM ±$30 (covers warehouse-relevant strikes)
+    spot_for_band = spot if spot > 0 else None
+
     # Snapshot under mm_attribution's own lock for consistency
     capture_snapshot: dict = {}
     capture_totals_snapshot: dict = {}
     try:
         with _mma._state_lock:
             for sym, exchs in (_mma._capture or {}).items():
+                # Fast filters BEFORE the deep dict copy
+                # (1) Must be a QQQ OSI: ticker is the prefix before YYMMDD
+                if not sym or len(sym) < 13:
+                    continue
+                # OSI format: TICKER (1-6 chars padded with spaces) + YYMMDD + C/P + STRIKE_8
+                # For QQQ specifically the underlying part is "QQQ   " (6 chars padded).
+                # Cheap check: skip anything that doesn't start with 'QQQ'.
+                if not sym.startswith('QQQ'):
+                    continue
+                # (2) ATM-band check (only if we have spot)
+                if spot_for_band is not None:
+                    try:
+                        # OSI strike is last 8 chars, in tenths-of-cent (8-digit, 5+3)
+                        strike_int = int(sym[-8:])
+                        strike = strike_int / 1000.0
+                        if abs(strike - spot_for_band) > SNAPSHOT_BAND_DOLLARS:
+                            continue
+                    except (ValueError, IndexError):
+                        # fall through — better to include than skip on parse error
+                        pass
+                # Survivor: deep-copy the per-exch nested dicts
                 capture_snapshot[sym] = {
                     e: dict(rec) for e, rec in (exchs or {}).items()
                 }
+            # totals are tiny; keep full snapshot
             for sym, tots in (_mma._capture_totals or {}).items():
                 capture_totals_snapshot[sym] = dict(tots)
     except Exception as e:

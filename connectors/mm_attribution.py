@@ -79,6 +79,10 @@ _TRADIER_TO_MPID = {
     'A': 'AMEX',   # NYSE American Options
     'B': 'BOSX',   # Nasdaq BX Options
     'C': 'CBOE',   # Cboe Options Exchange
+    'D': 'MIAX',   # MIAX Pearl Options — OPRA D, folded into MIAX family
+                   # in Schwab's OPTIONS_BOOK (no separate Pearl MPID seen).
+    'E': 'MIAX',   # MIAX Emerald — OPRA E, folded into MIAX family
+                   # in Schwab's OPTIONS_BOOK (no separate Emerald MPID seen).
     'H': 'XBXO',   # BOX Options Exchange
     'I': 'ISEX',   # Nasdaq ISE
     'J': 'MERC',   # Nasdaq MRX (ISE Mercury)
@@ -91,9 +95,11 @@ _TRADIER_TO_MPID = {
     'X': 'PHLX',   # Nasdaq PHLX
     'Y': 'EDGX',   # Cboe EDGX Options
     'Z': 'BATS',   # Cboe BZX
-    # Unmapped single-letter codes seen live (D, E, S, T) pass through and
-    # trigger a one-shot warning — extend this table once the venue is
-    # confirmed. Do NOT guess.
+    # 'S' and 'T' codes still pass through unmapped — they appear in Tradier
+    # timesale but Schwab OPTIONS_BOOK doesn't expose 'S'/'T' MPIDs visibly,
+    # so we let them keep their own venue identity rather than guess wrong.
+    # If they later show up as posted-but-never-caught (or vice versa) in
+    # capture_rows, that's the signal to re-map.
 }
 
 # Tracks unmapped codes so we warn once per code, not per print.
